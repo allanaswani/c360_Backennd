@@ -1,0 +1,26 @@
+# Customer 360 — backend dependencies (Python 3.11+)
+# Pinned to the versions validated against the live Trino warehouse.
+# Install:  python -m venv .venv && .venv/Scripts/pip install -r requirements.txt
+
+Django==5.2.16
+djangorestframework==3.17.1
+djangorestframework-simplejwt==5.5.1
+django-cors-headers==4.9.0
+python-dotenv==1.2.2
+
+# Production serving — gunicorn is the WSGI server (Linux container); WhiteNoise
+# serves the admin / DRF browsable-API static straight from the app process so no
+# separate static server is needed. Mirrors the HF portfolio backend. Gunicorn is
+# not used on Windows dev (use manage.py runserver there); WhiteNoise runs anywhere.
+gunicorn==23.0.0
+whitenoise==6.11.0
+
+# Live warehouse access (delta / gold_db over HTTPS, self-signed cert).
+# Only needed when C360_DATA_MODE=live; the mock mode has no external deps.
+trino==0.338.0
+
+# Next-best-product model (offline training + in-request scoring). Free, CPU-only.
+lightgbm==4.7.0
+scikit-learn==1.9.0
+pandas==3.0.5
+numpy==2.5.1

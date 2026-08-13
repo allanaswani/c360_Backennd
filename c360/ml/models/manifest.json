@@ -1,0 +1,186 @@
+{
+  "version": "lgbm-v1",
+  "rows": 84219,
+  "n_products_trained": 6,
+  "products": {
+    "current": {
+      "trained": true,
+      "positives": 10726,
+      "rate": 0.12736,
+      "auc": 0.9653,
+      "precision_at_10pct": 0.7463,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "savings",
+        "mortgage",
+        "asset_finance",
+        "overdraft",
+        "ipf",
+        "cash_cover",
+        "trade",
+        "unsecured"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    },
+    "savings": {
+      "trained": true,
+      "positives": 13162,
+      "rate": 0.15628,
+      "auc": 0.9519,
+      "precision_at_10pct": 0.8372,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "current",
+        "mortgage",
+        "asset_finance",
+        "overdraft",
+        "ipf",
+        "cash_cover",
+        "trade",
+        "unsecured"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    },
+    "mortgage": {
+      "trained": true,
+      "positives": 2791,
+      "rate": 0.03314,
+      "auc": 0.9899,
+      "precision_at_10pct": 0.3393,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "current",
+        "savings",
+        "asset_finance",
+        "overdraft",
+        "ipf",
+        "cash_cover",
+        "trade",
+        "unsecured"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    },
+    "asset_finance": {
+      "trained": true,
+      "positives": 287,
+      "rate": 0.00341,
+      "auc": 0.9089,
+      "precision_at_10pct": 0.0281,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "current",
+        "savings",
+        "mortgage",
+        "overdraft",
+        "ipf",
+        "cash_cover",
+        "trade",
+        "unsecured"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    },
+    "overdraft": {
+      "trained": true,
+      "positives": 279,
+      "rate": 0.00331,
+      "auc": 0.9013,
+      "precision_at_10pct": 0.0239,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "current",
+        "savings",
+        "mortgage",
+        "asset_finance",
+        "ipf",
+        "cash_cover",
+        "trade",
+        "unsecured"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    },
+    "ipf": {
+      "trained": false,
+      "positives": 195,
+      "rate": 0.00232
+    },
+    "cash_cover": {
+      "trained": false,
+      "positives": 0,
+      "rate": 0.0
+    },
+    "trade": {
+      "trained": false,
+      "positives": 0,
+      "rate": 0.0
+    },
+    "unsecured": {
+      "trained": true,
+      "positives": 3306,
+      "rate": 0.03925,
+      "auc": 0.9931,
+      "precision_at_10pct": 0.368,
+      "features": [
+        "log_dep_bal",
+        "log_loan_bal",
+        "tenure_years",
+        "segment",
+        "current",
+        "savings",
+        "mortgage",
+        "asset_finance",
+        "overdraft",
+        "ipf",
+        "cash_cover",
+        "trade"
+      ],
+      "categorical": [
+        "segment"
+      ]
+    }
+  },
+  "product_labels": {
+    "current": "Current Account",
+    "savings": "Savings Account",
+    "mortgage": "Mortgage",
+    "asset_finance": "Asset Finance",
+    "overdraft": "Overdraft",
+    "ipf": "Insurance Premium Finance",
+    "cash_cover": "Cash Cover",
+    "trade": "Trade Finance",
+    "unsecured": "Unsecured Loan"
+  },
+  "numeric_features": [
+    "log_dep_bal",
+    "log_loan_bal",
+    "tenure_years"
+  ],
+  "categorical_features": [
+    "segment"
+  ],
+  "mean_auc": 0.9517
+}

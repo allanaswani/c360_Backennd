@@ -1,0 +1,15 @@
+# Keep the build context small and secrets/artefacts OUT of the image.
+.venv/
+**/__pycache__/
+*.pyc
+*.sqlite3
+db.sqlite3
+.env
+.env.*
+staticfiles/
+.git/
+.gitignore
+*.log
+.pytest_cache/
+.DS_Store
+Thumbs.db
