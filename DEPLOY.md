@@ -24,10 +24,15 @@ Public URL: **https://ceo.hfcb.co.ke/customer-360** · LAN: **http://128.2.1.25:
 ## 0. Clone both repos
 
 ```bash
-sudo mkdir -p /data/apps/customer360 && cd /data/apps/customer360
-git clone https://github.com/allanaswani/c360_Backennd.git backend
-git clone https://github.com/allanaswani/c360_Frontend.git frontend
+sudo mkdir -p /data/apps/customer360
+sudo chown "$USER":"$USER" /data/apps/customer360
+cd /data/apps/customer360
+git clone https://github.com/allanaswani/c360_Backennd.git
+git clone https://github.com/allanaswani/c360_Frontend.git
 ```
+
+This leaves the repos at their own names: `/data/apps/customer360/c360_Backennd`
+and `/data/apps/customer360/c360_Frontend` (used in every path below).
 
 ---
 
@@ -38,7 +43,7 @@ password and the SSO signing key).
 
 ```bash
 sudo mkdir -p /etc/hf
-cp /data/apps/customer360/backend/.env.example /etc/hf/c360.env
+cp /data/apps/customer360/c360_Backennd/.env.example /etc/hf/c360.env
 sudo nano /etc/hf/c360.env
 ```
 
@@ -63,7 +68,7 @@ The lines that must be set:
 ## 2. Backend — build, run, first-run migrations
 
 ```bash
-cd /data/apps/customer360/backend
+cd /data/apps/customer360/c360_Backennd
 docker build -t c360-backend:latest .
 docker rm -f c360-backend
 
@@ -90,7 +95,7 @@ docker logs -f c360-backend
 ## 3. Frontend — run (node:22, same pattern as the portfolio)
 
 ```bash
-cd /data/apps/customer360/frontend
+cd /data/apps/customer360/c360_Frontend
 docker rm -f c360-frontend
 
 docker run -d --name c360-frontend --restart unless-stopped \
@@ -160,14 +165,14 @@ directly and the Next server proxies the API for them.
 
 ```bash
 # Backend
-cd /data/apps/customer360/backend && git pull
+cd /data/apps/customer360/c360_Backennd && git pull
 docker build -t c360-backend:latest . && docker rm -f c360-backend
 docker run -d --name c360-backend --restart unless-stopped --network=host \
   --env-file /etc/hf/c360.env -v /data/apps/customer360/appdb:/app/appdb c360-backend:latest
 docker exec c360-backend python manage.py migrate   # if models changed
 
 # Frontend
-cd /data/apps/customer360/frontend && git pull
+cd /data/apps/customer360/c360_Frontend && git pull
 docker rm -f c360-frontend
 docker run -d --name c360-frontend --restart unless-stopped \
   -p 5401:3000 -v "$(pwd)":/app -w /app \
