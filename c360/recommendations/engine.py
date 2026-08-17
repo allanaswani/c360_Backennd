@@ -218,6 +218,7 @@ def worklist_across_customers(
     sales_codes: list[str] | None,
     limit_per_customer: int = 1,
     max_customers: int | None = None,
+    include_staff: bool = True,
 ) -> list[dict[str, Any]]:
     """Level 1 cross-sell worklist — same engine, ranked across the visible book.
 
@@ -239,6 +240,10 @@ def worklist_across_customers(
             roster = None
     if not roster:
         roster = gateway.list_customers(sales_codes=sales_codes)
+    # Staff customers (HF employees) are admin-only — strip them from a non-admin's
+    # cross-sell call list. Every gateway stamps ``is_staff`` on its roster rows.
+    if not include_staff:
+        roster = [c for c in roster if not c.get('is_staff')]
     roster.sort(key=lambda c: (c.get('value') or 0), reverse=True)
     if max_customers is not None:
         roster = roster[:max_customers]

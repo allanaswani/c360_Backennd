@@ -11,7 +11,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from ..rbac.scoping import customer_visible, resolve_scope
+from ..rbac.scoping import customer_visible, resolve_scope, staff_hidden
 from ..recommendations.engine import recommend_for_customer, worklist_across_customers
 from ..services.customer import build_customer_header, build_value_summary
 from ..services.domains import DOMAIN_BUILDERS
@@ -30,6 +30,22 @@ def _period_from_request(request: Request, gateway):
         start=request.query_params.get('start'),
         end=request.query_params.get('end'),
     )
+
+
+def _not_found():
+    return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
+                    status=status.HTTP_404_NOT_FOUND)
+
+
+def _resolve_or_hide(gateway, scope, cust_id):
+    """Fetch a customer, treating out-of-reach records as not-found. Returns the raw
+    record, or a 404 Response when the customer is unknown OR is an HF-staff account the
+    caller may not see. Staff records return 404 (not 403) so their existence is never
+    confirmed to a non-admin snooping by id."""
+    raw = gateway.get_customer(cust_id)
+    if raw is None or staff_hidden(scope, raw):
+        return None, _not_found()
+    return raw, None
 
 
 class MetaView(APIView):
@@ -68,6 +84,7 @@ class CustomerListView(APIView):
             request.query_params.get('q', ''),
             sales_codes=scope.sales_codes,
             limit=int(request.query_params.get('limit', 25)),
+            include_staff=scope.is_admin,   # staff customers are admin-only
         )
         return Response({'count': len(rows), 'results': rows})
 
@@ -78,14 +95,15 @@ class CustomerDetailView(APIView):
     def get(self, request: Request, cust_id: str):
         gateway = get_gateway()
         scope = resolve_scope(request)
-        header = build_customer_header(gateway, cust_id)
-        if header is None:
-            return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
-                            status=status.HTTP_404_NOT_FOUND)
-        raw = gateway.get_customer(cust_id)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
+        header = build_customer_header(gateway, cust_id)
+        if header is None:
+            return _not_found()
         return Response({
             'header': header,
             'value_summary': build_value_summary(gateway, cust_id),
@@ -98,10 +116,9 @@ class CustomerOverviewView(APIView):
     def get(self, request: Request, cust_id: str):
         gateway = get_gateway()
         scope = resolve_scope(request)
-        raw = gateway.get_customer(cust_id)
-        if not raw:
-            return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
-                            status=status.HTTP_404_NOT_FOUND)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
@@ -115,10 +132,9 @@ class HFCBDomainView(APIView):
     def get(self, request: Request, cust_id: str):
         gateway = get_gateway()
         scope = resolve_scope(request)
-        raw = gateway.get_customer(cust_id)
-        if not raw:
-            return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
-                            status=status.HTTP_404_NOT_FOUND)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
@@ -136,10 +152,9 @@ class DomainView(APIView):
                             status=status.HTTP_404_NOT_FOUND)
         gateway = get_gateway()
         scope = resolve_scope(request)
-        raw = gateway.get_customer(cust_id)
-        if not raw:
-            return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
-                            status=status.HTTP_404_NOT_FOUND)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
@@ -154,10 +169,9 @@ class RecommendationsView(APIView):
     def get(self, request: Request, cust_id: str):
         gateway = get_gateway()
         scope = resolve_scope(request)
-        raw = gateway.get_customer(cust_id)
-        if not raw:
-            return Response({'error': {'status': 404, 'detail': 'Customer not found.'}},
-                            status=status.HTTP_404_NOT_FOUND)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
@@ -199,10 +213,13 @@ class WorklistView(APIView):
         # so it no longer needs a tight per-customer cap; 60 gives a rich call list
         # while keeping the batch query sizes and the cached payload sensible.
         max_customers = 60 if data_mode() == 'live' else None
-        key = f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}'
+        # Staff customers are admin-only, so the cache key is per-lens (admin vs not) to
+        # avoid an admin's staff-inclusive worklist being served to a non-admin manager.
+        key = f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}:{"a" if scope.is_admin else "n"}'
         rows = portfolio_cache.get_or_build(
             key,
             lambda: worklist_across_customers(
-                gateway, sales_codes=scope.sales_codes, max_customers=max_customers),
+                gateway, sales_codes=scope.sales_codes, max_customers=max_customers,
+                include_staff=scope.is_admin),
         )[0]
         return Response({'count': len(rows), 'results': rows})

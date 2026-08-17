@@ -31,6 +31,7 @@ from datetime import date
 from typing import Any
 
 from ... import risk as risk_derive
+from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
 from ..gateway import WarehouseGateway
 from ..periods import ResolvedPeriod
@@ -370,6 +371,11 @@ class TrinoWarehouse(WarehouseGateway):
             'email': self._clean(r.get('e_mail')),
             'id_no': id_no,
             'active': status not in {'C', 'CLOSED', 'I', 'INACTIVE', 'D'},
+            # HF-staff confidentiality (admin-only). Any of the signals in rbac/staff.py
+            # marks the record; the query layer 404s it for non-admins.
+            'is_staff': is_staff_from_fields(
+                employer=r.get('employer'), segment=r.get('customer_segment'),
+                bank_employee_id=r.get('fk_bankemployeeid')),
             # Risk feed exists (aml_customer.risk_class) but is blank in production,
             # so the eligibility gate correctly stays pending — do not fake it.
             'risk_class': None,
@@ -479,7 +485,7 @@ class TrinoWarehouse(WarehouseGateway):
         } for r in rows]
 
     # --- search (identity only; value is per-customer on the detail page) -
-    def search_customers(self, query, *, sales_codes, limit=25):
+    def search_customers(self, query, *, sales_codes, limit=25, include_staff=True):
         raw = (query or '').strip()
         like = f"%{raw.lower()}%"
         # Identification-document search (backlog item #2): match the raw ID number
@@ -490,11 +496,14 @@ class TrinoWarehouse(WarehouseGateway):
         id_norm = _re.sub(r'[^A-Za-z0-9]', '', raw).upper()
         id_guard = id_norm if len(id_norm) >= 5 else ''
         id_like = f"%{id_norm}%"
+        # Staff customers are admin-only; when excluding them, over-fetch so the filtered
+        # page still fills to `limit` rather than showing a short list.
+        fetch = int(limit) if include_staff else min(int(limit) * 4, 200)
         rows = self._t.execute(
             """
             SELECT CAST(customer_id AS BIGINT) AS id, full_name, customer_segment,
                    account_branch_name, created_emp_id, created_emp_name,
-                   customer_id_no, issue_authority, cust_type
+                   customer_id_no, issue_authority, cust_type, employer, fk_bankemployeeid
             FROM delta.gold_db.dim_customer
             WHERE full_name IS NOT NULL
               AND customer_segment <> 'INTERNAL ACCOUNTS'
@@ -503,17 +512,28 @@ class TrinoWarehouse(WarehouseGateway):
                    OR (? <> '' AND UPPER(REPLACE(REPLACE(REPLACE(TRIM(customer_id_no), ' ', ''), '.', ''), '/', '')) LIKE ?))
             LIMIT ?
             """,
-            (like, like, id_guard, id_like, int(limit)),
+            (like, like, id_guard, id_like, fetch),
         )
-        return [{
-            'cust_id': str(r['id']), 'name': self._clean(r.get('full_name')),
-            'segment': self._seg_label(r.get('customer_segment')), 'branch': self._clean(r.get('account_branch_name')),
-            'sales_code': self._officer_id(r.get('created_emp_id')),
-            'rm_name': self._officer_name(r.get('created_emp_name')),
-            'id_no': self._clean(r.get('customer_id_no')),
-            'id_type': self._id_type(r.get('issue_authority'), r.get('cust_type')),
-            'customer_type': self._cust_type_label(r.get('cust_type')),
-        } for r in rows]
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            staff = is_staff_from_fields(
+                employer=r.get('employer'), segment=r.get('customer_segment'),
+                bank_employee_id=r.get('fk_bankemployeeid'))
+            if staff and not include_staff:
+                continue
+            out.append({
+                'cust_id': str(r['id']), 'name': self._clean(r.get('full_name')),
+                'segment': self._seg_label(r.get('customer_segment')), 'branch': self._clean(r.get('account_branch_name')),
+                'sales_code': self._officer_id(r.get('created_emp_id')),
+                'rm_name': self._officer_name(r.get('created_emp_name')),
+                'id_no': self._clean(r.get('customer_id_no')),
+                'id_type': self._id_type(r.get('issue_authority'), r.get('cust_type')),
+                'customer_type': self._cust_type_label(r.get('cust_type')),
+                'is_staff': staff,
+            })
+            if len(out) >= int(limit):
+                break
+        return out
 
     # --- product holdings (canonical flags derived from real products) --------
     def get_product_holdings(self, cust_id):
@@ -676,15 +696,17 @@ class TrinoWarehouse(WarehouseGateway):
         return out
 
     # --- bounded live portfolio sample (whole-book stays precompute, §6) ------
-    def list_customers(self, *, sales_codes, sample: int = 200):
+    def list_customers(self, *, sales_codes, include_staff: bool = True, sample: int = 200):
         """A bounded set of real loan-holding customers (meaningful value),
-        aggregated dedup-safe — feeds the RM-scoped/mock overview fallback."""
+        aggregated dedup-safe — feeds the RM-scoped/mock overview fallback. Staff
+        customers are dropped unless ``include_staff`` (admin-only)."""
         d, p = self._as_of_lit(), self._asof_part()
         id_rows = self._t.execute(
             f"SELECT DISTINCT cust_id FROM delta.gold_db.eom_loans "
             f"WHERE eom_date={d} {p} AND cust_id IS NOT NULL LIMIT {int(sample)}")
         ids = [self._cid(r['cust_id']) for r in id_rows]
-        return self._aggregate_customers([i for i in ids if i is not None])
+        rows = self._aggregate_customers([i for i in ids if i is not None])
+        return rows if include_staff else [r for r in rows if not r.get('is_staff')]
 
     def list_prospects(self, *, sample: int = 150):
         """Cross-sell *prospects* for the worklist: real customers in higher-value
@@ -716,8 +738,8 @@ class TrinoWarehouse(WarehouseGateway):
             f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} AND cust_id IN ({inlist}) GROUP BY cust_id")}
         idn = {self._cid(r['id']): r for r in self._t.execute(
             f"SELECT CAST(customer_id AS BIGINT) id, full_name, customer_segment, "
-            f"account_branch_name, created_emp_id, created_emp_name FROM delta.gold_db.dim_customer "
-            f"WHERE customer_id IN ({inlist})")}
+            f"account_branch_name, created_emp_id, created_emp_name, employer, fk_bankemployeeid "
+            f"FROM delta.gold_db.dim_customer WHERE customer_id IN ({inlist})")}
         out = []
         for i in ids:
             dv, dn = dep.get(i, (0.0, 0))
@@ -732,6 +754,9 @@ class TrinoWarehouse(WarehouseGateway):
                 'rm_name': self._officer_name(ident.get('created_emp_name')),
                 'value': round(dv + lv), 'deposits': round(dv), 'loans': round(lv),
                 'products_held': dn + ln,
+                'is_staff': is_staff_from_fields(
+                    employer=ident.get('employer'), segment=ident.get('customer_segment'),
+                    bank_employee_id=ident.get('fk_bankemployeeid')),
             })
         out.sort(key=lambda c: c['value'], reverse=True)
         return out

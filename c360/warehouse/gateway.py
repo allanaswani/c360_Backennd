@@ -32,17 +32,24 @@ class WarehouseGateway(abc.ABC):
     # --- identity & scope ------------------------------------------------
     @abc.abstractmethod
     def get_customer(self, cust_id: str) -> dict[str, Any] | None:
-        """Identity + allocation + risk/KYC placeholders for one customer."""
+        """Identity + allocation + risk/KYC placeholders for one customer. Every record
+        carries ``is_staff`` — True when the customer is an HF employee (see
+        ``rbac/staff.py``); the query layer hides those from non-admins."""
 
     @abc.abstractmethod
     def search_customers(
-        self, query: str, *, sales_codes: list[str] | None, limit: int = 25
+        self, query: str, *, sales_codes: list[str] | None, limit: int = 25,
+        include_staff: bool = True,
     ) -> list[dict[str, Any]]:
-        """Customer table bridge into Level 2, RBAC-scoped by ``sales_codes``."""
+        """Customer table bridge into Level 2, RBAC-scoped by ``sales_codes``. When
+        ``include_staff`` is False, HF-staff customers are excluded (admin-only)."""
 
     @abc.abstractmethod
-    def list_customers(self, *, sales_codes: list[str] | None) -> list[dict[str, Any]]:
-        """All customers visible to the caller — feeds the cross-sell worklist."""
+    def list_customers(
+        self, *, sales_codes: list[str] | None, include_staff: bool = True
+    ) -> list[dict[str, Any]]:
+        """All customers visible to the caller — feeds the cross-sell worklist. Excludes
+        HF-staff customers unless ``include_staff`` is True. Rows carry ``is_staff``."""
 
     # --- core-banking holdings & value ----------------------------------
     @abc.abstractmethod

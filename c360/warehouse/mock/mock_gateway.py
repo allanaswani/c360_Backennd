@@ -14,6 +14,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from ... import risk as risk_derive
+from ...rbac.staff import is_staff_from_fields
 from ..gateway import WarehouseGateway
 from ..periods import ResolvedPeriod
 from . import seed
@@ -54,6 +55,7 @@ class MockWarehouse(WarehouseGateway):
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if not c:
             return None
+        bio = self._bio(c)
         return {
             'cust_id': c['cust_id'],
             'name': c['name'],
@@ -65,14 +67,22 @@ class MockWarehouse(WarehouseGateway):
             'email': c['email'],
             'id_no': c['id_no'],
             'staff': c['staff'],
+            'is_staff': self._is_staff(c, bio),
             'active': c['active'],
             # Must-source feeds: returned as None so the service tags them TO_SOURCE.
             'risk_class': None,
             'crb_status': None,
             'kyc_status': None,
             'relationship_since': None,
-            'bio': self._bio(c),
+            'bio': bio,
         }
+
+    @staticmethod
+    def _is_staff(c: dict, bio: dict) -> bool:
+        """Mock staff detection — the seed's explicit ``staff`` flag, plus the same
+        employer/segment signals the live gateway uses (so previews behave identically)."""
+        return is_staff_from_fields(
+            explicit=c.get('staff'), segment=c.get('segment'), employer=bio.get('employer'))
 
     # Bio & identification (backlog item #1). Preview mode has no dim_customer, so a
     # deterministic bio is synthesised from the seed identity — organisations (company
@@ -113,7 +123,7 @@ class MockWarehouse(WarehouseGateway):
         allowed = set(sales_codes)
         return [c for c in seed.CUSTOMERS if c['sales_code'] in allowed]
 
-    def search_customers(self, query, *, sales_codes, limit=25):
+    def search_customers(self, query, *, sales_codes, limit=25, include_staff=True):
         q = (query or '').strip().lower()
         qid = ''.join(ch for ch in q if ch.isalnum())
         rows = self._visible(sales_codes)
@@ -124,10 +134,16 @@ class MockWarehouse(WarehouseGateway):
                 # ID-document match (item #2): compare punctuation-stripped id numbers.
                 return len(qid) >= 4 and qid in ''.join(ch for ch in str(c.get('id_no') or '').lower() if ch.isalnum())
             rows = [c for c in rows if hit(c)]
-        return [self._summary(c) for c in rows[:limit]]
+        summaries = [self._summary(c) for c in rows]
+        if not include_staff:   # staff customers are admin-only
+            summaries = [s for s in summaries if not s.get('is_staff')]
+        return summaries[:limit]
 
-    def list_customers(self, *, sales_codes):
-        return [self._summary(c) for c in self._visible(sales_codes)]
+    def list_customers(self, *, sales_codes, include_staff=True):
+        summaries = [self._summary(c) for c in self._visible(sales_codes)]
+        if not include_staff:
+            summaries = [s for s in summaries if not s.get('is_staff')]
+        return summaries
 
     def _summary(self, c: dict) -> dict[str, Any]:
         bio = self._bio(c)
@@ -138,6 +154,7 @@ class MockWarehouse(WarehouseGateway):
             'value': c['value'], 'deposits': c['deposits'], 'loans': c['loans'],
             'products_held': sum(1 for v in c['flags'].values() if v),
             'id_no': c.get('id_no'), 'id_type': bio['id_type'], 'customer_type': bio['customer_type'],
+            'is_staff': self._is_staff(c, bio),
         }
 
     # --- holdings & value ------------------------------------------------
