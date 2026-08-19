@@ -80,3 +80,49 @@ class ApiTests(TestCase):
         self.assertEqual(snaps['Properties']['status'], 'to_source')
         domains_in_donut = {s['domain'] for s in r.json()['value_by_domain']['slices']}
         self.assertNotIn('Properties', domains_in_donut)
+
+
+class DomainUnavailableTests(TestCase):
+    """Honesty rule: a domain whose SOURCE can't be read must say 'couldn't load',
+    never masquerade as 'this customer has nothing' (a genuine None)."""
+
+    def _period(self):
+        from c360.warehouse.periods import resolve_period
+        from datetime import date
+        return resolve_period('30D', as_of=date(2026, 8, 18))
+
+    def test_source_failure_is_unavailable_not_empty(self):
+        from c360.services import domains
+
+        class Boom:
+            def get_customer(self, cid):
+                return {'cust_id': cid}
+            def get_properties(self, cid):
+                raise RuntimeError('source table unreachable')
+            def get_bancassurance(self, cid, period):
+                raise RuntimeError('source table unreachable')
+
+        gw, p = Boom(), self._period()
+        prop = domains.build_properties(gw, 'X', p)
+        banc = domains.build_bancassurance(gw, 'X', p)
+        self.assertTrue(prop['unavailable'])
+        self.assertTrue(banc['unavailable'])
+        self.assertTrue(prop['empty_reason'])           # still explained, never bare
+
+    def test_genuine_none_is_empty_not_unavailable(self):
+        from c360.services import domains
+
+        class NoneGw:
+            def get_customer(self, cid):
+                return {'cust_id': cid}
+            def get_properties(self, cid):
+                return None                              # customer genuinely owns none
+            def get_bancassurance(self, cid, period):
+                return None
+
+        gw, p = NoneGw(), self._period()
+        prop = domains.build_properties(gw, 'X', p)
+        banc = domains.build_bancassurance(gw, 'X', p)
+        self.assertFalse(prop.get('unavailable'))
+        self.assertFalse(banc.get('unavailable'))
+        self.assertTrue(prop['empty_reason'])           # honest, explained empty state

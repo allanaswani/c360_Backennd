@@ -123,6 +123,10 @@ class TrinoWarehouse(WarehouseGateway):
         self._t = trino
         self._as_of: date | None = None
         self._as_of_at: float = 0.0
+        # Cached "does this source table hold ANY rows" probes (table -> (present, at)).
+        # Lets a domain tell "this customer has none" apart from "the whole source is
+        # empty/unreachable" without a COUNT on every request.
+        self._src_probe: dict[str, tuple[bool, float]] = {}
         # As-of whole-book aggregates are period-independent and expensive, so they
         # are memoised (see _WB_TTL_SECONDS). Stored with the wall-clock time it was
         # built so the memo can expire.
@@ -159,6 +163,25 @@ class TrinoWarehouse(WarehouseGateway):
     def _as_of_lit(self) -> str:
         # Our own validated date value → safe to inline (enables partition pruning).
         return f"DATE '{self.as_of_date().isoformat()}'"
+
+    _SRC_PROBE_TTL_SECONDS = 900  # 15 min
+
+    def _source_has_rows(self, table: str) -> bool:
+        """True iff ``table`` currently holds at least one row and is reachable.
+        Cheap (LIMIT 1) and memoised on a short TTL. A domain uses this to distinguish
+        'this customer genuinely has none' (return None) from 'the source is empty or
+        unreachable' (raise LiveDataNotReady → the UI shows an honest 'couldn't load'
+        state instead of a false 'nothing linked')."""
+        now = time.monotonic()
+        hit = self._src_probe.get(table)
+        if hit is not None and (now - hit[1]) < self._SRC_PROBE_TTL_SECONDS:
+            return hit[0]
+        try:
+            present = bool(self._t.execute(f"SELECT 1 FROM {table} LIMIT 1"))
+        except Exception:
+            present = False  # unreachable / missing table == not available
+        self._src_probe[table] = (present, now)
+        return present
 
     @staticmethod
     def _date_lit(d: date) -> str:
@@ -1315,6 +1338,11 @@ class TrinoWarehouse(WarehouseGateway):
             "WHERE TRIM(cp.client_idno) = ? AND cp.unit_id IS NOT NULL "
             "GROUP BY cp.unit_id", (nid,))
         if not units:
+            # No units for this national ID. Before saying "no properties", make sure the
+            # source itself is populated — an empty/unreachable property table must surface
+            # as "couldn't load", not as a false "this customer owns nothing".
+            if not self._source_has_rows('delta.gold_db.rpt_c360_customer_property'):
+                raise LiveDataNotReady('property source (rpt_c360_customer_property) is empty or unreachable')
             return None
         unit_ids = [int(u['unit_id']) for u in units if u['unit_id'] is not None]
         mortgaged: set[int] = set()
@@ -1362,6 +1390,10 @@ class TrinoWarehouse(WarehouseGateway):
             "WHERE TRIM(idno) = ? AND policy_policy_no IS NOT NULL AND TRIM(policy_policy_no) <> '' "
             "GROUP BY policy_policy_no", (nid,))
         if not rows:
+            # No policies for this national ID. Distinguish a genuinely policy-free
+            # customer from an empty/unreachable policy source (see get_properties).
+            if not self._source_has_rows('delta.gold_db.rpt_c360_customer_policies_summary'):
+                raise LiveDataNotReady('bancassurance source (rpt_c360_customer_policies_summary) is empty or unreachable')
             return None
         policies = []
         for r in rows:

@@ -50,13 +50,26 @@ def _empty(cust_id, domain, reason):
             'metrics': [], 'charts': [], 'tables': [], 'empty_reason': reason}
 
 
+def _unavailable(cust_id, domain, detail=None):
+    """The source couldn't be read — an error, or the source table itself is empty/
+    unreachable — as opposed to the customer genuinely holding none. Honesty rule
+    (never a silent —): an RM must not see "nothing linked" when the truth is
+    "not loaded", so this is flagged distinctly for the UI to render as such."""
+    return {'cust_id': cust_id, 'domain': domain, 'preview': True,
+            'metrics': [], 'charts': [], 'tables': [], 'unavailable': True,
+            'empty_reason': detail or (
+                f'{domain} data could not be loaded right now — its source may be '
+                'temporarily unavailable. This is a data-source issue, not a gap in '
+                'this customer’s record.')}
+
+
 def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
     if gateway.get_customer(cust_id) is None:
         return None
     try:
         data = gateway.get_whizz(cust_id, period)
     except Exception:
-        data = None
+        return _unavailable(cust_id, 'Whizz')
     if data is None:
         return _empty(cust_id, 'Whizz', 'No Whizz / M-Pesa activity for this customer in the selected period.')
 
@@ -97,7 +110,7 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     try:
         data = gateway.get_properties(cust_id)
     except Exception:
-        data = None
+        return _unavailable(cust_id, 'Properties')
     if data is None:
         return _empty(cust_id, 'Properties', 'No properties linked to this customer.')
 
@@ -146,7 +159,7 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
     try:
         data = gateway.get_bancassurance(cust_id, period)
     except Exception:
-        data = None
+        return _unavailable(cust_id, 'Bancassurance')
     if data is None:
         return _empty(cust_id, 'Bancassurance', 'No insurance policies linked to this customer.')
 
