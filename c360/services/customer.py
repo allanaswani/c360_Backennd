@@ -83,6 +83,11 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     if idy.get('active', {}).get('value') is False:
         parts.append('Currently dormant.')
 
+    # Voice a retention risk in the one-liner — it's the most action-worthy signal.
+    ret = header.get('retention')
+    if ret and ret.get('flag') == 'at_risk' and ret.get('note'):
+        parts.append(ret['note'])
+
     return ' '.join(parts)
 
 
@@ -117,8 +122,17 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
         risk_metric = to_source(note='Risk profile unavailable for this customer.').to_dict()
         kyc_metric = to_source(note='KYC profile unavailable for this customer.').to_dict()
 
+    # Silent-attrition early warning — DERIVED from the deposit-balance history
+    # (c360/retention.py). Optional: None when the gateway has no history or the
+    # trend can't be judged, in which case the UI simply omits the chip.
+    try:
+        retention = gateway.get_retention_signal(cust_id)
+    except Exception:
+        retention = None
+
     return {
         'cust_id': c['cust_id'],
+        'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
         'identity': {
             'name': live(c['name']).to_dict(),
             'segment': live(c['segment']).to_dict(),

@@ -27,9 +27,10 @@ from __future__ import annotations
 
 import re as _re
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
+from ... import retention as retention_derive
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
@@ -637,6 +638,34 @@ class TrinoWarehouse(WarehouseGateway):
             'loans': [{'period': self._safe_date(r['p']), 'balance': round(float(r['b'] or 0))}
                       for r in loan if self._safe_date(r['p'])],
         }
+
+    def get_retention_signal(self, cust_id):
+        """Silent-attrition early warning (see c360/retention.py). Compares the
+        earliest vs latest deposit snapshot in the trailing ~quarter (one
+        partition-pruned scan) → DERIVED retention flag. None when there isn't
+        enough history, or the account had no positive balance to erode from."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        asof = self.as_of_date()
+        start = asof - timedelta(days=95)
+        lo, hi = self._date_lit(start), self._date_lit(asof)
+        rp = self._range_part(start, asof)
+        rows = self._t.execute(
+            f"SELECT CAST(eom_date AS varchar) p, SUM(book_balance) b "
+            f"FROM delta.gold_db.eom_deposits "
+            f"WHERE cust_id=? {rp} AND eom_date BETWEEN {lo} AND {hi} "
+            f"GROUP BY eom_date ORDER BY eom_date", (cid,))
+        pts = [(self._safe_date(r['p']), float(r['b'] or 0)) for r in rows]
+        pts = [(d, b) for d, b in pts if d]
+        if len(pts) < 2:
+            return None
+        sig = retention_derive.classify_retention(pts[0][1], pts[-1][1])
+        if sig is None:
+            return None
+        sig['from'] = pts[0][0]
+        sig['to'] = pts[-1][0]
+        return sig
 
     def disbursement_vs_balance_series(self, cust_id, period):
         cid = self._cid(cust_id)

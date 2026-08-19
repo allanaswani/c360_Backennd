@@ -138,3 +138,9 @@ class WarehouseGateway(abc.ABC):
     @abc.abstractmethod
     def get_bancassurance(self, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
         ...
+
+    # --- retention / silent-attrition early warning (optional capability) -----
+    # Default: not computed. A gateway that holds a deposit-balance history overrides
+    # this to return {'flag','trend_pct','note','from','to'} (see c360/retention.py).
+    def get_retention_signal(self, cust_id: str) -> dict[str, Any] | None:
+        return None
