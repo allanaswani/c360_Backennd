@@ -144,3 +144,9 @@ class WarehouseGateway(abc.ABC):
     # this to return {'flag','trend_pct','note','from','to'} (see c360/retention.py).
     def get_retention_signal(self, cust_id: str) -> dict[str, Any] | None:
         return None
+
+    # --- data-health report (admin panel; live gateways override) -------------
+    def health_report(self) -> dict[str, Any]:
+        return {'data_mode': 'mock', 'freshness': None, 'checks': [],
+                'note': 'Preview (mock) data — connect the live warehouse '
+                        '(C360_DATA_MODE=live) to see source health.'}

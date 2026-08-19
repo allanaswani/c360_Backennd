@@ -69,6 +69,19 @@ class ApiTests(TestCase):
         r = self.c.get('/api/portfolio/overview/', HTTP_X_C360_ROLE='rm')
         self.assertEqual(r.status_code, 403)
 
+    def test_data_health_is_admin_only(self):
+        # A non-admin RM must not see warehouse internals.
+        r = self.c.get('/api/admin/health/', HTTP_X_C360_ROLE='rm', HTTP_X_C360_SALES_CODES='SC-1077')
+        self.assertEqual(r.status_code, 403)
+
+    def test_data_health_admin_gets_report(self):
+        r = self.c.get('/api/admin/health/', HTTP_X_C360_ADMIN='true')
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertIn('data_mode', body)
+        self.assertIn('checks', body)
+        self.assertIn('generated_at', body)
+
     def test_customer_overview_value_by_domain_provenance(self):
         # Flagship customer: HFCB value is LIVE, non-core domains are PREVIEW.
         r = self.c.get('/api/customers/HF-102377/overview/?period=30D')

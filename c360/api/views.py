@@ -5,6 +5,7 @@ through the gateway. No business logic here; views orchestrate and serialise.
 """
 from __future__ import annotations
 
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
@@ -227,3 +228,19 @@ class WorklistView(APIView):
                 include_staff=scope.is_admin),
         )[0]
         return Response({'count': len(rows), 'results': rows})
+
+
+class DataHealthView(APIView):
+    """Admin-only live-warehouse health — freshness, table reachability and row counts.
+    Surfaces the exact conditions that have silently broken the app before (a frozen
+    as-of date, an emptied source table) so ops sees them before a user does."""
+
+    def get(self, request: Request):
+        scope = resolve_scope(request)
+        if not scope.is_admin:
+            return Response({'error': {'status': 403, 'detail': 'Data health is admin-only.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        report = get_gateway().health_report()
+        report['data_mode'] = data_mode()
+        report['generated_at'] = timezone.now().isoformat()
+        return Response(report)

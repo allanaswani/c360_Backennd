@@ -184,6 +184,48 @@ class TrinoWarehouse(WarehouseGateway):
         self._src_probe[table] = (present, now)
         return present
 
+    # --- data-health report (admin panel) --------------------------------
+    # Curated list of the tables the app actually depends on. Huge fact tables use a
+    # cheap presence check (never COUNT a 2.37B-row table); the small report/domain
+    # tables carry an exact count so an emptied source is obvious at a glance.
+    _HEALTH_CHECKS = [
+        ('dim_customer', 'Identity master', 'Core banking', 'delta.gold_db.dim_customer', 'count'),
+        ('eom_deposits', 'Deposit snapshots', 'Core banking', 'delta.gold_db.eom_deposits', 'presence'),
+        ('eom_loans', 'Loan snapshots', 'Core banking', 'delta.gold_db.eom_loans', 'presence'),
+        ('fact_dep_trx', 'Transactions', 'Core banking', 'delta.gold_db.fact_dep_trx_recording', 'presence'),
+        ('customers_whizz', 'Whizz (digital)', 'Domains', 'delta.gold_db.customers_whizz', 'count'),
+        ('rpt_property', 'Properties source', 'Domains', 'delta.gold_db.rpt_c360_customer_property', 'count'),
+        ('hfdi_mortgage', 'Mortgage flags', 'Domains', 'delta.gold_db.hfdi_mortgage_data', 'count'),
+        ('rpt_policies', 'Bancassurance source', 'Domains', 'delta.gold_db.rpt_c360_customer_policies_summary', 'count'),
+    ]
+
+    def _run_health_check(self, key, label, group, table, mode):
+        base = {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1]}
+        try:
+            if mode == 'count':
+                rows = self._t.execute(f"SELECT COUNT(*) n FROM {table}")
+                n = int(rows[0]['n']) if rows else 0
+                return {**base, 'status': 'ok' if n > 0 else 'empty', 'value': n,
+                        'detail': f'{n:,} rows' if n > 0 else 'table is empty — source data not loaded'}
+            present = bool(self._t.execute(f"SELECT 1 FROM {table} LIMIT 1"))
+            return {**base, 'status': 'ok' if present else 'empty', 'value': present,
+                    'detail': 'reachable, has rows' if present else 'empty / no rows'}
+        except Exception as e:
+            return {**base, 'status': 'error', 'value': None,
+                    'detail': f'{type(e).__name__}: {str(e)[:140]}'}
+
+    def health_report(self):
+        checks = [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
+        try:
+            asof = self.as_of_date()
+            days = (date.today() - asof).days
+            freshness = {'as_of': asof.isoformat(), 'days_behind': days,
+                         'status': 'ok' if days <= 4 else 'stale'}
+        except Exception as e:
+            freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
+                         'detail': f'{type(e).__name__}: {str(e)[:140]}'}
+        return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
+
     @staticmethod
     def _date_lit(d: date) -> str:
         # Period bounds come from our own resolver, never user text → safe to inline.
