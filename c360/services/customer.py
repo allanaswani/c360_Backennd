@@ -7,6 +7,7 @@ instead of rendering a bare ``--``.
 """
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 from ..warehouse.gateway import WarehouseGateway
@@ -15,6 +16,74 @@ from ..warehouse.provenance import Provenance, derived, live, to_source
 
 # Bio fields carried as ISO dates so the UI can format them; the rest are strings.
 _BIO_DATE_FIELDS = {'date_of_birth', 'account_open_date'}
+
+
+def _kes_short(n: float | int | None) -> str:
+    """Human KES with a K/M/B/T rollup, mirroring the frontend `kes()`—for the
+    server-authored relationship summary sentence."""
+    v = float(n or 0)
+    a = abs(v)
+    if a >= 1e12:
+        body = f'{v / 1e12:.1f}T'
+    elif a >= 1e9:
+        body = f'{v / 1e9:.1f}B'
+    elif a >= 1e6:
+        body = f'{v / 1e6:.1f}M'
+    elif a >= 1e3:
+        body = f'{v / 1e3:.0f}K'
+    else:
+        body = f'{v:.0f}'
+    return f'KES {body}'
+
+
+def _seg_human(seg: str | None) -> str:
+    s = (seg or 'Unsegmented').strip()
+    return s.title() if s.isupper() else s
+
+
+def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
+    """A single plain-language sentence an RM can read at a glance — 'who is this
+    customer', composed from the same facts already on the page (no new query, no
+    invented number). Every clause is dropped when its source is missing rather than
+    printed as a bare gap, keeping the never-a-silent-dash rule.
+
+    e.g. 'Mass customer of 8 years with the bank. Holds KES 2.1M in deposits against
+    KES 1.3M in loans — KES 0.8M net. Low risk.'"""
+    idy, risk = header['identity'], header['risk']
+    hl = value.get('headline', {})
+    dep = hl.get('deposits', {}).get('value') or 0
+    loan = hl.get('loans', {}).get('value') or 0
+    net = dep - loan
+
+    lead = f'{_seg_human(idy["segment"]["value"])} customer'
+    since = risk.get('relationship_since', {}).get('value')
+    if since:
+        try:
+            tenure = date.today().year - int(str(since)[:4])
+        except (TypeError, ValueError):
+            tenure = None
+        if tenure and tenure >= 1:
+            lead += f' of {tenure} year{"s" if tenure != 1 else ""} with the bank'
+        else:
+            lead += f' since {str(since)[:4]}'
+    parts = [lead + '.']
+
+    if dep > 0 and loan > 0:
+        net_txt = f'{_kes_short(net)} net' if net >= 0 else f'{_kes_short(-net)} net borrowing'
+        parts.append(f'Holds {_kes_short(dep)} in deposits against {_kes_short(loan)} in loans — {net_txt}.')
+    elif dep > 0:
+        parts.append(f'Holds {_kes_short(dep)} in deposits, no active lending.')
+    elif loan > 0:
+        parts.append(f'Carries {_kes_short(loan)} in loans, no deposit balance.')
+
+    rc = risk.get('risk_class', {}).get('value')
+    if rc in ('Low', 'Medium', 'High'):
+        parts.append(f'{rc} risk.')
+
+    if idy.get('active', {}).get('value') is False:
+        parts.append('Currently dormant.')
+
+    return ' '.join(parts)
 
 
 def _build_bio(bio: dict[str, Any]) -> dict[str, Any]:

@@ -13,7 +13,7 @@ from rest_framework.views import APIView
 
 from ..rbac.scoping import customer_visible, resolve_scope, staff_hidden
 from ..recommendations.engine import recommend_for_customer, worklist_across_customers
-from ..services.customer import build_customer_header, build_value_summary
+from ..services.customer import build_customer_header, build_value_summary, relationship_summary
 from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
@@ -104,9 +104,13 @@ class CustomerDetailView(APIView):
         header = build_customer_header(gateway, cust_id)
         if header is None:
             return _not_found()
+        value_summary = build_value_summary(gateway, cust_id)
+        # One plain-language line for the top of the page — composed from the facts
+        # already assembled above, so it's testable and never invents a figure.
+        header['summary'] = relationship_summary(header, value_summary)
         return Response({
             'header': header,
-            'value_summary': build_value_summary(gateway, cust_id),
+            'value_summary': value_summary,
         })
 
 

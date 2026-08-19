@@ -36,6 +36,13 @@ class ApiTests(TestCase):
         r = self.c.get('/api/customers/HF-100238/', HTTP_X_C360_ROLE='rm', HTTP_X_C360_SALES_CODES='SC-1077')
         self.assertEqual(r.status_code, 403)
 
+    def test_customer_detail_has_plain_language_summary(self):
+        r = self.c.get('/api/customers/HF-100238/')
+        summary = r.json()['header'].get('summary')
+        self.assertTrue(summary)
+        self.assertIn('customer', summary.lower())   # a real sentence, not a bare value
+        self.assertTrue(summary.endswith('.'))
+
     def test_hfcb_domain_has_all_charts_with_questions(self):
         r = self.c.get('/api/customers/HF-100238/domains/hfcb/?period=30D')
         self.assertEqual(r.status_code, 200)
