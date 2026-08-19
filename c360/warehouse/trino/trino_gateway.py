@@ -122,6 +122,7 @@ class TrinoWarehouse(WarehouseGateway):
     def __init__(self, trino: TrinoConnector, postgres: TrinoConnector | None = None):
         self._t = trino
         self._as_of: date | None = None
+        self._as_of_at: float = 0.0
         # As-of whole-book aggregates are period-independent and expensive, so they
         # are memoised (see _WB_TTL_SECONDS). Stored with the wall-clock time it was
         # built so the memo can expire.
@@ -131,12 +132,28 @@ class TrinoWarehouse(WarehouseGateway):
         self._internal_ids_cache: list[int] | None = None
 
     # --- anchors ---------------------------------------------------------
+    # The as-of anchor pins EVERY figure in the app to the warehouse's last closed
+    # business date (bank_parameters.prev_trx_date). The gateway is one lru_cached
+    # instance per worker, so this MUST expire: without a TTL the whole app freezes on
+    # whatever date the worker booted on and silently drifts stale as the warehouse
+    # rolls forward daily. Re-read on the same 30-min cadence as the whole-book memo.
+    _ASOF_TTL_SECONDS = 1800
+
     def as_of_date(self) -> date:
-        if self._as_of is None:
-            rows = self._t.execute(
-                "SELECT prev_trx_date AS d FROM delta.gold_db.bank_parameters LIMIT 1"
-            )
-            self._as_of = rows[0]['d'] if rows else date.today()
+        now = time.monotonic()
+        if self._as_of is not None and (now - self._as_of_at) < self._ASOF_TTL_SECONDS:
+            return self._as_of
+        rows = self._t.execute(
+            "SELECT prev_trx_date AS d FROM delta.gold_db.bank_parameters LIMIT 1"
+        )
+        if rows and rows[0].get('d'):
+            self._as_of = rows[0]['d']
+            self._as_of_at = now
+        elif self._as_of is None:
+            # Nothing to read and no prior value → last resort. (A transient empty read
+            # never clobbers a good cached date back to today().)
+            self._as_of = date.today()
+            self._as_of_at = now
         return self._as_of
 
     def _as_of_lit(self) -> str:
