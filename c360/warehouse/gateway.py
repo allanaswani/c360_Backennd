@@ -145,6 +145,13 @@ class WarehouseGateway(abc.ABC):
     def get_retention_signal(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- linked parties / same-person records (optional capability) -----------
+    # Default: not computed. A live gateway overrides this to return
+    # {'basis','primary_value','members':[...]} — customer records sharing this
+    # customer's national ID (see the trino gateway).
+    def get_linked_parties(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

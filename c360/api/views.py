@@ -14,7 +14,7 @@ from rest_framework.views import APIView
 
 from ..rbac.scoping import customer_visible, resolve_scope, staff_hidden
 from ..recommendations.engine import recommend_for_customer, worklist_across_customers
-from ..services.customer import build_customer_header, build_value_summary, relationship_summary
+from ..services.customer import build_customer_header, build_linked_parties, build_value_summary, relationship_summary
 from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
@@ -113,6 +113,24 @@ class CustomerDetailView(APIView):
             'header': header,
             'value_summary': value_summary,
         })
+
+
+class LinkedPartiesView(APIView):
+    """Same-person linked records (shared national ID), scoped to what the caller may
+    see. Returns 404 for an unknown/staff-hidden primary; an empty body when nothing
+    linked is visible."""
+
+    def get(self, request: Request, cust_id: str):
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        linked = build_linked_parties(gateway, scope, cust_id)
+        return Response(linked or {'count': 0, 'members': []})
 
 
 class CustomerOverviewView(APIView):

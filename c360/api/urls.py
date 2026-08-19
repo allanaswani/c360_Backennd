@@ -27,6 +27,7 @@ urlpatterns = [
     path('customers/', views.CustomerListView.as_view(), name='customer-list'),
     path('customers/<str:cust_id>/', views.CustomerDetailView.as_view(), name='customer-detail'),
     path('customers/<str:cust_id>/overview/', views.CustomerOverviewView.as_view(), name='customer-overview'),
+    path('customers/<str:cust_id>/linked/', views.LinkedPartiesView.as_view(), name='customer-linked'),
     path('customers/<str:cust_id>/domains/hfcb/', views.HFCBDomainView.as_view(), name='hfcb-domain'),
     path('customers/<str:cust_id>/domains/<str:domain>/', views.DomainView.as_view(), name='domain'),
     path('customers/<str:cust_id>/recommendations/', views.RecommendationsView.as_view(), name='recommendations'),

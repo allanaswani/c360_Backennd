@@ -163,6 +163,37 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     }
 
 
+def build_linked_parties(gateway: WarehouseGateway, scope, cust_id: str) -> dict[str, Any] | None:
+    """Same-person linked records (shared national ID), filtered to what THIS caller may
+    see: members outside their book are dropped, and HF-staff records are hidden from
+    everyone but the admin tier (the staff sieve). The combined value reflects only the
+    visible members plus the primary, so it never leaks a total the caller couldn't
+    otherwise reach. Returns None when nothing linked is visible."""
+    from ..rbac.scoping import customer_visible, staff_hidden  # local: avoid import cycle
+
+    try:
+        linked = gateway.get_linked_parties(cust_id)
+    except Exception:
+        linked = None
+    if not linked or not linked.get('members'):
+        return None
+    visible = [m for m in linked['members']
+               if customer_visible(scope, m) and not staff_hidden(scope, m)]
+    if not visible:
+        return None
+    combined = (linked.get('primary_value') or 0) + sum(m.get('value') or 0 for m in visible)
+    return {
+        'basis': linked.get('basis', 'National ID'),
+        'count': len(visible),
+        'combined_value': combined,
+        'members': [{
+            'cust_id': m['cust_id'], 'name': m['name'], 'segment': m['segment'],
+            'branch': m.get('branch'), 'value': m.get('value'),
+            'products_held': m.get('products_held'),
+        } for m in visible],
+    }
+
+
 def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any]:
     """Cross-domain value summary. Core banking is LIVE; the other three domains
     are declared but PREVIEW/TO_SOURCE until their pipelines land, so the donut

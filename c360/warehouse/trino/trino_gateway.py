@@ -872,6 +872,37 @@ class TrinoWarehouse(WarehouseGateway):
         out.sort(key=lambda c: c['value'], reverse=True)
         return out
 
+    def get_linked_parties(self, cust_id):
+        """Other customer records belonging to the same legal person — matched on the
+        national ID (``dim_customer.customer_id_no``). A person commonly holds several
+        customer numbers (personal, joint, business signatory); this stitches them into
+        one relationship. Returns None when the ID is blank/placeholder (can't link
+        safely) or nothing else shares it. Members carry value/identity (dedup-safe via
+        ``_aggregate_customers``) and an ``is_staff`` stamp so the caller's scope + the
+        staff sieve can filter them."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        rows = self._t.execute(
+            "SELECT TRIM(customer_id_no) nid FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
+        nid = (rows[0]['nid'] if rows else None) or ''
+        if len(nid) < 5 or not any(ch.isdigit() for ch in nid) or nid.strip('0') == '':
+            return None
+        linked = self._t.execute(
+            "SELECT CAST(customer_id AS BIGINT) id FROM delta.gold_db.dim_customer "
+            "WHERE TRIM(customer_id_no) = ? AND customer_id <> ? "
+            "AND customer_segment <> 'INTERNAL ACCOUNTS' "
+            "ORDER BY customer_id LIMIT 12", (nid, cid))
+        linked_ids = [int(r['id']) for r in linked if r['id'] is not None]
+        if not linked_ids:
+            return None
+        prim = self._aggregate_customers([cid])
+        return {
+            'basis': 'National ID',
+            'primary_value': prim[0]['value'] if prim else 0,
+            'members': self._aggregate_customers(linked_ids),
+        }
+
     # --- derived risk / KYC (computed from held data, no dedicated feed) ------
     def get_risk_profile(self, cust_id):
         """Compute KYC (identity completeness) + operational risk (loan performance

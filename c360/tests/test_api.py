@@ -82,6 +82,18 @@ class ApiTests(TestCase):
         self.assertIn('checks', body)
         self.assertIn('generated_at', body)
 
+    def test_linked_parties_shape(self):
+        # Mock has no linking, so the endpoint returns an empty, well-formed body
+        # rather than erroring — and it still enforces the primary's visibility.
+        r = self.c.get('/api/customers/HF-100238/linked/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json().get('count', 0), 0)
+
+    def test_linked_parties_respects_book(self):
+        r = self.c.get('/api/customers/HF-100238/linked/',
+                       HTTP_X_C360_ROLE='rm', HTTP_X_C360_SALES_CODES='SC-1077')
+        self.assertEqual(r.status_code, 403)
+
     def test_customer_overview_value_by_domain_provenance(self):
         # Flagship customer: HFCB value is LIVE, non-core domains are PREVIEW.
         r = self.c.get('/api/customers/HF-102377/overview/?period=30D')
