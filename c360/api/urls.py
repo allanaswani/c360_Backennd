@@ -37,6 +37,8 @@ urlpatterns = [
     path('recommendations/feedback/stats/', feedback_views.FeedbackStatsView.as_view(), name='rec-feedback-stats'),
     path('portfolio/overview/', views.PortfolioOverviewView.as_view(), name='portfolio-overview'),
     path('portfolio/worklist/', views.WorklistView.as_view(), name='worklist'),
+    # --- an RM's own book (or whole book for management) roll-up ---
+    path('book/', views.BookSummaryView.as_view(), name='book-summary'),
     # --- admin: live-warehouse data health ---
     path('admin/health/', views.DataHealthView.as_view(), name='data-health'),
 ]

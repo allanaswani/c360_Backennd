@@ -166,6 +166,12 @@ class WarehouseGateway(abc.ABC):
     def get_profitability(self, cust_id) -> dict[str, Any] | None:
         return None
 
+    # --- RM book summary (optional capability) --------------------------------
+    # Default: not available. The live gateway overrides this to roll up an RM's book
+    # (or the whole book) from the curated Postgres customer_allocation_base.
+    def get_book_summary(self, sales_code: str | None) -> dict[str, Any] | None:
+        return None
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

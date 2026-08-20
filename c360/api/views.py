@@ -250,6 +250,38 @@ class WorklistView(APIView):
         return Response({'count': len(rows), 'results': rows})
 
 
+def _acting_sales_code(request) -> str | None:
+    """The signed-in user's own sales code (their book). Falls back to the dev header
+    used for header-driven RBAC when there's no authenticated profile."""
+    user = getattr(request, 'user', None)
+    if user is not None and getattr(user, 'is_authenticated', False):
+        code = getattr(getattr(user, 'profile', None), 'sales_code', None)
+        if code:
+            return str(code)
+    raw = request.headers.get('X-C360-Sales-Codes', '') or ''
+    first = raw.split(',')[0].strip()
+    return first or None
+
+
+class BookSummaryView(APIView):
+    """The caller's own book (or the whole book, for management) — headline totals,
+    segment mix and top customers by AUM. Sourced from the reporting Postgres; returns
+    an honest ``available: false`` when that feed isn't wired (mock / Postgres down)."""
+
+    def get(self, request: Request):
+        scope = resolve_scope(request)
+        sales_code = _acting_sales_code(request)
+        whole = scope.can_view_portfolio() and not sales_code
+        if not whole and not sales_code:
+            return Response({'available': False,
+                             'detail': 'No sales code on your profile yet — ask an admin to set it so your book can load.'})
+        summary = get_gateway().get_book_summary(None if whole else sales_code)
+        if not summary:
+            return Response({'available': False,
+                             'detail': 'Book analytics need the live reporting warehouse — not available in preview mode.'})
+        return Response({'available': True, **summary})
+
+
 _HEALTH_CAPTURE_MIN_GAP = timedelta(minutes=10)   # don't write a row on every refresh
 _HEALTH_HISTORY_LIMIT = 60                        # points charted on the trend graphs
 

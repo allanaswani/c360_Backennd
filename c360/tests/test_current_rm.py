@@ -120,3 +120,37 @@ class ProfitabilityTests(SimpleTestCase):
     def test_none_without_postgres(self):
         gw = TrinoWarehouse(_FakeTrino(), postgres=None)
         self.assertIsNone(gw.get_profitability('134909'))
+
+
+class _BookPG:
+    def execute(self, sql, params=None):
+        s = sql.lower()
+        if 'group by main_segment' in s:
+            return [{'segment': 'BUSINESS', 'n': 30, 'aum': 700000},
+                    {'segment': 'PB', 'n': 12, 'aum': 300000}]
+        if 'order by aum_cust_id desc' in s:
+            return [{'cust_id': '39002', 'customer_name': 'ACME LTD', 'segment': 'BUSINESS',
+                     'aum': 500000, 'contribution': 20000, 'npl': 0}]
+        if 'count(*) as customers' in s:
+            return [{'customers': 42, 'aum': 1000000, 'deposits': 400000, 'loans': 600000,
+                     'contribution': 50000, 'npl_customers': 3}]
+        return []
+
+
+class BookSummaryTests(SimpleTestCase):
+    def test_book_rollup(self):
+        gw = TrinoWarehouse(_FakeTrino(), postgres=_BookPG())
+        b = gw.get_book_summary('SC1')
+        self.assertEqual(b['customers'], 42)
+        self.assertEqual(b['aum'], 1000000)
+        self.assertEqual(b['npl_customers'], 3)
+        self.assertFalse(b['whole_book'])
+        self.assertEqual(len(b['segments']), 2)
+        self.assertEqual(b['top_customers'][0]['name'], 'ACME LTD')
+
+    def test_whole_book_when_no_sales_code(self):
+        gw = TrinoWarehouse(_FakeTrino(), postgres=_BookPG())
+        self.assertTrue(gw.get_book_summary(None)['whole_book'])
+
+    def test_none_without_pg(self):
+        self.assertIsNone(TrinoWarehouse(_FakeTrino(), postgres=None).get_book_summary('SC1'))

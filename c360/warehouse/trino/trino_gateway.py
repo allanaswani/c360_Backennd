@@ -522,6 +522,67 @@ class TrinoWarehouse(WarehouseGateway):
             'prev_rm': self._clean(r.get('rm_name_prev')),      # previous RM (reassignment signal)
         }
 
+    def get_book_summary(self, sales_code: str | None) -> dict[str, Any] | None:
+        """An RM's book (or the whole book when ``sales_code`` is None) rolled up from the
+        reporting Postgres ``customer_allocation_base``: headline totals, a segment
+        breakdown and the top customers by AUM. Returns None when Postgres is absent/
+        unreachable (the caller then shows an honest 'not available' state). Never raises."""
+        if self._pg is None:
+            return None
+        where, params = '', ()
+        if sales_code:
+            where, params = 'WHERE rm_code = %s', (str(sales_code),)
+        try:
+            head = self._pg.execute(
+                f"""SELECT COUNT(*) AS customers,
+                           COALESCE(SUM(aum_cust_id), 0)       AS aum,
+                           COALESCE(SUM(deposit), 0)           AS deposits,
+                           COALESCE(SUM(loans), 0)             AS loans,
+                           COALESCE(SUM(net_after_expense), 0) AS contribution,
+                           COALESCE(SUM(CASE WHEN npl <> 0 THEN 1 ELSE 0 END), 0) AS npl_customers
+                    FROM customer_allocation_base {where}""", params)
+            segs = self._pg.execute(
+                f"""SELECT main_segment AS segment, COUNT(*) AS n,
+                           COALESCE(SUM(aum_cust_id), 0) AS aum
+                    FROM customer_allocation_base {where}
+                    GROUP BY main_segment ORDER BY aum DESC""", params)
+            top = self._pg.execute(
+                f"""SELECT CAST(cust_id AS text) AS cust_id, customer_name, main_segment AS segment,
+                           aum_cust_id AS aum, net_after_expense AS contribution, npl
+                    FROM customer_allocation_base {where}
+                    ORDER BY aum_cust_id DESC NULLS LAST LIMIT 10""", params)
+        except Exception:
+            return None
+        if not head:
+            return None
+        h = head[0]
+
+        def _n(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            'sales_code': sales_code,
+            'whole_book': sales_code is None,
+            'customers': int(h.get('customers') or 0),
+            'aum': round(_n(h.get('aum'))),
+            'deposits': round(_n(h.get('deposits'))),
+            'loans': round(_n(h.get('loans'))),
+            'contribution': round(_n(h.get('contribution'))),
+            'npl_customers': int(h.get('npl_customers') or 0),
+            'segments': [{'segment': self._clean(s.get('segment')) or 'Unsegmented',
+                          'customers': int(s.get('n') or 0), 'aum': round(_n(s.get('aum')))}
+                         for s in segs],
+            'top_customers': [{'cust_id': str(t.get('cust_id') or '').strip(),
+                               'name': self._clean(t.get('customer_name')),
+                               'segment': self._clean(t.get('segment')),
+                               'aum': round(_n(t.get('aum'))),
+                               'contribution': round(_n(t.get('contribution'))),
+                               'npl': bool(_n(t.get('npl')) or 0)} for t in top],
+        }
+
     # 'INTERNAL ACCOUNTS' is the bank's own ledger/clearing/suspense estate (CBK
     # clearing, M-Pesa float, treasury margin, nostro) — NOT customers. They carry
     # huge volatile/negative balances that distort every portfolio aggregate, so they
