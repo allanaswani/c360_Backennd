@@ -20,7 +20,7 @@ from typing import Any
 from ..warehouse.factory import data_mode
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.periods import ResolvedPeriod
-from ..warehouse.provenance import Provenance, Series, live
+from ..warehouse.provenance import Provenance, Series, derived, live
 
 # In mock, per-customer series are a simulated must-build derivation → PREVIEW.
 # In live, they are real (EOM day-grouped balances / rpt_c360 summaries) → LIVE.
@@ -55,7 +55,9 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
     recent = gateway.recent_transactions(cust_id, period=period, limit=8)
 
     products_held = sum(1 for held in holdings['flags'].values() if held)
-    net_position = (value['deposits'] or 0) - (value['loans'] or 0)
+    deposits = value['deposits'] or 0
+    loans = value['loans'] or 0
+    net_position = deposits - loans
     series_status, series_note = _provenance()
 
     return {
@@ -63,11 +65,14 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
         'period': period.to_dict(),
         # ---- headline metrics (LIVE) --------------------------------------
         'metrics': {
-            'total_deposits': live(value['deposits'], unit='KES').to_dict(),
-            'total_loans': live(value['loans'], unit='KES').to_dict(),
+            'total_deposits': live(deposits, unit='KES').to_dict(),
+            'total_loans': live(loans, unit='KES').to_dict(),
             'net_position': live(net_position, unit='KES').to_dict(),
             'products_held': live(products_held, unit='count').to_dict(),
             'revenue': live(value['revenue'], unit='KES').to_dict(),
+            # Derived ratio reads (from the live snapshot) — leverage + channel reach.
+            'loan_to_deposit': _leverage_metric(deposits, loans),
+            'active_channels': live(len(channels), unit='count').to_dict(),
         },
         # ---- charts, each answering a stated question ---------------------
         'charts': {
@@ -123,6 +128,22 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             },
         },
     }
+
+
+def _leverage_metric(deposits: float, loans: float) -> dict[str, Any]:
+    """Loan-to-deposit leverage (loans ÷ deposits) — a DERIVED gearing read. Honest when
+    there is nothing to gear against, rather than a fake ratio: a borrower with no
+    deposits, or a pure depositor, carries an explicit label instead of a bare number."""
+    if deposits and deposits > 0:
+        r = loans / deposits
+        band = 'Low gearing' if r < 1 else 'Moderate gearing' if r < 3 else 'High gearing'
+        return derived(round(r, 2), unit='ratio',
+                       note=f'Loan-to-deposit = loans ÷ deposits. {band}.').to_dict()
+    if loans and loans > 0:
+        return derived(None, unit='ratio', label='Borrowing only',
+                       note='Loans with no deposit balance to offset — leverage not meaningful.').to_dict()
+    return derived(None, unit='ratio', label='No lending',
+                   note='No loan facilities — leverage not applicable.').to_dict()
 
 
 def _product_holdings_bars(deposit_accts: list[dict], loan_accts: list[dict]) -> list[dict]:

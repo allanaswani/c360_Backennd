@@ -52,6 +52,19 @@ class ApiTests(TestCase):
         for c in charts.values():
             self.assertTrue(c.get('question'))   # every chart answers a stated question
 
+    def test_hfcb_has_derived_ratio_metrics(self):
+        r = self.c.get('/api/customers/HF-100238/domains/hfcb/?period=30D')
+        m = r.json()['metrics']
+        # New ratio cards (Power BI parity): leverage read + channel reach.
+        self.assertIn('loan_to_deposit', m)
+        self.assertIn('active_channels', m)
+        self.assertEqual(m['loan_to_deposit']['status'], 'derived')   # never faked as live
+        self.assertEqual(m['active_channels']['status'], 'live')
+        # A derived leverage value is either a real ratio or an explicit label, never a bare gap.
+        ltd = m['loan_to_deposit']
+        self.assertTrue(ltd.get('value') is not None or ltd.get('label'))
+        self.assertTrue(ltd.get('note'))
+
     def test_preview_domain_empty_state_is_explained(self):
         # Retail customer with no mortgage → Properties has an honest empty reason.
         r = self.c.get('/api/customers/HF-100571/domains/properties/?period=30D')
