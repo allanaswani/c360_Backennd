@@ -73,3 +73,41 @@ class TrinoDBAPIConnector:
             cur.execute(sql)
         cols = [c[0] for c in cur.description] if cur.description else []
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+class PostgresDBAPIConnector:
+    """Standalone adapter over ``psycopg2`` for the curated reporting Postgres.
+
+    Holds the report-ready tables the core-banking lakehouse does not — notably
+    ``retail_allocated_portfolio`` (the CURRENT customer→RM allocation, which
+    ``dim_customer`` only carries as the frozen account-opening officer). Same
+    ``execute()`` shape as the Trino connector so the gateway treats them alike;
+    Postgres uses ``%s`` positional params (not Trino's ``?``). Constructed lazily
+    so importing this module never requires the driver or a reachable database, and
+    only when ``postgres_config.host`` is set (never in mock mode).
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        self._config = config
+        self._conn = None
+
+    def _connection(self):
+        if self._conn is None or getattr(self._conn, 'closed', 0):
+            import psycopg2  # imported lazily; not needed in mock mode / if PG unused
+            cfg = self._config
+            self._conn = psycopg2.connect(
+                host=cfg['host'], port=cfg.get('port', 5432),
+                dbname=cfg['dbname'], user=cfg['user'], password=cfg.get('password', ''),
+                connect_timeout=int(cfg.get('connect_timeout', 5)),
+            )
+            self._conn.autocommit = True   # read-only reporting queries, no txn needed
+        return self._conn
+
+    def execute(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
+        cur = self._connection().cursor()
+        if params is not None:
+            cur.execute(sql, tuple(params))   # psycopg2 %s positional binding
+        else:
+            cur.execute(sql)
+        cols = [c[0] for c in cur.description] if cur.description else []
+        return [dict(zip(cols, row)) for row in cur.fetchall()]

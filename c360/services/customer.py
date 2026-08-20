@@ -130,6 +130,13 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     except Exception:
         retention = None
 
+    # RM provenance: 'allocation' = the current relationship manager (portfolio
+    # allocation); 'onboarding' = the account-opening officer we fall back to when the
+    # allocation source is unavailable. Label the fallback so a stale name is never
+    # shown as the current RM (no rm_source, e.g. mock/preview, carries no caveat).
+    rm_note = ('Account-opening officer — current RM allocation not available.'
+               if c.get('rm_source') == 'onboarding' and c.get('rm_name') else None)
+
     return {
         'cust_id': c['cust_id'],
         'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
@@ -137,7 +144,7 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
             'name': live(c['name']).to_dict(),
             'segment': live(c['segment']).to_dict(),
             'branch': live(c['branch']).to_dict(),
-            'rm_name': live(c.get('rm_name')).to_dict(),
+            'rm_name': live(c.get('rm_name'), note=rm_note).to_dict(),
             'sales_code': live(c.get('sales_code')).to_dict(),
             'mobile': live(c.get('mobile')).to_dict(),
             'email': live(c.get('email')).to_dict(),

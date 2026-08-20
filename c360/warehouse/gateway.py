@@ -152,6 +152,13 @@ class WarehouseGateway(abc.ABC):
     def get_linked_parties(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- current RM allocation (optional capability) --------------------------
+    # Default: none known (callers keep the account-opening officer). The live gateway
+    # overrides this to read the CURRENT customer→RM allocation from the curated
+    # Postgres (retail_allocated_portfolio), returning {cust_id: {'name','code'}}.
+    def get_current_rm(self, cust_ids) -> dict[str, dict[str, Any]]:
+        return {}
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

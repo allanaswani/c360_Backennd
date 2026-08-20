@@ -122,6 +122,13 @@ class TrinoWarehouse(WarehouseGateway):
 
     def __init__(self, trino: TrinoConnector, postgres: TrinoConnector | None = None):
         self._t = trino
+        self._pg = postgres
+        # Resolved current-RM allocation schema (table + column names), introspected
+        # once from the curated Postgres and memoised. None = not yet probed; the
+        # sentinel _ALLOC_NONE = probed and unavailable (cached on a TTL so a down PG
+        # is retried, not hammered). See _alloc_schema / get_current_rm.
+        self._alloc_meta: dict[str, str] | None = None
+        self._alloc_meta_at: float = 0.0
         self._as_of: date | None = None
         self._as_of_at: float = 0.0
         # Cached "does this source table hold ANY rows" probes (table -> (present, at)).
@@ -357,6 +364,121 @@ class TrinoWarehouse(WarehouseGateway):
             return None
         return v
 
+    # --- current RM allocation (curated Postgres) ------------------------
+    # dim_customer only carries the ACCOUNT-OPENING officer (created_emp_name), frozen
+    # at onboarding — so it is wrong once a customer is reassigned to a new RM (the
+    # "shows an RM no longer managing them" report). The live current RM lives in the
+    # curated Postgres (retail_allocated_portfolio), which core banking / Trino cannot
+    # see. We introspect that table's columns at runtime — their exact names are not
+    # fixed across environments and this box can't reach the DB to check — memoise the
+    # resolution, and let PG_ALLOC_* env vars pin them if auto-detection guesses wrong.
+    # ANY failure (no Postgres, unreachable, table/column not found, id mismatch) →
+    # callers simply keep the onboarding officer, so this never breaks the page.
+    _ALLOC_TTL_SECONDS = 900
+    _ALLOC_CUST_COLS = ('customer_id', 'customer_no', 'customer_number', 'cif', 'cif_no',
+                        'cif_number', 'cust_id', 'client_id', 'customer_cif', 'cust_no')
+    _ALLOC_CODE_COLS = ('sales_code', 'salescode', 'sales_cd', 'sc_code', 'rm_code', 'officer_code')
+    _ALLOC_NAME_COLS = ('rm_name', 'relationship_manager_name', 'relationship_manager',
+                        'officer_name', 'account_officer_name', 'account_officer', 'manager_name',
+                        'staff_name', 'rm_full_name', 'rm')
+    _ALLOC_DATE_COLS = ('allocated_date', 'allocation_date', 'alloc_date', 'as_of_date',
+                        'snapshot_date', 'effective_date', 'updated_at', 'modified_date', 'date')
+
+    @staticmethod
+    def _alloc_env(key: str) -> str:
+        import os
+        return (os.environ.get(key) or '').strip()
+
+    def _alloc_schema(self) -> dict[str, str] | None:
+        """Resolve + memoise the allocation table and its columns from the curated
+        Postgres. Returns {table, cust_col, name_col, code_col, date_col} or None when
+        Postgres is absent/unreachable or no suitable table is found. Negative results
+        are cached on a TTL so a down PG is retried, not hammered every request."""
+        if self._pg is None:
+            return None
+        now = time.monotonic()
+        if self._alloc_meta is not None and (now - self._alloc_meta_at) < self._ALLOC_TTL_SECONDS:
+            return self._alloc_meta or None    # {} sentinel => probed, unavailable
+        try:
+            meta = self._probe_alloc_schema()
+        except Exception:
+            meta = None
+        self._alloc_meta = meta or {}          # cache the negative result too (TTL-bounded)
+        self._alloc_meta_at = now
+        return meta
+
+    def _probe_alloc_schema(self) -> dict[str, str] | None:
+        table = self._alloc_env('PG_ALLOC_TABLE')   # explicit pin wins
+        if not table:
+            rows = self._pg.execute(
+                "SELECT table_schema, table_name FROM information_schema.tables "
+                "WHERE table_name ILIKE %s "
+                "ORDER BY (table_name ILIKE %s) DESC, table_name LIMIT 1",
+                ('%allocat%', '%retail%allocat%'))
+            if not rows:
+                return None
+            table = f"{rows[0]['table_schema']}.{rows[0]['table_name']}"
+        tbl_only = table.split('.')[-1]
+        cols = [str(r['column_name']).lower() for r in self._pg.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s", (tbl_only,))]
+        if not cols:
+            return None
+
+        def pick(env_key: str, priority: tuple[str, ...]) -> str:
+            pinned = self._alloc_env(env_key).lower()
+            if pinned and pinned in cols:
+                return pinned
+            for cand in priority:                    # exact column name first
+                if cand in cols:
+                    return cand
+            for cand in priority:                    # then a substring match
+                for c in cols:
+                    if cand in c:
+                        return c
+            return ''
+
+        cust = pick('PG_ALLOC_CUST_COL', self._ALLOC_CUST_COLS)
+        name = pick('PG_ALLOC_NAME_COL', self._ALLOC_NAME_COLS)
+        code = pick('PG_ALLOC_CODE_COL', self._ALLOC_CODE_COLS)
+        dcol = pick('PG_ALLOC_DATE_COL', self._ALLOC_DATE_COLS)
+        if not cust or not (name or code):
+            return None                              # can't map customer → RM; give up
+        return {'table': table, 'cust_col': cust, 'name_col': name, 'code_col': code, 'date_col': dcol}
+
+    def get_current_rm(self, cust_ids) -> dict[str, dict[str, Any]]:
+        """Map each customer id → their CURRENT RM ``{'name','code'}`` from the curated
+        Postgres allocation. Returns ``{}`` (callers then keep the onboarding officer)
+        when the allocation is unavailable or none of the ids are allocated. Batched and
+        never raises — a failure degrades to the onboarding officer, never an error."""
+        ids = [str(c) for c in cust_ids if c is not None and str(c).strip()]
+        if not ids:
+            return {}
+        meta = self._alloc_schema()
+        if not meta:
+            return {}
+        try:
+            cust, name, code, dcol = (meta['cust_col'], meta['name_col'],
+                                      meta['code_col'], meta['date_col'])
+            select = [f"TRIM(CAST({cust} AS text)) AS cid",
+                      (f"{name} AS rm_name" if name else "NULL AS rm_name"),
+                      (f"{code} AS sales_code" if code else "NULL AS sales_code")]
+            order = f" ORDER BY {dcol} DESC NULLS LAST" if dcol else ""
+            placeholders = ','.join(['%s'] * len(ids))
+            rows = self._pg.execute(
+                f"SELECT {', '.join(select)} FROM {meta['table']} "
+                f"WHERE TRIM(CAST({cust} AS text)) IN ({placeholders}){order}", tuple(ids))
+        except Exception:
+            return {}
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            cid = str(r.get('cid') or '').strip()
+            if not cid or cid in out:                # first row per customer wins (latest, if ordered)
+                continue
+            nm, cd = self._clean(r.get('rm_name')), self._clean(r.get('sales_code'))
+            if nm or cd:
+                out[cid] = {'name': nm, 'code': cd}
+        return out
+
     # 'INTERNAL ACCOUNTS' is the bank's own ledger/clearing/suspense estate (CBK
     # clearing, M-Pesa float, treasury margin, nostro) — NOT customers. They carry
     # huge volatile/negative balances that distort every portfolio aggregate, so they
@@ -473,16 +595,29 @@ class TrinoWarehouse(WarehouseGateway):
         status = (r.get('cust_status') or '').strip().upper()
         id_no = self._clean(r.get('customer_id_no'))
         cust_type = r.get('cust_type')
+        # RM: prefer the CURRENT allocation (retail_allocated_portfolio, curated
+        # Postgres); fall back to the account-opening officer when the allocation is
+        # unavailable or this customer isn't allocated. rm_source lets the header label
+        # which one it is, so a fallback name is never passed off as the current RM.
+        onboard_name = self._officer_name(r.get('created_emp_name'))
+        onboard_code = self._officer_id(r.get('created_emp_id'))
+        alloc = self.get_current_rm([r['id']]).get(str(r['id']))
+        if alloc and (alloc.get('name') or alloc.get('code')):
+            rm_name = alloc.get('name') or onboard_name
+            sales_code = alloc.get('code') or onboard_code
+            rm_source = 'allocation'
+        else:
+            rm_name, sales_code, rm_source = onboard_name, onboard_code, 'onboarding'
         return {
             'cust_id': str(r['id']),
             'name': self._clean(r.get('full_name')),
             'segment': self._seg_label(r.get('customer_segment')),
             'branch': self._clean(r.get('account_branch_name')),
-            # Servicing officer: dim_customer.created_emp_name is the real person who
-            # holds the record (fk_bankemployeeid is a migration placeholder — 'MIG_CIS').
-            # It's the closest reachable RM; system/migration users are filtered out.
-            'rm_name': self._officer_name(r.get('created_emp_name')),
-            'sales_code': self._officer_id(r.get('created_emp_id')),
+            'rm_name': rm_name,
+            'sales_code': sales_code,
+            # 'allocation' = current RM from retail_allocated_portfolio; 'onboarding' =
+            # the account-opening officer fallback (labelled honestly in the header).
+            'rm_source': rm_source,
             'mobile': self._clean(r.get('primary_mobile_no')),
             'email': self._clean(r.get('e_mail')),
             'id_no': id_no,
@@ -649,6 +784,15 @@ class TrinoWarehouse(WarehouseGateway):
             })
             if len(out) >= int(limit):
                 break
+        # Prefer the current RM allocation over the account-opening officer (one batched
+        # lookup; a no-op when the Postgres allocation is unavailable).
+        alloc = self.get_current_rm([row['cust_id'] for row in out])
+        if alloc:
+            for row in out:
+                cur = alloc.get(row['cust_id'])
+                if cur:
+                    row['rm_name'] = cur.get('name') or row['rm_name']
+                    row['sales_code'] = cur.get('code') or row['sales_code']
         return out
 
     # --- product holdings (canonical flags derived from real products) --------
@@ -884,18 +1028,22 @@ class TrinoWarehouse(WarehouseGateway):
             f"SELECT CAST(customer_id AS BIGINT) id, full_name, customer_segment, "
             f"account_branch_name, created_emp_id, created_emp_name, employer, fk_bankemployeeid "
             f"FROM delta.gold_db.dim_customer WHERE customer_id IN ({inlist})")}
+        # Current RM for the whole batch in one lookup (empty when Postgres allocation
+        # is unavailable → each row keeps its account-opening officer).
+        alloc = self.get_current_rm(ids)
         out = []
         for i in ids:
             dv, dn = dep.get(i, (0.0, 0))
             lv, ln = loan.get(i, (0.0, 0))
             ident = idn.get(i, {})
+            cur = alloc.get(str(i)) or {}
             out.append({
                 'cust_id': str(i),
                 'name': self._clean(ident.get('full_name')) or f'Customer {i}',
                 'segment': self._seg_label(ident.get('customer_segment')),
                 'branch': self._clean(ident.get('account_branch_name')),
-                'sales_code': self._officer_id(ident.get('created_emp_id')),
-                'rm_name': self._officer_name(ident.get('created_emp_name')),
+                'sales_code': cur.get('code') or self._officer_id(ident.get('created_emp_id')),
+                'rm_name': cur.get('name') or self._officer_name(ident.get('created_emp_name')),
                 'value': round(dv + lv), 'deposits': round(dv), 'loans': round(lv),
                 'products_held': dn + ln,
                 'is_staff': is_staff_from_fields(

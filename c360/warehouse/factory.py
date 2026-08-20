@@ -22,10 +22,17 @@ def get_gateway() -> WarehouseGateway:
         from .trino.trino_gateway import TrinoWarehouse
 
         trino_conn = TrinoDBAPIConnector(settings.C360['trino_config'])
-        # A dedicated Postgres connector would slot in here; for now the same
-        # execute() protocol is reused. Wiring the curated-Postgres reader is a
-        # follow-up once its credentials are issued.
-        return TrinoWarehouse(trino_conn)
+        # Curated reporting Postgres — holds the CURRENT customer→RM allocation
+        # (retail_allocated_portfolio) that core banking only carries as the frozen
+        # account-opening officer. Wired only when PG_HOST is configured; the gateway
+        # falls back to the onboarding officer when it is absent or unreachable, so an
+        # unset / down Postgres never breaks live mode.
+        pg_cfg = settings.C360.get('postgres_config') or {}
+        pg_conn = None
+        if pg_cfg.get('host'):
+            from .connector import PostgresDBAPIConnector
+            pg_conn = PostgresDBAPIConnector(pg_cfg)
+        return TrinoWarehouse(trino_conn, postgres=pg_conn)
 
     from .mock.mock_gateway import MockWarehouse
     return MockWarehouse()
