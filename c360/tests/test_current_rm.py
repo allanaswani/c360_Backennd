@@ -133,7 +133,7 @@ class _BookPG:
                      'aum': 500000, 'contribution': 20000, 'npl': 0}]
         if 'count(*) as customers' in s:
             return [{'customers': 42, 'aum': 1000000, 'deposits': 400000, 'loans': 600000,
-                     'contribution': 50000, 'npl_customers': 3}]
+                     'contribution': 50000, 'npl_customers': 3, 'npl_aum': 120000}]
         return []
 
 
@@ -144,6 +144,7 @@ class BookSummaryTests(SimpleTestCase):
         self.assertEqual(b['customers'], 42)
         self.assertEqual(b['aum'], 1000000)
         self.assertEqual(b['npl_customers'], 3)
+        self.assertEqual(b['npl_aum'], 120000)
         self.assertFalse(b['whole_book'])
         self.assertEqual(len(b['segments']), 2)
         self.assertEqual(b['top_customers'][0]['name'], 'ACME LTD')

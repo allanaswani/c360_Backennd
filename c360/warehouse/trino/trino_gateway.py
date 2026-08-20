@@ -539,7 +539,8 @@ class TrinoWarehouse(WarehouseGateway):
                            COALESCE(SUM(deposit), 0)           AS deposits,
                            COALESCE(SUM(loans), 0)             AS loans,
                            COALESCE(SUM(net_after_expense), 0) AS contribution,
-                           COALESCE(SUM(CASE WHEN npl <> 0 THEN 1 ELSE 0 END), 0) AS npl_customers
+                           COALESCE(SUM(CASE WHEN npl <> 0 THEN 1 ELSE 0 END), 0) AS npl_customers,
+                           COALESCE(SUM(CASE WHEN npl <> 0 THEN aum_cust_id ELSE 0 END), 0) AS npl_aum
                     FROM customer_allocation_base {where}""", params)
             segs = self._pg.execute(
                 f"""SELECT main_segment AS segment, COUNT(*) AS n,
@@ -572,6 +573,7 @@ class TrinoWarehouse(WarehouseGateway):
             'loans': round(_n(h.get('loans'))),
             'contribution': round(_n(h.get('contribution'))),
             'npl_customers': int(h.get('npl_customers') or 0),
+            'npl_aum': round(_n(h.get('npl_aum'))),
             'segments': [{'segment': self._clean(s.get('segment')) or 'Unsegmented',
                           'customers': int(s.get('n') or 0), 'aum': round(_n(s.get('aum')))}
                          for s in segs],
