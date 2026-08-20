@@ -95,3 +95,28 @@ class CurrentRmTests(SimpleTestCase):
         c = gw.get_customer('39002')                          # must not raise
         self.assertEqual(c['rm_name'], 'JANE ONBOARDING')
         self.assertEqual(c['rm_source'], 'onboarding')
+
+
+class _ProfitPG:
+    """Answers the customer_allocation_base lookup with one populated row."""
+
+    def execute(self, sql, params=None):
+        s = sql.lower()
+        if 'customer_allocation_base' in s:
+            return [{'aum_cust_id': 40789262.64, 'net_after_expense': 18517.53, 'npl': 0,
+                     'main_segment': 'BUSINESS', 'rm_name_prev': 'OLD RM', 'rm_code_prev': 'OR1'}]
+        return []
+
+
+class ProfitabilityTests(SimpleTestCase):
+    def test_reads_aum_profitability_npl(self):
+        gw = TrinoWarehouse(_FakeTrino(), postgres=_ProfitPG())
+        p = gw.get_profitability('134909')
+        self.assertEqual(round(p['aum']), 40789263)
+        self.assertEqual(round(p['contribution']), 18518)
+        self.assertFalse(p['npl'])                            # npl 0 → performing
+        self.assertEqual(p['prev_rm'], 'OLD RM')
+
+    def test_none_without_postgres(self):
+        gw = TrinoWarehouse(_FakeTrino(), postgres=None)
+        self.assertIsNone(gw.get_profitability('134909'))

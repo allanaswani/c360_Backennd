@@ -64,6 +64,12 @@ class ApiTests(TestCase):
         ltd = m['loan_to_deposit']
         self.assertTrue(ltd.get('value') is not None or ltd.get('label'))
         self.assertTrue(ltd.get('note'))
+        # AUM / profitability / loan status exist; in mock they are honestly not-sourced
+        # (no Postgres allocation base), never a fabricated number.
+        for k in ('aum', 'profitability', 'npl_status'):
+            self.assertIn(k, m)
+            self.assertEqual(m[k]['status'], 'to_source')
+            self.assertTrue(m[k].get('note'))
 
     def test_preview_domain_empty_state_is_explained(self):
         # Retail customer with no mortgage → Properties has an honest empty reason.

@@ -20,7 +20,7 @@ from typing import Any
 from ..warehouse.factory import data_mode
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.periods import ResolvedPeriod
-from ..warehouse.provenance import Provenance, Series, derived, live
+from ..warehouse.provenance import Provenance, Series, derived, live, to_source
 
 # In mock, per-customer series are a simulated must-build derivation → PREVIEW.
 # In live, they are real (EOM day-grouped balances / rpt_c360 summaries) → LIVE.
@@ -60,6 +60,13 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
     net_position = deposits - loans
     series_status, series_note = _provenance()
 
+    # AUM + profitability + NPL from the reporting Postgres (customer_allocation_base).
+    # None when that source isn't wired (mock / Postgres down) → badged 'not sourced'.
+    try:
+        prof = gateway.get_profitability(cust_id)
+    except Exception:
+        prof = None
+
     return {
         'cust_id': cust_id,
         'period': period.to_dict(),
@@ -73,6 +80,11 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             # Derived ratio reads (from the live snapshot) — leverage + channel reach.
             'loan_to_deposit': _leverage_metric(deposits, loans),
             'active_channels': live(len(channels), unit='count').to_dict(),
+            # AUM + profitability from the reporting Postgres (LIVE where sourced, else
+            # honestly 'not sourced' — never a fabricated figure).
+            'aum': _aum_metric(prof),
+            'profitability': _profitability_metric(prof),
+            'npl_status': _npl_metric(prof),
         },
         # ---- charts, each answering a stated question ---------------------
         'charts': {
@@ -128,6 +140,28 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             },
         },
     }
+
+
+def _aum_metric(prof: dict | None) -> dict[str, Any]:
+    if prof and prof.get('aum') is not None:
+        return live(round(prof['aum']), unit='KES',
+                    note='Assets under management (customer_allocation_base).').to_dict()
+    return to_source(unit='KES', note='AUM pending the allocation feed.').to_dict()
+
+
+def _profitability_metric(prof: dict | None) -> dict[str, Any]:
+    if prof and prof.get('contribution') is not None:
+        return live(round(prof['contribution']), unit='KES',
+                    note='Net contribution after expense (customer_allocation_base).').to_dict()
+    return to_source(unit='KES', note='Profitability pending the allocation feed.').to_dict()
+
+
+def _npl_metric(prof: dict | None) -> dict[str, Any]:
+    """Loan performance status from the allocation base's NPL flag."""
+    if prof is None or prof.get('npl') is None:
+        return to_source(note='Loan-performance flag pending the allocation feed.').to_dict()
+    status = 'Non-performing' if prof['npl'] else 'Performing'
+    return derived(status, note='From the NPL flag on customer_allocation_base.').to_dict()
 
 
 def _leverage_metric(deposits: float, loans: float) -> dict[str, Any]:

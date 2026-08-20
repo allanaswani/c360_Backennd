@@ -159,6 +159,13 @@ class WarehouseGateway(abc.ABC):
     def get_current_rm(self, cust_ids) -> dict[str, dict[str, Any]]:
         return {}
 
+    # --- profitability / AUM (optional capability) ----------------------------
+    # Default: not available (callers badge AUM/profitability 'not sourced'). The live
+    # gateway overrides this to read AUM + net contribution + NPL from the curated
+    # Postgres (customer_allocation_base): {'aum','contribution','npl','main_segment','prev_rm'}.
+    def get_profitability(self, cust_id) -> dict[str, Any] | None:
+        return None
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

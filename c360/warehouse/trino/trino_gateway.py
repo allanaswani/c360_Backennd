@@ -482,6 +482,41 @@ class TrinoWarehouse(WarehouseGateway):
                 out[cid] = {'name': nm, 'code': cd}
         return out
 
+    def get_profitability(self, cust_id) -> dict[str, Any] | None:
+        """Per-customer AUM + net contribution + NPL flag from the reporting Postgres
+        ``customer_allocation_base`` (100% populated). Returns None when Postgres is
+        absent/unreachable or the customer isn't in the allocation base. Never raises —
+        callers then badge these figures 'not sourced' rather than showing a fake."""
+        if self._pg is None:
+            return None
+        cid = str(cust_id).strip()
+        if not cid:
+            return None
+        try:
+            rows = self._pg.execute(
+                "SELECT aum_cust_id, net_after_expense, npl, main_segment, "
+                "rm_name_prev, rm_code_prev FROM customer_allocation_base "
+                "WHERE TRIM(CAST(cust_id AS text)) = %s LIMIT 1", (cid,))
+        except Exception:
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+
+        def _num(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            'aum': _num(r.get('aum_cust_id')),
+            'contribution': _num(r.get('net_after_expense')),   # net after expense = profitability
+            'npl': bool(_num(r.get('npl')) or 0),
+            'main_segment': self._clean(r.get('main_segment')),
+            'prev_rm': self._clean(r.get('rm_name_prev')),      # previous RM (reassignment signal)
+        }
+
     # 'INTERNAL ACCOUNTS' is the bank's own ledger/clearing/suspense estate (CBK
     # clearing, M-Pesa float, treasury margin, nostro) — NOT customers. They carry
     # huge volatile/negative balances that distort every portfolio aggregate, so they
