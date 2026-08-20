@@ -5,6 +5,8 @@ through the gateway. No business logic here; views orchestrate and serialise.
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.permissions import AllowAny
@@ -248,6 +250,43 @@ class WorklistView(APIView):
         return Response({'count': len(rows), 'results': rows})
 
 
+_HEALTH_CAPTURE_MIN_GAP = timedelta(minutes=10)   # don't write a row on every refresh
+_HEALTH_HISTORY_LIMIT = 60                        # points charted on the trend graphs
+
+
+def _capture_health_snapshot(report: dict) -> None:
+    """Store one health snapshot, throttled, so the admin page accrues a time series.
+    Live mode only; never lets a persistence hiccup break the health view."""
+    if report.get('data_mode') != 'live':
+        return
+    from ..models import HealthSnapshot
+    try:
+        last = HealthSnapshot.objects.first()   # newest (Meta ordering -captured_at)
+        if last and (timezone.now() - last.captured_at) < _HEALTH_CAPTURE_MIN_GAP:
+            return
+        days = (report.get('freshness') or {}).get('days_behind')
+        HealthSnapshot.objects.create(days_behind=days, payload=report)
+    except Exception:
+        pass
+
+
+def _health_history() -> list[dict]:
+    """Recent snapshots in chronological order, compacted for charting: freshness and,
+    per source, its value / status / latency at each capture."""
+    from ..models import HealthSnapshot
+    try:
+        snaps = list(HealthSnapshot.objects.all()[:_HEALTH_HISTORY_LIMIT])
+    except Exception:
+        return []
+    out = []
+    for sn in reversed(snaps):   # oldest → newest for a left-to-right line
+        checks = {c.get('key'): {'value': c.get('value'), 'status': c.get('status'),
+                                 'latency_ms': c.get('latency_ms')}
+                  for c in (sn.payload.get('checks') or [])}
+        out.append({'at': sn.captured_at.isoformat(), 'days_behind': sn.days_behind, 'checks': checks})
+    return out
+
+
 class DataHealthView(APIView):
     """Admin-only live-warehouse health — freshness, table reachability and row counts.
     Surfaces the exact conditions that have silently broken the app before (a frozen
@@ -261,4 +300,7 @@ class DataHealthView(APIView):
         report = get_gateway().health_report()
         report['data_mode'] = data_mode()
         report['generated_at'] = timezone.now().isoformat()
+        # Persist a throttled snapshot so the page can chart trends, then attach history.
+        _capture_health_snapshot(report)
+        report['history'] = _health_history()
         return Response(report)

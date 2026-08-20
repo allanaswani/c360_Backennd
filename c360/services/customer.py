@@ -137,6 +137,17 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     rm_note = ('Account-opening officer — current RM allocation not available.'
                if c.get('rm_source') == 'onboarding' and c.get('rm_name') else None)
 
+    # Previous RM (reassignment signal) from the allocation base, shown only when it
+    # genuinely differs from the current RM. Optional; absent → simply not rendered.
+    prev_rm = None
+    try:
+        prof = gateway.get_profitability(cust_id)
+        pr = prof.get('prev_rm') if prof else None
+        if pr and pr != c.get('rm_name'):
+            prev_rm = pr
+    except Exception:
+        prev_rm = None
+
     return {
         'cust_id': c['cust_id'],
         'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
@@ -145,6 +156,7 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
             'segment': live(c['segment']).to_dict(),
             'branch': live(c['branch']).to_dict(),
             'rm_name': live(c.get('rm_name'), note=rm_note).to_dict(),
+            'rm_previous': live(prev_rm).to_dict() if prev_rm else None,
             'sales_code': live(c.get('sales_code')).to_dict(),
             'mobile': live(c.get('mobile')).to_dict(),
             'email': live(c.get('email')).to_dict(),

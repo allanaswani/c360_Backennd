@@ -241,17 +241,22 @@ class TrinoWarehouse(WarehouseGateway):
 
     def _run_health_check(self, key, label, group, table, mode):
         base = {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1]}
+        t0 = time.monotonic()
         try:
             if mode == 'count':
                 rows = self._t.execute(f"SELECT COUNT(*) n FROM {table}")
                 n = int(rows[0]['n']) if rows else 0
-                return {**base, 'status': 'ok' if n > 0 else 'empty', 'value': n,
-                        'detail': f'{n:,} rows' if n > 0 else 'table is empty — source data not loaded'}
-            present = bool(self._t.execute(f"SELECT 1 FROM {table} LIMIT 1"))
-            return {**base, 'status': 'ok' if present else 'empty', 'value': present,
-                    'detail': 'reachable, has rows' if present else 'empty / no rows'}
+                out = {**base, 'status': 'ok' if n > 0 else 'empty', 'value': n,
+                       'detail': f'{n:,} rows' if n > 0 else 'table is empty — source data not loaded'}
+            else:
+                present = bool(self._t.execute(f"SELECT 1 FROM {table} LIMIT 1"))
+                out = {**base, 'status': 'ok' if present else 'empty', 'value': 1 if present else 0,
+                       'detail': 'reachable, has rows' if present else 'empty / no rows'}
+            out['latency_ms'] = round((time.monotonic() - t0) * 1000)
+            return out
         except Exception as e:
             return {**base, 'status': 'error', 'value': None,
+                    'latency_ms': round((time.monotonic() - t0) * 1000),
                     'detail': f'{type(e).__name__}: {str(e)[:140]}'}
 
     def health_report(self):

@@ -100,6 +100,7 @@ class ApiTests(TestCase):
         self.assertIn('data_mode', body)
         self.assertIn('checks', body)
         self.assertIn('generated_at', body)
+        self.assertIn('history', body)   # trend series for the native monitoring graphs
 
     def test_linked_parties_shape(self):
         # Mock has no linking, so the endpoint returns an empty, well-formed body

@@ -148,6 +148,24 @@ class RecommendationFeedback(models.Model):
         return None
 
 
+class HealthSnapshot(models.Model):
+    """A point-in-time capture of the warehouse health report, so the admin Data-health
+    page can chart trends (freshness over time, per-source row counts, latency) — a
+    native, in-app equivalent of a Grafana board, inside Customer 360's own auth. Written
+    on a throttle when an admin views the page, and by the ``capture_health`` command."""
+
+    captured_at = models.DateTimeField(default=timezone.now, db_index=True)
+    days_behind = models.IntegerField(null=True, blank=True)   # freshness at capture
+    payload = models.JSONField()                               # the full health_report
+
+    class Meta:
+        db_table = 'c360_health_snapshot'
+        ordering = ['-captured_at']
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f'health @ {self.captured_at:%Y-%m-%d %H:%M} (days_behind={self.days_behind})'
+
+
 @receiver(post_save, sender=User)
 def create_user_profile(sender, instance, created, **kwargs):
     """Every user gets a Profile on creation. We never email a password here — the
