@@ -27,6 +27,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from ..auth.claims import apply_claims
@@ -54,6 +55,39 @@ def _issue_tokens(user: User) -> dict:
     refresh = RefreshToken.for_user(user)
     apply_claims(refresh, user)
     return {'access': str(refresh.access_token), 'refresh': str(refresh)}
+
+
+class ClaimsTokenRefreshView(APIView):
+    """Stateless silent-refresh: verify the refresh token and mint a fresh access token
+    carrying the same identity/RBAC claims — WITHOUT rotation or blacklisting.
+
+    Why not the stock ``TokenRefreshView``: with ``ROTATE_REFRESH_TOKENS`` +
+    ``BLACKLIST_AFTER_ROTATION`` it writes an ``OutstandingToken`` keyed to a database
+    user. A portfolio-minted single-sign-on token has no such user in Customer 360's DB,
+    so rotation raises a foreign-key error (HTTP 500) and the SPA can NEVER refresh —
+    the 30-minute access token simply expires and every call returns
+    ``token_not_valid: Token is expired``. Customer 360 already trusts the token's claims
+    (see ``auth/claims.py``); here we only verify the refresh token's signature + expiry
+    and re-issue an access token. ``RefreshToken.access_token`` copies every non-reserved
+    claim, so identity/RBAC ride along. Works identically for a portfolio token and a
+    Customer-360-issued one (both are enriched with the same claims), touches no database
+    row that could be missing, and cannot 500. The response is ``{"access": ...}`` only;
+    the client keeps its existing (still-valid, up to 7-day) refresh token."""
+
+    authentication_classes: list = []
+    permission_classes = [AllowAny]
+
+    def post(self, request: Request) -> Response:
+        raw = (request.data or {}).get('refresh')
+        if not raw:
+            return Response({'detail': 'A refresh token is required.', 'code': 'token_not_valid'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            refresh = RefreshToken(raw)   # verifies signature, expiry, type, blacklist
+        except TokenError:
+            return Response({'detail': 'Token is invalid or expired', 'code': 'token_not_valid'},
+                            status=status.HTTP_401_UNAUTHORIZED)
+        return Response({'access': str(refresh.access_token)})
 
 
 def _mask_email(email: str) -> str:

@@ -1,5 +1,4 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from . import auth_views, feedback_views, views
 
@@ -10,10 +9,12 @@ urlpatterns = [
     # --- auth: JWT + login 2FA (admin-provisioned users; no self-service) ---
     # Sign-in is two-step: login/ verifies the password and emails a code; login/verify/
     # exchanges the code for tokens. (No single-step token endpoint, so 2FA can't be
-    # bypassed.) token/refresh/ powers the SPA's silent refresh.
+    # bypassed.) token/refresh/ powers the SPA's silent refresh — a STATELESS refresh
+    # (no rotation/blacklist) so it can also refresh a portfolio single-sign-on token,
+    # whose user isn't in Customer 360's DB (the stock view 500s on that). See the view.
     path('auth/login/', auth_views.LoginStartView.as_view(), name='auth-login'),
     path('auth/login/verify/', auth_views.LoginVerifyView.as_view(), name='auth-login-verify'),
-    path('auth/token/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
+    path('auth/token/refresh/', auth_views.ClaimsTokenRefreshView.as_view(), name='token-refresh'),
     path('auth/password-reset/', auth_views.PasswordResetRequestView.as_view(), name='auth-password-reset'),
     path('auth/password-reset/confirm/', auth_views.PasswordResetConfirmView.as_view(), name='auth-password-reset-confirm'),
     path('auth/logout/', auth_views.LogoutAPIView.as_view(), name='auth-logout'),
