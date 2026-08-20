@@ -374,9 +374,12 @@ class TrinoWarehouse(WarehouseGateway):
     # resolution, and let PG_ALLOC_* env vars pin them if auto-detection guesses wrong.
     # ANY failure (no Postgres, unreachable, table/column not found, id mismatch) →
     # callers simply keep the onboarding officer, so this never breaks the page.
+    # Column priorities lead with the CONFIRMED HF names (retail_allocated_portfolio:
+    # cust_id / rm_name / sales_code — verified against the portfolio backend's queries),
+    # then generic fallbacks for other environments. PG_ALLOC_* env vars still override.
     _ALLOC_TTL_SECONDS = 900
-    _ALLOC_CUST_COLS = ('customer_id', 'customer_no', 'customer_number', 'cif', 'cif_no',
-                        'cif_number', 'cust_id', 'client_id', 'customer_cif', 'cust_no')
+    _ALLOC_CUST_COLS = ('cust_id', 'customer_id', 'cust_cif', 'customer_no', 'customer_number',
+                        'cif', 'cif_no', 'cif_number', 'client_id', 'customer_cif', 'cust_no')
     _ALLOC_CODE_COLS = ('sales_code', 'salescode', 'sales_cd', 'sc_code', 'rm_code', 'officer_code')
     _ALLOC_NAME_COLS = ('rm_name', 'relationship_manager_name', 'relationship_manager',
                         'officer_name', 'account_officer_name', 'account_officer', 'manager_name',
