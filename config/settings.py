@@ -232,6 +232,24 @@ REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
 }
 
 # ---------------------------------------------------------------------------
+# Logging — send app errors + unhandled request exceptions to stderr so they land in
+# the container logs (docker logs c360-backend). Django's default routes request
+# errors to mail_admins and silences the console when DEBUG=False, which hides the
+# real cause of a 500 behind the generic error envelope — this restores the traceback.
+# ---------------------------------------------------------------------------
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'formatters': {'plain': {'format': '%(asctime)s %(levelname)s %(name)s %(message)s'}},
+    'handlers': {'console': {'class': 'logging.StreamHandler', 'formatter': 'plain'}},
+    'loggers': {
+        'c360': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
+        'django.request': {'handlers': ['console'], 'level': 'ERROR', 'propagate': False},
+    },
+    'root': {'handlers': ['console'], 'level': 'WARNING'},
+}
+
+# ---------------------------------------------------------------------------
 # Email — used to deliver OTP / password-reset codes. Dev uses the console backend
 # (mail is printed to the server log); point EMAIL_* at SMTP for real delivery.
 # ---------------------------------------------------------------------------

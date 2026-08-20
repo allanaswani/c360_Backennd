@@ -6,9 +6,13 @@ bare ``--``.
 """
 from __future__ import annotations
 
+import logging
+
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler as drf_exception_handler
+
+logger = logging.getLogger('c360.api')
 
 
 def exception_handler(exc, context):
@@ -21,7 +25,14 @@ def exception_handler(exc, context):
             }
         }
         return response
-    # Unhandled — fail with a clear message rather than a 500 HTML page.
+    # Unhandled — LOG the full traceback so it lands in the container logs (docker logs
+    # c360-backend), then return a clean envelope instead of an HTML 500 page. Without
+    # this the generic message below is all anyone sees and the real cause is invisible.
+    view = context.get('view') if context else None
+    request = context.get('request') if context else None
+    logger.exception('Unhandled error in %s (%s %s)', view,
+                     getattr(request, 'method', '?'),
+                     getattr(request, 'path', '?'), exc_info=exc)
     return Response(
         {'error': {'status': 500, 'detail': 'Unexpected error resolving this view.'}},
         status=status.HTTP_500_INTERNAL_SERVER_ERROR,
