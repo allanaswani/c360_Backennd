@@ -95,11 +95,14 @@ class PostgresDBAPIConnector:
         if self._conn is None or getattr(self._conn, 'closed', 0):
             import psycopg2  # imported lazily; not needed in mock mode / if PG unused
             cfg = self._config
-            self._conn = psycopg2.connect(
+            kwargs = dict(
                 host=cfg['host'], port=cfg.get('port', 5432),
                 dbname=cfg['dbname'], user=cfg['user'], password=cfg.get('password', ''),
                 connect_timeout=int(cfg.get('connect_timeout', 5)),
             )
+            if cfg.get('sslmode'):     # only override libpq's default when explicitly set
+                kwargs['sslmode'] = cfg['sslmode']
+            self._conn = psycopg2.connect(**kwargs)
             self._conn.autocommit = True   # read-only reporting queries, no txn needed
         return self._conn
 

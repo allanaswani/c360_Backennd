@@ -337,5 +337,9 @@ C360 = {
         'dbname': os.environ.get('PG_DBNAME', ''),
         'user': os.environ.get('PG_USER', ''),
         'password': os.environ.get('PG_PASSWORD', ''),
+        # Optional libpq sslmode (disable/allow/prefer/require/verify-ca/verify-full).
+        # Unset → libpq default ('prefer'). Set PG_SSLMODE=require if the warehouse's
+        # pg_hba.conf only has hostssl rules for this user.
+        'sslmode': os.environ.get('PG_SSLMODE', '').strip() or None,
     },
 }
