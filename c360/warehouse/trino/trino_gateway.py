@@ -137,29 +137,62 @@ class TrinoWarehouse(WarehouseGateway):
         self._internal_ids_cache: list[int] | None = None
 
     # --- anchors ---------------------------------------------------------
-    # The as-of anchor pins EVERY figure in the app to the warehouse's last closed
-    # business date (bank_parameters.prev_trx_date). The gateway is one lru_cached
-    # instance per worker, so this MUST expire: without a TTL the whole app freezes on
-    # whatever date the worker booted on and silently drifts stale as the warehouse
-    # rolls forward daily. Re-read on the same 30-min cadence as the whole-book memo.
+    # The as-of anchor pins EVERY figure in the app to the warehouse's most recent
+    # AVAILABLE snapshot date. That is NOT simply bank_parameters.prev_trx_date: the
+    # eom_deposits / eom_loans fact tables are loaded daily but lag the business date
+    # (deposits by up to a day; both skip weekends/holidays). Pinning to the raw
+    # business date silently returns 0 whenever that exact day has not posted yet — a
+    # deposit-only customer then reads 'KES 0' while the balance is one day back. So we
+    # resolve to the newest date present in BOTH fact tables, on or before the business
+    # date, giving a single consistent non-empty snapshot. The gateway is one lru_cached
+    # instance per worker, so this MUST expire: without a TTL a worker freezes on
+    # whatever date it booted on and silently drifts stale as the warehouse rolls
+    # forward daily. Re-read on the same 30-min cadence as the whole-book memo.
     _ASOF_TTL_SECONDS = 1800
 
     def as_of_date(self) -> date:
         now = time.monotonic()
         if self._as_of is not None and (now - self._as_of_at) < self._ASOF_TTL_SECONDS:
             return self._as_of
-        rows = self._t.execute(
-            "SELECT prev_trx_date AS d FROM delta.gold_db.bank_parameters LIMIT 1"
-        )
-        if rows and rows[0].get('d'):
-            self._as_of = rows[0]['d']
+        resolved = self._resolve_as_of()
+        if resolved is not None:
+            self._as_of = resolved
             self._as_of_at = now
         elif self._as_of is None:
-            # Nothing to read and no prior value → last resort. (A transient empty read
+            # Nothing readable and no prior value → last resort. (A transient empty read
             # never clobbers a good cached date back to today().)
             self._as_of = date.today()
             self._as_of_at = now
         return self._as_of
+
+    def _resolve_as_of(self) -> date | None:
+        """The latest snapshot date the value tables actually hold, on or before the
+        bank's business date. Deposits and loans can each lag the business date and skip
+        non-working days, so we take the newest ``eom_date`` present in BOTH tables — the
+        two figures are then a single, consistent, non-empty snapshot. The probe is
+        bounded to a short recent window and partition-pruned so it stays cheap on the
+        2.37B-row fact tables. Returns None only when nothing at all is readable (so the
+        caller keeps any previously cached date rather than snapping to today())."""
+        rows = self._t.execute(
+            "SELECT prev_trx_date AS d FROM delta.gold_db.bank_parameters LIMIT 1")
+        biz = rows[0]['d'] if rows and rows[0].get('d') else None
+        if biz is None:
+            return None
+        lo = biz - timedelta(days=10)   # covers a long weekend / public-holiday gap
+        months = ','.join(str(m) for m in self._months_between(lo, biz))
+
+        def _latest(table: str) -> date | None:
+            r = self._t.execute(
+                f"SELECT max(eom_date) AS d FROM delta.gold_db.{table} "
+                f"WHERE eom_date <= DATE '{biz.isoformat()}' AND eom_date >= DATE '{lo.isoformat()}' "
+                f"AND (partition_year * 100 + partition_month) IN ({months})")
+            return r[0]['d'] if r and r[0].get('d') else None
+
+        dep, loan = _latest('eom_deposits'), _latest('eom_loans')
+        if dep and loan:
+            return min(dep, loan)          # newest date both tables share
+        # One side unreadable in the window → use whichever we have, else the biz date.
+        return dep or loan or biz
 
     def _as_of_lit(self) -> str:
         # Our own validated date value → safe to inline (enables partition pruning).
