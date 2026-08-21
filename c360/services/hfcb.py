@@ -145,7 +145,9 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
 def _aum_metric(prof: dict | None) -> dict[str, Any]:
     if prof and prof.get('aum') is not None:
         return live(round(prof['aum']), unit='KES',
-                    note='Assets under management (customer_allocation_base).').to_dict()
+                    note=('Assets under management from the portfolio allocation base — a '
+                          'periodic management snapshot, so it can differ from the live '
+                          'deposit/loan balances above.')).to_dict()
     return to_source(unit='KES', note='AUM pending the allocation feed.').to_dict()
 
 
