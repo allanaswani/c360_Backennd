@@ -84,7 +84,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             # honestly 'not sourced' — never a fabricated figure).
             'aum': _aum_metric(prof),
             'profitability': _profitability_metric(prof),
-            'npl_status': _npl_metric(prof),
+            'npl_status': _npl_metric(prof, loans),
         },
         # ---- charts, each answering a stated question ---------------------
         'charts': {
@@ -104,7 +104,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
                     _series('disbursed', 'Cumulative disbursed', disb['disbursed'], status=series_status, note=series_note),
                     _series('balance', 'Outstanding balance', disb['balance'], status=series_status, note=series_note),
                 ],
-                'empty_reason': None if loan_accts else 'No loan facilities on this customer.',
+                'empty_reason': None if loan_accts else 'No active loan facilities on this customer.',
             },
             'product_holdings': {
                 'question': "What's actually driving their balance?",
@@ -158,12 +158,29 @@ def _profitability_metric(prof: dict | None) -> dict[str, Any]:
     return to_source(unit='KES', note='Profitability pending the allocation feed.').to_dict()
 
 
-def _npl_metric(prof: dict | None) -> dict[str, Any]:
-    """Loan performance status from the allocation base's NPL flag."""
-    if prof is None or prof.get('npl') is None:
+def _npl_metric(prof: dict | None, loans: float) -> dict[str, Any]:
+    """Loan-performance status, reconciled against the LIVE loan book.
+
+    The NPL flag lives on ``customer_allocation_base`` — a periodic snapshot. If we print
+    it blindly we can end up screaming 'Non-performing' next to live loans of KES 0 and a
+    'no loan facilities' panel (the snapshot still reflects a loan the customer has since
+    cleared). So: with no live loan, the status is 'No active loan' and the stale flag is
+    demoted to a note; only when there IS a live loan do we show Performing/Non-performing.
+    """
+    npl = None if prof is None else prof.get('npl')
+    if not loans:
+        # No live loan today — a bald 'Non-performing' here is the contradiction users flag.
+        if npl:
+            return derived('No active loan', note=(
+                'No loan facility in the live book. The allocation snapshot still flags this '
+                'customer non-performing — most likely a loan that has since been cleared or '
+                'written off. Re-check once the snapshot is refreshed.')).to_dict()
+        return derived('No active loan',
+                       note='No loan facility in the live book.').to_dict()
+    if npl is None:
         return to_source(note='Loan-performance flag pending the allocation feed.').to_dict()
-    status = 'Non-performing' if prof['npl'] else 'Performing'
-    return derived(status, note='From the NPL flag on customer_allocation_base.').to_dict()
+    status = 'Non-performing' if npl else 'Performing'
+    return derived(status, note='Loan-performance flag from the allocation snapshot.').to_dict()
 
 
 def _leverage_metric(deposits: float, loans: float) -> dict[str, Any]:
