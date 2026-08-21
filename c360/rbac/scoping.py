@@ -33,7 +33,8 @@ from .staff import is_staff_customer
 class Scope:
     role: str
     sales_codes: list[str] | None   # None => whole book (management)
-    is_admin: bool = False          # admin tier only — the sole tier that may see staff
+    is_admin: bool = False          # admin tier (superuser OR ceo/exco/hfdi_admin) — gates ops pages
+    is_superuser: bool = False      # Django superuser ONLY — the sole identity that may see staff
 
     @property
     def is_whole_book(self) -> bool:
@@ -51,31 +52,36 @@ def resolve_scope(request) -> Scope:
     user = getattr(request, 'user', None)
     if user is not None and getattr(user, 'is_authenticated', False):
         tier = tier_for_groups(user.groups.values_list('name', flat=True))
-        # Staff customers (HF employees) are visible to the admin tier ONLY — not to
-        # managers, not to RMs. Superusers and the admin tier (ceo / exco / hfdi_admin)
-        # qualify; every other role is blocked from those records at the query layer.
+        # Staff customers (HF employees) are the most sensitive records in the bank: a
+        # colleague's own 360 must never be openable by an RM, by whole-book management,
+        # or even by a role-tier admin (ceo / exco / hfdi_admin). ONLY a Django superuser
+        # may see them — deliberately NARROWER than is_admin below.
+        is_super = bool(user.is_superuser)
+        # The admin *tier* (superuser OR ceo/exco/hfdi_admin) still gates the ops-only
+        # data-health page — a broader set than staff visibility above.
         is_admin = bool(user.is_superuser or tier == ROLE_ADMIN)
         # Management tiers (admin/manager) and superusers get the whole book AND the
         # Level 1 portfolio analytics.
         if user.is_superuser or tier in (ROLE_ADMIN, ROLE_MANAGER):
-            return Scope('management', None, is_admin=is_admin)
+            return Scope('management', None, is_admin=is_admin, is_superuser=is_super)
         # RMs (officer tier): this is Customer 360 — an RM must be able to look up ANY
         # customer's 360, not only their own book. So they get whole-book *view*
         # access (sales_codes=None → no per-customer filter). The 'rm' role still gates
         # them out of the whole-book Level 1 dashboard/worklist (management's remit);
         # their own book (profile.sales_code) remains available as a 'my book' lens.
-        return Scope('rm', None, is_admin=False)
+        return Scope('rm', None, is_admin=False, is_superuser=False)
 
     # Unauthenticated: the documented local-dev seam — header-driven scope so RBAC
     # can be exercised without the auth service. Ignored once a user is logged in.
-    # X-C360-Admin: true grants the admin lens so the staff sieve is testable too.
+    # X-C360-Admin grants the admin (ops) lens; X-C360-Superuser grants the staff lens.
     role = (request.headers.get('X-C360-Role') or 'management').strip().lower()
     is_admin = (request.headers.get('X-C360-Admin') or '').strip().lower() in ('1', 'true', 'yes')
+    is_super = (request.headers.get('X-C360-Superuser') or '').strip().lower() in ('1', 'true', 'yes')
     if role == 'rm':
         raw = request.headers.get('X-C360-Sales-Codes', '') or ''
         codes = [c.strip() for c in raw.split(',') if c.strip()]
-        return Scope('rm', codes, is_admin=False)
-    return Scope('management', None, is_admin=is_admin)
+        return Scope('rm', codes, is_admin=False, is_superuser=False)
+    return Scope('management', None, is_admin=is_admin, is_superuser=is_super)
 
 
 def customer_visible(scope: Scope, customer: dict) -> bool:
@@ -86,9 +92,10 @@ def customer_visible(scope: Scope, customer: dict) -> bool:
 
 
 def staff_hidden(scope: Scope, customer: dict) -> bool:
-    """True when this record is an HF-staff customer the caller may NOT see. Only the
-    admin tier is exempt; for everyone else a staff record is treated as non-existent
-    (the view returns 404, never a 403, so the account's existence isn't confirmed)."""
-    if scope.is_admin:
+    """True when this record is an HF-staff customer the caller may NOT see. ONLY a Django
+    superuser is exempt; for everyone else — RMs, managers, even role-tier admins — a
+    staff record is treated as non-existent (the view returns 404, never a 403, so the
+    account's existence isn't confirmed)."""
+    if scope.is_superuser:
         return False
     return is_staff_customer(customer)

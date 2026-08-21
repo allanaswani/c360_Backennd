@@ -87,7 +87,7 @@ class CustomerListView(APIView):
             request.query_params.get('q', ''),
             sales_codes=scope.sales_codes,
             limit=int(request.query_params.get('limit', 25)),
-            include_staff=scope.is_admin,   # staff customers are admin-only
+            include_staff=scope.is_superuser,   # staff customers are superuser-only
         )
         return Response({'count': len(rows), 'results': rows})
 
@@ -238,14 +238,14 @@ class WorklistView(APIView):
         # so it no longer needs a tight per-customer cap; 60 gives a rich call list
         # while keeping the batch query sizes and the cached payload sensible.
         max_customers = 60 if data_mode() == 'live' else None
-        # Staff customers are admin-only, so the cache key is per-lens (admin vs not) to
-        # avoid an admin's staff-inclusive worklist being served to a non-admin manager.
-        key = f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}:{"a" if scope.is_admin else "n"}'
+        # Staff customers are superuser-only, so the cache key is per-lens (superuser vs
+        # not) to avoid a superuser's staff-inclusive worklist being served to a manager.
+        key = f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}:{"s" if scope.is_superuser else "n"}'
         rows = portfolio_cache.get_or_build(
             key,
             lambda: worklist_across_customers(
                 gateway, sales_codes=scope.sales_codes, max_customers=max_customers,
-                include_staff=scope.is_admin),
+                include_staff=scope.is_superuser),
         )[0]
         return Response({'count': len(rows), 'results': rows})
 

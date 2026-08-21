@@ -42,7 +42,8 @@ class ScopingTests(SimpleTestCase):
 
 
 class StaffSieveTests(SimpleTestCase):
-    """HF-staff customers are admin-only — invisible to RMs AND to management."""
+    """HF-staff customers are superuser-only — invisible to RMs, to management, and even
+    to role-tier admins (ceo/exco/hfdi_admin). Only a Django superuser may see them."""
 
     def test_rule_fires_on_any_signal(self):
         self.assertTrue(is_staff_from_fields(employer='HOUSING FINANCE CO'))
@@ -59,18 +60,24 @@ class StaffSieveTests(SimpleTestCase):
         self.assertFalse(is_staff_from_fields(bank_employee_id=None))
         self.assertFalse(is_staff_from_fields())
 
-    def test_staff_visible_to_admin_only(self):
+    def test_staff_visible_to_superuser_only(self):
         staff = {'is_staff': True}
-        self.assertTrue(staff_hidden(Scope('rm', ['SC-1']), staff))                  # RM: hidden
-        self.assertTrue(staff_hidden(Scope('management', None), staff))              # manager: hidden
-        self.assertFalse(staff_hidden(Scope('management', None, is_admin=True), staff))  # admin: visible
-        self.assertFalse(staff_hidden(Scope('rm', ['SC-1']), {'is_staff': False}))   # non-staff: visible
+        self.assertTrue(staff_hidden(Scope('rm', ['SC-1']), staff))                     # RM: hidden
+        self.assertTrue(staff_hidden(Scope('management', None), staff))                 # manager: hidden
+        # A role-tier admin (is_admin, e.g. ceo/exco) is NOT enough — still hidden.
+        self.assertTrue(staff_hidden(Scope('management', None, is_admin=True), staff))
+        # Only a Django superuser sees the staff record.
+        self.assertFalse(staff_hidden(Scope('management', None, is_superuser=True), staff))
+        self.assertFalse(staff_hidden(Scope('rm', ['SC-1']), {'is_staff': False}))      # non-staff: visible
 
-    def test_admin_header_grants_admin_lens(self):
-        self.assertTrue(resolve_scope(_req({'X-C360-Admin': 'true'})).is_admin)
-        self.assertFalse(resolve_scope(_req({})).is_admin)
-        # An RM is never admin, even if the header is spoofed.
-        self.assertFalse(resolve_scope(_req({'X-C360-Role': 'rm', 'X-C360-Admin': 'true'})).is_admin)
+    def test_superuser_header_grants_staff_lens_admin_does_not(self):
+        # X-C360-Superuser grants the staff lens; X-C360-Admin only grants the ops lens.
+        self.assertTrue(resolve_scope(_req({'X-C360-Superuser': 'true'})).is_superuser)
+        self.assertFalse(resolve_scope(_req({'X-C360-Admin': 'true'})).is_superuser)   # admin ≠ superuser
+        self.assertTrue(resolve_scope(_req({'X-C360-Admin': 'true'})).is_admin)        # but admin lens stands
+        self.assertFalse(resolve_scope(_req({})).is_superuser)
+        # An RM is never superuser, even if the header is spoofed.
+        self.assertFalse(resolve_scope(_req({'X-C360-Role': 'rm', 'X-C360-Superuser': 'true'})).is_superuser)
 
     def test_mock_search_and_detail_hide_staff_from_non_admin(self):
         gw = MockWarehouse()
