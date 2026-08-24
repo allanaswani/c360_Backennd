@@ -29,9 +29,14 @@ def _csv_env(name: str, default: str) -> list[str]:
 
 
 # Employer text that means "works for HF" (case-insensitive substring match).
+# NOTE: the match is ``pattern in employer``, so a pattern must be a SUBSTRING of the
+# real value — not the other way round. dim_customer.employer stores the short form
+# ``HFC`` (not ``HFC LTD``), so ``HFC`` must be listed on its own; it also subsumes
+# ``HFCB`` / ``HFC LTD`` / ``HFC LIMITED`` / ``HFC BANK``. Under-listing here leaks a
+# colleague's 360 to non-admins, so err toward the broader token.
 STAFF_EMPLOYER_PATTERNS = _csv_env(
     'C360_STAFF_EMPLOYER_PATTERNS',
-    'HOUSING FINANCE,HF GROUP,HFC LTD,HFC LIMITED,HFCB,HF BANK,HFDI,HF FOUNDATION,HF CUSTODY,HF INSURANCE',
+    'HOUSING FINANCE,HF GROUP,HFC,HF BANK,HFDI,HF FOUNDATION,HF CUSTODY,HF INSURANCE',
 )
 # customer_segment / scheme values that denote a staff scheme (exact match).
 STAFF_SEGMENTS = _csv_env('C360_STAFF_SEGMENTS', 'STAFF,STAFF SCHEME,EMPLOYEE,EMPLOYEES')

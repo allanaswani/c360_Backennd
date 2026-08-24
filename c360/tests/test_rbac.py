@@ -52,6 +52,15 @@ class StaffSieveTests(SimpleTestCase):
         self.assertTrue(is_staff_from_fields(bank_employee_id='EMP20481'))
         self.assertTrue(is_staff_from_fields(explicit=True))
 
+    def test_bare_hfc_employer_is_staff(self):
+        # Regression: dim_customer.employer stores the short form 'HFC' (seen in production).
+        # The pattern is a substring of the value, so a bare 'HFC' pattern is required — the
+        # verbose 'HFC LTD' never matched 'HFC' and leaked the record to non-admins.
+        self.assertTrue(is_staff_from_fields(employer='HFC'))
+        self.assertTrue(is_staff_from_fields(employer='hfc'))            # case-insensitive
+        self.assertTrue(is_staff_from_fields(employer='HFCB'))           # subsumed by 'HFC'
+        self.assertTrue(is_staff_from_fields(employer='HFC BANK LTD'))
+
     def test_rule_ignores_placeholders_and_outsiders(self):
         self.assertFalse(is_staff_from_fields(employer='Self-employed'))
         self.assertFalse(is_staff_from_fields(employer='Safaricom PLC'))
