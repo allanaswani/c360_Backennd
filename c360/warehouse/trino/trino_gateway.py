@@ -1089,6 +1089,51 @@ class TrinoWarehouse(WarehouseGateway):
             })
         return out
 
+    def _months_ago(self, n: int) -> date:
+        """First day of the month ``n`` months before the as-of month."""
+        asof = self.as_of_date()
+        total = asof.year * 12 + (asof.month - 1) - n
+        return date(total // 12, total % 12 + 1, 1)
+
+    # Descending, NON-overlapping lookback windows (months-before-as-of: older, newer),
+    # scanned newest first. We stop at the first that holds a transaction, so a recently
+    # active customer pays only a small partition-pruned scan and only a long-dormant one
+    # reaches back a dozen years, never the whole 2.37B-row fact table.
+    _LAST_TXN_WINDOWS = ((12, 0), (36, 12), (84, 36), (144, 84))
+
+    def last_transaction_date(self, cust_id: str):
+        """The customer's most recent CUSTOMER-FACING transaction date, all-time: the
+        honest 'when was this account last active'. Uses the same table and channel /
+        accrued-interest filters as ``recent_transactions`` so it agrees with the
+        transaction history a user browses: an account can read 'Active' yet show nothing
+        under a YTD filter because its last real transaction was years ago. Deliberately
+        NOT ``eom_deposits.last_trx_date`` — that column moves with month-end interest /
+        system postings and would report a misleadingly recent date.
+
+        Cost varies (a recent customer is one cheap scan; a decade-dormant one walks the
+        windows), so callers MUST treat it as a slow probe and keep it off the hot path.
+        Returns None when nothing customer-facing is found within ~12 years."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        asof = self.as_of_date()
+        for older, newer in self._LAST_TXN_WINDOWS:
+            lo = self._months_ago(older)
+            hi = asof if newer == 0 else self._months_ago(newer)
+            rp = self._range_part(lo, hi)
+            rows = self._t.execute(
+                f"SELECT CAST(MAX(transaction_date) AS varchar) d "
+                f"FROM delta.gold_db.fact_dep_trx_recording "
+                f"WHERE customer_id=? {rp} "
+                f"AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
+                f"AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}) "
+                f"AND UPPER(justific_descrption) NOT LIKE '%ACCRUED INTEREST%' "
+                f"AND i_amount <> 0", (cid,))
+            d = self._safe_date(rows[0]['d']) if rows else None
+            if d:
+                return d
+        return None
+
     # --- bounded live portfolio sample (whole-book stays precompute, §6) ------
     def list_customers(self, *, sales_codes, include_staff: bool = True, sample: int = 200):
         """A bounded set of real loan-holding customers (meaningful value),

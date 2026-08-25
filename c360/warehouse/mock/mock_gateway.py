@@ -77,6 +77,17 @@ class MockWarehouse(WarehouseGateway):
             'bio': bio,
         }
 
+    def last_transaction_date(self, cust_id: str):
+        """Preview parity for the live probe. ~70% of customers transacted in the last
+        few weeks; the rest are 'active but stale' (last transaction 1.5-8 years back) so
+        the header's staleness flag is exercised in preview exactly as against live data."""
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if not c:
+            return None
+        r = _rng(cust_id + 'lasttx')
+        days_ago = int(r.next() * 25) if r.next() > 0.3 else int(500 + r.next() * 2500)
+        return _AS_OF - timedelta(days=days_ago)
+
     @staticmethod
     def _is_staff(c: dict, bio: dict) -> bool:
         """Mock staff detection — the seed's explicit ``staff`` flag, plus the same

@@ -145,6 +145,14 @@ class WarehouseGateway(abc.ABC):
     def get_retention_signal(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- last customer-facing transaction (optional capability) ---------------
+    # Default: not computed. A live gateway overrides this to return the customer's most
+    # recent customer-facing transaction date (all-time), so an 'Active' account that
+    # hasn't really transacted in years is exposed. A potentially slow probe — kept off
+    # the header's hot path and served by its own endpoint. Returns None when unknown.
+    def last_transaction_date(self, cust_id: str) -> date | None:
+        return None
+
     # --- linked parties / same-person records (optional capability) -----------
     # Default: not computed. A live gateway overrides this to return
     # {'basis','primary_value','members':[...]} — customer records sharing this

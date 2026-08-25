@@ -135,6 +135,33 @@ class LinkedPartiesView(APIView):
         return Response(linked or {'count': 0, 'members': []})
 
 
+class CustomerLastTransactionView(APIView):
+    """When the account LAST actually transacted (customer-facing), all-time. Its own
+    endpoint because the probe can be slow for a long-dormant customer, so it must not
+    block the header. Scoped + staff-sieved like every other customer read. Returns a
+    provenance-stamped metric: an ISO date, or null when nothing customer-facing is on
+    record — genuinely 'none', not 'unsourced'."""
+
+    def get(self, request: Request, cust_id: str):
+        from ..warehouse.provenance import live
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        d = gateway.last_transaction_date(cust_id)
+        iso = d.isoformat() if hasattr(d, 'isoformat') else (str(d)[:10] if d else None)
+        return Response({
+            'last_transaction': live(
+                iso, unit='date',
+                note=(None if iso else 'No customer-facing transaction found on record (looked back ~12 years).'),
+            ).to_dict(),
+        })
+
+
 class CustomerOverviewView(APIView):
     """Level 2 — cross-domain overview (value-by-domain, relationship trend)."""
 
