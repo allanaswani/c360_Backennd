@@ -1723,9 +1723,10 @@ class TrinoWarehouse(WarehouseGateway):
                        'value': round(float(r['v'] or 0))} for r in cats]
         txn_value = sum(c['value'] for c in categories)
         activity = self._t.execute(
-            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n {where} "
+            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n, SUM(i_amount) v {where} "
             f"GROUP BY CAST(transaction_date AS varchar) ORDER BY 1", (cid,))
-        activity_pts = [{'period': self._safe_date(r['d']), 'count': int(r['n'] or 0)}
+        activity_pts = [{'period': self._safe_date(r['d']), 'count': int(r['n'] or 0),
+                         'value': round(float(r['v'] or 0))}
                         for r in activity if self._safe_date(r['d'])]
         recent = self._t.execute(
             f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, i_amount amt {where} "

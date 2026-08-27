@@ -24,7 +24,7 @@ PREVIEW = 'preview'
 LIVE = 'live'
 
 
-def _metric(label, value, unit, *, lead=False, tone=None, status=PREVIEW, meta=None):
+def _metric(label, value, unit, *, lead=False, tone=None, status=PREVIEW, meta=None, spark=None):
     m = {'label': label, 'value': value, 'unit': unit, 'status': status}
     if lead:
         m['lead'] = True
@@ -32,6 +32,10 @@ def _metric(label, value, unit, *, lead=False, tone=None, status=PREVIEW, meta=N
         m['tone'] = tone
     if meta:
         m['meta'] = meta
+    # A short trend to draw under the figure. Only attached when there are ≥2 points
+    # (a single point would render a misleading flat line).
+    if spark and len(spark) >= 2:
+        m['spark'] = spark
     return m
 
 
@@ -76,14 +80,17 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
     live = data_mode() == 'live'
     st = LIVE if live else PREVIEW
     avg = round(data['txn_value'] / data['txn_count']) if data.get('txn_count') else 0
+    # Daily trends for the tile sparklines (transactions and value moved over the period).
+    spark_count = [p['count'] for p in data['activity']]
+    spark_value = [p.get('value', 0) for p in data['activity']]
     since = data.get('registered_since')
     profile_note = (f"Whizz customer since {since[:4]} · {data.get('status', '')}".strip(' ·')
                     if since else (f"Whizz status: {data.get('status')}" if data.get('status') else None))
     return {
         'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
         'metrics': [
-            _metric('Transactions', data['txn_count'], 'count', lead=True, status=st),
-            _metric('Value moved', data['txn_value'], 'KES', status=st),
+            _metric('Transactions', data['txn_count'], 'count', lead=True, status=st, spark=spark_count),
+            _metric('Value moved', data['txn_value'], 'KES', status=st, spark=spark_value),
             _metric('Services used', data['services_used'], 'count', status=st,
                     meta=', '.join(c['label'] for c in data['categories']) or None),
             _metric('Avg / transaction', avg, 'KES', status=st),
@@ -93,9 +100,16 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
              'question': 'Is Whizz engagement growing, flat, or dropping off?', 'status': st, 'fmt': 'count',
              'series': [{'name': 'Transactions', 'dataKey': 'count', 'colorRole': 1}],
              'data': data['activity']},
+            {'kind': 'lines', 'id': 'value_moved', 'title': 'Value moved over time',
+             'question': 'How much money is flowing through Whizz over the period?', 'status': st, 'fmt': 'kes',
+             'series': [{'name': 'Value moved', 'dataKey': 'value', 'colorRole': 2}],
+             'data': data['activity']},
             {'kind': 'bars', 'id': 'categories', 'title': 'What they use Whizz for',
              'question': 'Which Whizz services move the most money?', 'status': st, 'fmt': 'kes',
              'data': [{'label': c['label'], 'value': c['value'], 'colorRole': 1} for c in data['categories']]},
+            {'kind': 'donut', 'id': 'service_mix', 'title': 'Service mix',
+             'question': 'Where is Whizz spend concentrated by service?', 'status': st, 'fmt': 'kes',
+             'data': [{'label': c['label'], 'value': c['value']} for c in data['categories'] if c['value'] > 0]},
         ],
         'tables': [
             {'id': 'recent', 'title': 'Recent Whizz transactions', 'status': st, 'note': profile_note,
@@ -128,6 +142,15 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     for p in props:
         by_project[p['project']] = by_project.get(p['project'], 0) + p['value']
 
+    # Financed vs owned outright — how much of the property book is still mortgaged
+    # (mortgage cross-sell / equity-release headroom). Only non-zero slices shown.
+    mortgaged_value = sum(p['value'] for p in props if p.get('mortgage'))
+    outright_value = total_value - mortgaged_value
+    financed_split = [seg for seg in (
+        {'label': 'Under mortgage', 'value': mortgaged_value},
+        {'label': 'Owned outright', 'value': outright_value},
+    ) if seg['value'] > 0]
+
     return {
         'cust_id': cust_id, 'domain': 'Properties', 'preview': not live, 'period': period.to_dict(),
         'metrics': [
@@ -141,10 +164,20 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
              'question': 'Where is the customer’s property wealth concentrated?', 'status': st, 'fmt': 'kes',
              'data': [{'label': proj, 'value': val} for proj, val in
                       sorted(by_project.items(), key=lambda kv: kv[1], reverse=True)]},
-            {'kind': 'bars', 'id': 'paid', 'title': 'Payment progress per unit',
-             'question': 'How much of each unit is paid off?', 'status': st, 'fmt': 'pct',
-             'data': [{'label': f"{p['project']} · {p['unit']}", 'value': p['paid_pct'], 'colorRole': 1}
-                      for p in props]},
+            {'kind': 'donut', 'id': 'financed', 'title': 'Financed vs owned outright',
+             'question': 'How much of the property book is still under mortgage?', 'status': st, 'fmt': 'kes',
+             'data': financed_split},
+            {'kind': 'grouped', 'id': 'paid_vs_out', 'title': 'Value paid vs outstanding per unit',
+             'question': 'How much of each unit is paid off, and how much is still outstanding?',
+             'status': st, 'fmt': 'kes', 'seriesNames': ['Paid', 'Outstanding'],
+             'data': [{'label': f"{p['project']} · {p['unit']}",
+                       'a': round(p['value'] * p['paid_pct']),
+                       'b': round(p['value'] * (1 - p['paid_pct']))} for p in props]},
+            {'kind': 'meters', 'id': 'progress', 'title': 'Payment progress per unit',
+             'question': 'How far along is each unit toward being fully paid?',
+             'status': st, 'fmt': 'pct',
+             'data': [{'label': f"{p['project']} · {p['unit']}", 'value': p['paid_pct'],
+                       'paid': round(p['value'] * p['paid_pct']), 'total': p['value']} for p in props]},
         ],
         'tables': [
             {'id': 'props', 'title': 'Properties held', 'status': st,

@@ -373,11 +373,16 @@ class MockWarehouse(WarehouseGateway):
         slope = _TREND_SLOPE[c['profile']['trend']]
         ds = self._dates(period)
         activity = self._walk(base, slope + 0.2, len(ds), _rng(cust_id + 'wact'), vol=0.24)
-        activity_pts = [{'period': d.isoformat(), 'count': int(round(v))} for d, v in zip(ds, activity)]
-        txn_count = sum(p['count'] for p in activity_pts)
+        counts = [int(round(v)) for v in activity]
+        txn_count = sum(counts)
         cat_def = [('Send to M-Pesa', 0.42), ('Pay Bill', 0.24), ('Buy Goods', 0.18),
                    ('Airtime', 0.10), ('M-Pesa to account', 0.06)]
         total_val = round(base * 4_000 + r.next() * 60_000)
+        # Spread the period's value across days in proportion to that day's txn count,
+        # so the value line tracks the activity line without being identical.
+        per_txn = (total_val / txn_count) if txn_count else 0
+        activity_pts = [{'period': d.isoformat(), 'count': cnt, 'value': round(cnt * per_txn)}
+                        for d, cnt in zip(ds, counts)]
         categories = [{'label': name, 'count': max(1, int(txn_count * share)),
                        'value': round(total_val * share)} for name, share in cat_def]
         recent = [{
