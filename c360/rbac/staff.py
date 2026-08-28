@@ -11,7 +11,17 @@ rule can be tightened against the real warehouse without a code change:
 
     C360_STAFF_EMPLOYER_PATTERNS  employer text meaning "works for HF" (substring)
     C360_STAFF_SEGMENTS           customer_segment / scheme values that denote staff
+    C360_STAFF_USE_EMPID          opt-in: treat a real fk_bankemployeeid as a staff link
     C360_STAFF_EMPID_PLACEHOLDERS  fk_bankemployeeid values that are NOT a real link
+
+``fk_bankemployeeid`` is NOT used as a staff signal by default. In the HFCB warehouse
+that column is not an "is an HF employee" link at all — it carries the *creating channel
+or officer* code (``KOCE…`` for the Kocela/Whizz mobile channel, ``IAPP…`` for app
+onboarding, plus per-officer initials like ``JWM``/``SMW``). Populated on ~91% of the
+book, so treating any value as staff hid over a million ordinary customers from every RM
+(they saw "Customer not found" on live accounts). The genuine, precise staff marker is
+the employer text; the empid rule is therefore opt-in via ``C360_STAFF_USE_EMPID`` and
+only makes sense once the field carries a real employee-number format.
 
 The gateway stamps ``is_staff`` on every record it returns (search row, roster row and
 full customer) using :func:`is_staff_from_fields`; the query layer then hides those
@@ -26,6 +36,13 @@ import os
 def _csv_env(name: str, default: str) -> list[str]:
     raw = os.environ.get(name)
     return [p.strip().upper() for p in (raw if raw is not None else default).split(',') if p.strip()]
+
+
+def _flag_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 # Employer text that means "works for HF" (case-insensitive substring match).
@@ -58,7 +75,12 @@ def is_real_employee_id(v) -> bool:
 
 
 def is_staff_from_fields(*, employer=None, segment=None, bank_employee_id=None, explicit=None) -> bool:
-    """The single staff rule, fed raw ``dim_customer`` fields. ANY signal → staff."""
+    """The single staff rule, fed raw ``dim_customer`` fields. ANY signal → staff.
+
+    Note: ``bank_employee_id`` is only consulted when ``C360_STAFF_USE_EMPID`` is set,
+    because in this warehouse the column holds a creating-channel/officer code, not an
+    employee link (see module docstring). By default the marker is the employer text.
+    """
     if explicit is True:
         return True
     emp = _up(employer)
@@ -67,7 +89,9 @@ def is_staff_from_fields(*, employer=None, segment=None, bank_employee_id=None, 
     seg = _up(segment)
     if seg and seg in STAFF_SEGMENTS:
         return True
-    return is_real_employee_id(bank_employee_id)
+    if _flag_env('C360_STAFF_USE_EMPID'):
+        return is_real_employee_id(bank_employee_id)
+    return False
 
 
 def is_staff_customer(record: dict | None) -> bool:

@@ -1,5 +1,7 @@
 """RBAC scoping — must fail closed. An RM never sees the whole book by default."""
+import os
 from types import SimpleNamespace
+from unittest import mock
 
 from django.test import SimpleTestCase
 
@@ -49,8 +51,23 @@ class StaffSieveTests(SimpleTestCase):
         self.assertTrue(is_staff_from_fields(employer='HOUSING FINANCE CO'))
         self.assertTrue(is_staff_from_fields(employer='hf group ltd'))   # case-insensitive
         self.assertTrue(is_staff_from_fields(segment='STAFF'))
-        self.assertTrue(is_staff_from_fields(bank_employee_id='EMP20481'))
         self.assertTrue(is_staff_from_fields(explicit=True))
+
+    def test_bank_employee_id_is_not_a_signal_by_default(self):
+        # Regression (critical): fk_bankemployeeid is a creating-channel/officer code in
+        # the HFCB warehouse (KOCE…/IAPP…/officer initials), populated on ~91% of the
+        # book — NOT an HF-employee link. Treating any value as staff hid >1M real
+        # customers from RMs ("Customer not found" on live accounts). It must not flag.
+        self.assertFalse(is_staff_from_fields(bank_employee_id='IAPP0999'))
+        self.assertFalse(is_staff_from_fields(bank_employee_id='KOCE12345'))
+        self.assertFalse(is_staff_from_fields(bank_employee_id='EMP20481'))
+
+    def test_bank_employee_id_opt_in_via_env(self):
+        # Deployments whose fk_bankemployeeid IS a real employee link can re-enable it.
+        with mock.patch.dict(os.environ, {'C360_STAFF_USE_EMPID': 'true'}):
+            self.assertTrue(is_staff_from_fields(bank_employee_id='EMP20481'))
+            self.assertFalse(is_staff_from_fields(bank_employee_id='MIG_CIS'))  # placeholder still ignored
+            self.assertFalse(is_staff_from_fields(bank_employee_id=None))
 
     def test_bare_hfc_employer_is_staff(self):
         # Regression: dim_customer.employer stores the short form 'HFC' (seen in production).
@@ -65,7 +82,6 @@ class StaffSieveTests(SimpleTestCase):
         self.assertFalse(is_staff_from_fields(employer='Self-employed'))
         self.assertFalse(is_staff_from_fields(employer='Safaricom PLC'))
         self.assertFalse(is_staff_from_fields(segment='PRIVATE'))
-        self.assertFalse(is_staff_from_fields(bank_employee_id='MIG_CIS'))   # migration placeholder
         self.assertFalse(is_staff_from_fields(bank_employee_id=None))
         self.assertFalse(is_staff_from_fields())
 
