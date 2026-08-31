@@ -20,6 +20,7 @@ from pathlib import Path
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import roc_auc_score
 
 from . import features as F
@@ -58,6 +59,30 @@ def _precision_at_k(y_true: np.ndarray, y_score: np.ndarray, k_frac: float = 0.1
     k = max(1, int(n * k_frac))
     top = np.argsort(y_score)[::-1][:k]
     return float(y_true[top].mean())
+
+
+def _calibration_curve(y_score: np.ndarray, y_true: np.ndarray, *, max_points: int = 24) -> dict | None:
+    """Fit an isotonic map raw-score → observed frequency on the holdout, so the model's
+    scale_pos_weight-inflated outputs become true probabilities that are comparable
+    ACROSS products. Returned as compact breakpoints the scorer replays with plain
+    interpolation (:func:`ranking.apply_calibration`) — no sklearn needed at score time.
+    None when the holdout is too small/degenerate to calibrate honestly."""
+    if len(y_true) < 50 or len(np.unique(y_true)) < 2:
+        return None
+    try:
+        iso = IsotonicRegression(out_of_bounds='clip', y_min=0.0, y_max=1.0)
+        iso.fit(y_score, y_true)
+        xs = np.asarray(iso.X_thresholds_, dtype=float)
+        ys = np.asarray(iso.y_thresholds_, dtype=float)
+    except Exception:
+        return None
+    if xs.size < 2:
+        return None
+    # Thin dense curves to at most max_points, always keeping the endpoints.
+    if xs.size > max_points:
+        idx = np.unique(np.linspace(0, xs.size - 1, max_points).round().astype(int))
+        xs, ys = xs[idx], ys[idx]
+    return {'x': [round(float(v), 6) for v in xs], 'y': [round(float(v), 6) for v in ys]}
 
 
 # Real recorded outcomes are worth more than ownership look-alike proxies, so each
@@ -127,12 +152,14 @@ def train_all(rows: list[dict], *, seed: int = 42,
         proba = booster.predict_proba(Xte)[:, 1]
         auc = float(roc_auc_score(yte, proba)) if len(np.unique(yte)) > 1 else float('nan')
         p_at_10 = _precision_at_k(yte, proba, 0.1)
+        calibration = _calibration_curve(proba, yte)
 
         booster.booster_.save_model(str(mdir / f'{target}.txt'))
         products_meta[target] = {
             'trained': True, 'positives': pos, 'rate': round(rate, 5),
             'auc': round(auc, 4), 'precision_at_10pct': round(p_at_10, 4),
             'feedback_examples': n_feedback,
+            'calibration': calibration,   # raw-score → probability; None if uncalibratable
             'features': cols, 'categorical': cat,
         }
         logger.info('trained %s: AUC=%.4f P@10%%=%.4f (pos=%d, feedback=%d)',

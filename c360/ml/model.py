@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from . import features as F
+from . import ranking
 from .train import manifest_path, models_dir
 
 logger = logging.getLogger(__name__)
@@ -87,7 +88,14 @@ class PropensityModel:
         return f'Recommended because this customer has {" and ".join(drivers)} — customers with this profile typically hold {label.lower()}.'
 
     def recommend(self, row: dict, *, limit: int = 3) -> list[dict]:
-        """Rank the customer's UN-held target products by propensity, with reasons."""
+        """Rank the customer's UN-held target products by propensity, with reasons.
+
+        Scores every un-held product, then hands the raw scores to the selection policy
+        (:mod:`ranking`): drop products whose model can't discriminate, calibrate the
+        rest to comparable probabilities, and keep only those clearing the confidence
+        floor. The result can be shorter than ``limit`` — or empty — on purpose: a thin
+        or ambiguous profile yields no confident pick, and the caller then falls back to
+        the transparent rules rather than forcing a generic match."""
         held = row.get('_held', set())
         scored = []
         for target, booster in self.boosters.items():
@@ -106,8 +114,7 @@ class PropensityModel:
                 'reason': reason,
                 'rule_id': 'ml.lgbm-v1',
             })
-        scored.sort(key=lambda r: r['score'], reverse=True)
-        return scored[:limit]
+        return ranking.select(scored, self.products_meta, limit=limit)
 
 
 @lru_cache(maxsize=1)

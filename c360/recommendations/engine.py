@@ -153,9 +153,12 @@ def recommend_for_customer(
     if not customer:
         return RecommendationResult('ok', [], [], {'gate_evaluable': False, 'note': 'Unknown customer.'})
 
-    # Prefer the trained ML model; fall back to the rule engine when it isn't available.
+    # Prefer the trained ML model; fall back to the rule engine when it isn't available
+    # OR when it yields no *confident* pick for this customer (an empty list). The rules
+    # are specific and auditable, so a weak ML guess never crowds out an honest rule —
+    # and if the rules are silent too, the panel shows nothing rather than a generic pick.
     ml = _ml_candidates(gateway, cust_id, limit=limit)
-    if ml is not None:
+    if ml:
         try:
             profile = gateway.get_risk_profile(cust_id)
         except Exception:
@@ -290,8 +293,10 @@ def _recommend_batched(gateway, summary, holdings, profile, *, limit=1) -> Recom
         return RecommendationResult('ok', [], [], {'gate_evaluable': False, 'note': 'No holdings.'})
 
     # Prefer the ML model here too — scored from the batch inputs (no extra queries).
+    # An empty result (no confident pick) falls through to the rules, same as the
+    # single-customer path, so the worklist never carries a forced weak recommendation.
     ml = _ml_candidates_batched(gateway, summary, holdings, limit=limit)
-    if ml is not None:
+    if ml:
         return _result_from(ml[:limit], profile, engine='ml.lgbm-v1')
 
     value = {'relationship_value': summary.get('value') or 0,

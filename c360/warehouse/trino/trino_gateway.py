@@ -259,8 +259,107 @@ class TrinoWarehouse(WarehouseGateway):
                     'latency_ms': round((time.monotonic() - t0) * 1000),
                     'detail': f'{type(e).__name__}: {str(e)[:140]}'}
 
+    def _check_connection(self) -> dict:
+        """Warehouse reachability + authentication. This is checked FIRST, because when
+        the connection or credentials fail every table check below would just repeat the
+        same error — so we surface one clear row (and name an auth failure explicitly,
+        the exact condition that took the app down when the Trino password expired)."""
+        base = {'key': 'warehouse_conn', 'label': 'Warehouse connection', 'group': 'System', 'table': 'trino'}
+        t0 = time.monotonic()
+        try:
+            self._t.execute('SELECT 1')
+            return {**base, 'status': 'ok', 'value': 1, 'detail': 'connected and authenticated',
+                    'latency_ms': round((time.monotonic() - t0) * 1000)}
+        except Exception as e:
+            msg = str(e)
+            auth = '401' in msg or 'access denied' in msg.lower() or 'credential' in msg.lower()
+            detail = ('authentication rejected — check the Trino service-account password (TRINO_USER / TRINO_PASSWORD)'
+                      if auth else f'{type(e).__name__}: {msg[:140]}')
+            return {**base, 'status': 'error', 'value': 0, 'detail': detail,
+                    'latency_ms': round((time.monotonic() - t0) * 1000)}
+
+    def _check_model(self) -> dict:
+        """Recommendation-model health from the on-disk manifest (no warehouse needed):
+        is a model trained, how many products, its mean quality, how many are calibrated,
+        and how old it is — so silent model rot shows on the same page as data outages."""
+        base = {'key': 'reco_model', 'label': 'Recommendation model', 'group': 'System', 'table': 'ml/models'}
+        try:
+            import json
+            import os
+            from pathlib import Path
+            # Read the manifest path directly (mirrors ml.train.models_dir) so the check
+            # never imports the LightGBM training stack just to read a JSON file.
+            mdir = Path(os.environ.get('C360_ML_MODELS_DIR') or (Path(__file__).resolve().parents[2] / 'ml' / 'models'))
+            mpath = mdir / 'manifest.json'
+            if not mpath.exists():
+                return {**base, 'status': 'empty', 'value': 0,
+                        'detail': 'no model trained — recommendations use the rule engine'}
+            manifest = json.loads(mpath.read_text())
+            trained = {k: v for k, v in (manifest.get('products') or {}).items() if v.get('trained')}
+            n = len(trained)
+            precs = [v['precision_at_10pct'] for v in trained.values() if v.get('precision_at_10pct') is not None]
+            mean_prec = round(sum(precs) / len(precs), 3) if precs else None
+            calibrated = sum(1 for v in trained.values() if v.get('calibration'))
+            age_days = round((time.time() - mpath.stat().st_mtime) / 86400)
+            detail = (f'{n} products · mean top-decile precision {mean_prec} · '
+                      f'{calibrated}/{n} calibrated · trained {age_days}d ago')
+            status = 'ok'
+            if n == 0:
+                status, detail = 'empty', 'manifest present but no product model trained'
+            elif age_days > 45:
+                status, detail = 'stale', f'{detail} — retrain recommended'
+            return {**base, 'status': status, 'value': n, 'detail': detail}
+        except Exception as e:
+            return {**base, 'status': 'error', 'value': None, 'detail': f'{type(e).__name__}: {str(e)[:140]}'}
+
+    def _check_rm_allocation(self) -> dict:
+        """Health of the curated Postgres (retail_allocated_portfolio) that supplies each
+        customer's CURRENT RM. If it's down, the app silently falls back to the frozen
+        onboarding officer — the 'shows an RM no longer managing them' report — so make
+        that visible rather than silent."""
+        base = {'key': 'rm_alloc', 'label': 'RM allocation (Postgres)', 'group': 'System',
+                'table': 'retail_allocated_portfolio'}
+        if self._pg is None:
+            return {**base, 'status': 'empty', 'value': 0,
+                    'detail': 'curated Postgres not configured — RMs show the onboarding officer'}
+        t0 = time.monotonic()
+        try:
+            meta = self._alloc_schema()
+            if not meta:
+                return {**base, 'status': 'empty', 'value': 0,
+                        'latency_ms': round((time.monotonic() - t0) * 1000),
+                        'detail': 'no allocation table/columns resolved (Postgres unreachable or table absent)'}
+            rows = self._pg.execute(f"SELECT COUNT(*) AS n FROM {meta['table']}")
+            n = int(rows[0]['n']) if rows else 0
+            base = {**base, 'table': meta['table'].split('.')[-1]}
+            return {**base, 'status': 'ok' if n > 0 else 'empty', 'value': n,
+                    'latency_ms': round((time.monotonic() - t0) * 1000),
+                    'detail': f'{n:,} current allocations' if n > 0 else 'allocation table is empty'}
+        except Exception as e:
+            return {**base, 'status': 'error', 'value': None,
+                    'latency_ms': round((time.monotonic() - t0) * 1000),
+                    'detail': f'{type(e).__name__}: {str(e)[:140]}'}
+
+    @staticmethod
+    def _skipped_check(key, label, group, table, mode) -> dict:
+        return {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1],
+                'status': 'unknown', 'value': None, 'detail': 'not checked — warehouse connection is down'}
+
     def health_report(self):
-        checks = [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
+        # System group first: connection/auth, model, RM-allocation source. The model
+        # check needs no warehouse, so it reports even during an outage.
+        conn = self._check_connection()
+        system = [conn, self._check_model(), self._check_rm_allocation()]
+
+        if conn['status'] == 'error':
+            # Can't reach/authenticate the warehouse — running the 8 table checks would
+            # just repeat this error, so mark them not-checked and point at the real cause.
+            checks = system + [self._skipped_check(*spec) for spec in self._HEALTH_CHECKS]
+            freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
+                         'detail': 'warehouse unreachable — see System · Warehouse connection'}
+            return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
+
+        checks = system + [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
         try:
             asof = self.as_of_date()
             days = (date.today() - asof).days

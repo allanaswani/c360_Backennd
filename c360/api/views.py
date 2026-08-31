@@ -329,6 +329,37 @@ def _capture_health_snapshot(report: dict) -> None:
         pass
 
 
+# A source whose row count falls by at least this fraction versus the previous snapshot
+# is flagged — a partial or failed pipeline load, which zero-checks alone would miss.
+_HEALTH_DROP_FRACTION = 0.30
+
+
+def _last_snapshot_values() -> dict:
+    """{check_key: value} from the most recent stored snapshot, for drop detection."""
+    from ..models import HealthSnapshot
+    try:
+        last = HealthSnapshot.objects.first()   # newest (Meta ordering -captured_at)
+    except Exception:
+        return {}
+    if not last:
+        return {}
+    return {c.get('key'): c.get('value') for c in (last.payload.get('checks') or [])}
+
+
+def _annotate_drops(report: dict, prior: dict) -> None:
+    """Compare each check's value to the previous snapshot; attach a delta and downgrade
+    a healthy source to 'warn' when its row count has dropped sharply (a partial load)."""
+    for c in report.get('checks') or []:
+        prev, cur = prior.get(c.get('key')), c.get('value')
+        if not isinstance(prev, (int, float)) or not isinstance(cur, (int, float)) or prev <= 0:
+            continue
+        change = (cur - prev) / prev
+        c['delta_pct'] = round(change * 100, 1)
+        if change <= -_HEALTH_DROP_FRACTION and c.get('status') == 'ok':
+            c['status'] = 'warn'
+            c['detail'] = f"{c.get('detail', '')} — down {abs(round(change * 100))}% from {int(prev):,}"
+
+
 def _health_history() -> list[dict]:
     """Recent snapshots in chronological order, compacted for charting: freshness and,
     per source, its value / status / latency at each capture."""
@@ -359,7 +390,11 @@ class DataHealthView(APIView):
         report = get_gateway().health_report()
         report['data_mode'] = data_mode()
         report['generated_at'] = timezone.now().isoformat()
-        # Persist a throttled snapshot so the page can chart trends, then attach history.
+        # Read the previous snapshot's values BEFORE capturing this one, so the drop
+        # alarm compares against the prior check, not the row we're about to write.
+        prior = _last_snapshot_values()
+        # Persist a throttled snapshot (raw, pre-annotation) so the page can chart trends.
         _capture_health_snapshot(report)
+        _annotate_drops(report, prior)
         report['history'] = _health_history()
         return Response(report)
