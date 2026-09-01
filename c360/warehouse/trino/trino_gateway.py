@@ -58,13 +58,25 @@ _DEPOSIT_KEYWORDS = (
     ('saving', 'savings'), ('fanaka', 'savings'), ('target', 'savings'),
     ('nyumba', 'savings'), ('bond', 'savings'), ('take on', 'savings'),
 )
+# Ordered, first-match-wins per description. The specific / least-ambiguous loan
+# types are listed BEFORE the mortgage bucket, because HF's names overlap: a
+# "hire purchase" or "motor vehicle purchase" is asset finance, not a mortgage,
+# and must be caught first. A bare "purchase" is deliberately NOT a mortgage
+# trigger — it appears in hire/asset/stock purchase too; mortgages are matched on
+# genuinely property-specific terms ("mortgage", "owner occupier", "plot", …).
+# Getting this wrong makes the recommendation panel claim "holds a mortgage" for
+# a customer who has none, so keep mortgage terms unambiguous.
 _LOAN_KEYWORDS = (
-    ('mortgage', 'mortgage'), ('owner occupier', 'mortgage'), ('purchase', 'mortgage'),
-    ('housing', 'mortgage'), ('plot', 'mortgage'), ('construction', 'mortgage'),
-    ('overdraft', 'overdraft'), ('asset', 'asset_finance'), ('motor', 'asset_finance'),
-    ('vehicle', 'asset_finance'), ('lpo', 'trade'), ('trade', 'trade'),
-    ('guarantee', 'trade'), ('insurance premium', 'ipf'), ('ipf', 'ipf'),
-    ('personal', 'unsecured'), ('salary', 'unsecured'), ('unsecured', 'unsecured'),
+    ('insurance premium', 'ipf'), ('ipf', 'ipf'),
+    ('hire purchase', 'asset_finance'), ('asset', 'asset_finance'),
+    ('motor', 'asset_finance'), ('vehicle', 'asset_finance'), ('equipment', 'asset_finance'),
+    ('lpo', 'trade'), ('trade', 'trade'), ('guarantee', 'trade'),
+    ('overdraft', 'overdraft'),
+    ('mortgage', 'mortgage'), ('owner occupier', 'mortgage'), ('home loan', 'mortgage'),
+    ('housing', 'mortgage'), ('residential', 'mortgage'), ('plot', 'mortgage'),
+    ('construction', 'mortgage'),
+    ('personal', 'unsecured'), ('salary', 'unsecured'), ('check off', 'unsecured'),
+    ('check-off', 'unsecured'), ('unsecured', 'unsecured'),
 )
 
 # --- transaction feed: fact_dep_trx_recording ---------------------------------
