@@ -161,6 +161,15 @@ class WarehouseGateway(abc.ABC):
     def get_insurance_crm(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- lending health (delinquency + collateral) ----------------------------
+    # Default: nothing. Live gateways override this to return {'delinquency':…,
+    # 'collateral':…} — the bank's NPL/watch classification + IFRS impairment, and the
+    # collateral types securing the customer's lending. None when neither applies.
+    # See c360/lending.py. Display-only; does NOT feed the risk gate (that's the
+    # deliberate 'critical' step, kept separate).
+    def get_lending_health(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
     # --- retention / silent-attrition early warning (optional capability) -----
     # Default: not computed. A gateway that holds a deposit-balance history overrides
     # this to return {'flag','trend_pct','note','from','to'} (see c360/retention.py).

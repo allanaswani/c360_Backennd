@@ -179,6 +179,13 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     # (national-ID bridged). None when the customer has neither.
     crm_panel = _build_crm(gateway, cust_id)
 
+    # Lending health — delinquency standing (NPL/watch + impairment) + collateral held.
+    # None when neither applies. Display-only (does not feed the risk gate).
+    try:
+        lending_panel = gateway.get_lending_health(cust_id)
+    except Exception:
+        lending_panel = None
+
     # Silent-attrition early warning — DERIVED from the deposit-balance history
     # (c360/retention.py). Optional: None when the gateway has no history or the
     # trend can't be judged, in which case the UI simply omits the chip.
@@ -230,6 +237,8 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
         'credit_bureau': bureau_panel,
         # Subsidiary CRM (property leads + insurance CRM), or None when neither applies.
         'crm': crm_panel,
+        # Lending health (delinquency + collateral), or None when neither applies.
+        'lending': lending_panel,
         'risk': {
             'risk_class': risk_metric,
             'crb_status': crb_metric,

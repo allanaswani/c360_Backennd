@@ -32,6 +32,7 @@ from typing import Any
 
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
+from ... import lending as lending_shape
 from ... import retention as retention_derive
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
@@ -2055,3 +2056,48 @@ class TrinoWarehouse(WarehouseGateway):
         if not rows:
             return None
         return crm_shape.shape_insurance_crm(rows[0])
+
+    def get_lending_health(self, cust_id):
+        """Credit standing (NPL / watch classification + IFRS impairment) and collateral
+        held, for the header 'Credit standing & collateral' panel. Delinquency joins
+        npl_accounts / pre_npl_accounts on the numeric prefix of their suffixed cust_id
+        (e.g. '1125644-8' -> 1125644 = dim_customer.customer_id). Collateral joins the
+        clean customer_id; its rows repeat, so we report distinct TYPES held (values are
+        blank upstream). Returns None when the customer has neither. Never raises.
+        Display-only — this does NOT feed the recommendation risk gate."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+
+        # Delinquency: the customer's classified NPL accounts (worst wins) + watch list.
+        npl = self._t.execute(
+            "SELECT TRIM(classification) classification, ifrs_impairement impairment, "
+            "CAST(month AS varchar) month FROM delta.gold_db.npl_accounts "
+            "WHERE TRY_CAST(SPLIT_PART(cust_id,'-',1) AS BIGINT) = ?", (cid,))
+        on_watch = False
+        if not npl:
+            wrows = self._t.execute(
+                "SELECT COUNT(*) n FROM delta.gold_db.pre_npl_accounts "
+                "WHERE TRY_CAST(SPLIT_PART(cust_id,'-',1) AS BIGINT) = ? "
+                "AND UPPER(TRIM(classification)) = 'WATCH'", (cid,))
+            on_watch = bool(wrows and int(wrows[0].get('n') or 0) > 0)
+        month = None
+        npl_rows = []
+        for r in npl:
+            npl_rows.append({'classification': self._clean(r.get('classification')),
+                             'impairment': r.get('impairment')})
+            month = month or self._clean(r.get('month'))
+        delinquency = lending_shape.shape_delinquency(npl_rows, on_watch, month)
+
+        # Collateral: distinct types held (rows repeat, so DISTINCT-count per type).
+        crows = self._t.execute(
+            "SELECT TRIM(collateral_type) collateral_type, COUNT(*) count "
+            "FROM delta.gold_db.collateral WHERE customer_id = ? "
+            "AND collateral_type IS NOT NULL AND TRIM(collateral_type) <> '' "
+            "GROUP BY TRIM(collateral_type)", (cid,))
+        collateral = lending_shape.shape_collateral(
+            [{'type': r.get('collateral_type'), 'count': r.get('count')} for r in crows])
+
+        if not delinquency and not collateral:
+            return None
+        return {'delinquency': delinquency, 'collateral': collateral}

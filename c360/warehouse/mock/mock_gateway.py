@@ -15,6 +15,7 @@ from typing import Any
 
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
+from ... import lending as lending_shape
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..gateway import WarehouseGateway
@@ -431,6 +432,35 @@ class MockWarehouse(WarehouseGateway):
             'branch': branches[int(r.next() * len(branches))],
             'location': None,
         })
+
+    def get_lending_health(self, cust_id):
+        """Preview credit standing + collateral. A down-trending borrower may be NPL or
+        on watch; borrowers commonly carry collateral. Shaped through the same
+        c360.lending logic as live."""
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if not c:
+            return None
+        r = _rng(cust_id + 'lend')
+        delinquency = None
+        if c['loans'] > 0:
+            down = c['profile'].get('trend') == 'down'
+            roll = r.next()
+            if down and roll > 0.7:
+                cls = ['SUBSTD', 'DOUBTFUL', 'LOSS'][min(2, int(r.next() * 3))]
+                delinquency = lending_shape.shape_delinquency(
+                    [{'classification': cls, 'impairment': round(200_000 + r.next() * 3_000_000)}],
+                    False, 'May')
+            elif roll > 0.72:
+                delinquency = lending_shape.shape_delinquency([], True, 'May')
+        collateral = None
+        if c['loans'] > 0 and r.next() > 0.35:
+            pool = [('PROPERTY', 1 + int(r.next() * 2)), ('VEHICLE', 1 + int(r.next() * 3)),
+                    ('TERM DEPOSIT COLLATERAL', 1)]
+            picks = [pool[i] for i in range(len(pool)) if r.next() > 0.5] or [pool[0]]
+            collateral = lending_shape.shape_collateral([{'type': tp, 'count': n} for tp, n in picks])
+        if not delinquency and not collateral:
+            return None
+        return {'delinquency': delinquency, 'collateral': collateral}
 
     def segment_product_benchmark(self, segment):
         return seed.SEGMENT_BENCHMARK.get(segment, 3.0)
