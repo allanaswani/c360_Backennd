@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import auth_views, feedback_views, views
+from . import auth_views, feedback_views, observability_views, views
 
 app_name = 'c360'
 
@@ -42,4 +42,8 @@ urlpatterns = [
     path('book/', views.BookSummaryView.as_view(), name='book-summary'),
     # --- admin: live-warehouse data health ---
     path('admin/health/', views.DataHealthView.as_view(), name='data-health'),
+    # --- observability: ops dashboard + audit trail (admin) + client telemetry beacon ---
+    path('observability/overview/', observability_views.ObservabilityOverviewView.as_view(), name='obs-overview'),
+    path('observability/audit/', observability_views.AuditListView.as_view(), name='obs-audit'),
+    path('telemetry/collect/', observability_views.TelemetryCollectView.as_view(), name='telemetry-collect'),
 ]

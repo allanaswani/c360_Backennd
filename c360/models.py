@@ -166,6 +166,75 @@ class HealthSnapshot(models.Model):
         return f'health @ {self.captured_at:%Y-%m-%d %H:%M} (days_behind={self.days_behind})'
 
 
+class AuditEvent(models.Model):
+    """One recorded activity — a server-side API action or a client-side interaction
+    (click / navigation). Written OFF the request hot path (buffered + bulk-inserted by
+    the observability flusher), so recording never blocks a user. Timestamped in real
+    system time. Retention is bounded (see the flusher) so the table can't grow without
+    limit under daily/hourly traffic."""
+
+    KIND_API = 'api'
+    KIND_PAGE = 'page_view'
+    KIND_CLICK = 'click'
+    KIND_NAV = 'nav'
+    KIND_AUTH = 'auth'
+
+    ts = models.DateTimeField(default=timezone.now, db_index=True)
+    user_id = models.IntegerField(null=True, blank=True)     # who (resolved from the JWT)
+    username = models.CharField(max_length=150, blank=True, default='')
+    kind = models.CharField(max_length=16, default=KIND_API)
+    method = models.CharField(max_length=8, blank=True, default='')
+    route = models.CharField(max_length=200, blank=True, default='')   # normalised URL pattern
+    path = models.CharField(max_length=300, blank=True, default='')    # raw path (truncated)
+    status = models.IntegerField(null=True, blank=True)
+    duration_ms = models.IntegerField(null=True, blank=True)
+    target = models.CharField(max_length=200, blank=True, default='')  # e.g. customer id / element
+    ip = models.GenericIPAddressField(null=True, blank=True)
+    session = models.CharField(max_length=64, blank=True, default='')
+    meta = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        db_table = 'c360_audit_event'
+        ordering = ['-ts']
+        indexes = [
+            models.Index(fields=['-ts']),
+            models.Index(fields=['user_id', '-ts']),
+            models.Index(fields=['kind', '-ts']),
+        ]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f'{self.ts:%Y-%m-%d %H:%M:%S} {self.username or self.user_id} {self.kind} {self.route}'
+
+
+class MetricMinute(models.Model):
+    """A per-minute, per-worker rollup of request metrics, flushed from the in-memory
+    collector (never a DB write on the request hot path). One row per (minute, instance)
+    so multiple gunicorn workers don't clobber each other; the read API aggregates across
+    instances. Latency percentiles are computed from a reservoir sample of the minute.
+    A gap in the minute series for a live instance = downtime."""
+
+    minute = models.DateTimeField(db_index=True)          # truncated to the minute (UTC)
+    instance = models.CharField(max_length=40)            # host:pid — the worker
+    count = models.IntegerField(default=0)
+    errors = models.IntegerField(default=0)               # 5xx
+    client_errors = models.IntegerField(default=0)        # 4xx
+    sum_ms = models.BigIntegerField(default=0)            # for an exact weighted mean on read
+    p50_ms = models.IntegerField(default=0)
+    p95_ms = models.IntegerField(default=0)
+    p99_ms = models.IntegerField(default=0)
+    max_ms = models.IntegerField(default=0)
+    by_status = models.JSONField(default=dict, blank=True)   # {'2xx':n,'4xx':n,'5xx':n}
+
+    class Meta:
+        db_table = 'c360_metric_minute'
+        ordering = ['-minute']
+        constraints = [models.UniqueConstraint(fields=['minute', 'instance'], name='uniq_metric_minute_instance')]
+        indexes = [models.Index(fields=['-minute'])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f'{self.minute:%Y-%m-%d %H:%M} {self.instance} n={self.count} p95={self.p95_ms}ms'
+
+
 @receiver(post_save, sender=User)
 def create_user_profile(sender, instance, created, **kwargs):
     """Every user gets a Profile on creation. We never email a password here — the

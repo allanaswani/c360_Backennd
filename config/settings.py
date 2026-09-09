@@ -66,6 +66,9 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'corsheaders.middleware.CorsMiddleware',
+    # Observability — outermost app middleware so it times the full request and captures
+    # the audit trail. Thin, never writes to the DB inline (see c360/observability.py).
+    'c360.middleware.ObservabilityMiddleware',
     'django.middleware.security.SecurityMiddleware',
     # WhiteNoise serves collected static (admin / DRF browsable-API CSS) straight
     # from the app process under gunicorn, so the container needs no static server.
@@ -151,6 +154,17 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 
 USE_TZ = True
+
+# --- Observability / audit ------------------------------------------------------
+# The in-app ops dashboard + audit trail + Prometheus /metrics. Timestamps are stored
+# tz-aware (UTC) and rendered in the viewer's system time by the frontend. Tunables:
+OBSERVABILITY_ENABLED = _env_bool('OBSERVABILITY_ENABLED', True)          # instrument requests
+OBSERVABILITY_BACKGROUND = _env_bool('OBSERVABILITY_BACKGROUND', True)    # run the flush thread
+OBSERVABILITY_FLUSH_SECONDS = int(os.environ.get('OBSERVABILITY_FLUSH_SECONDS', '20') or '20')
+OBSERVABILITY_METRIC_RETENTION_DAYS = int(os.environ.get('OBSERVABILITY_METRIC_RETENTION_DAYS', '30') or '30')
+OBSERVABILITY_AUDIT_RETENTION_DAYS = int(os.environ.get('OBSERVABILITY_AUDIT_RETENTION_DAYS', '90') or '90')
+# Fraction of client CLICK events to keep (navigations/page-views are always kept). 1.0 = all.
+OBSERVABILITY_CLIENT_SAMPLE = float(os.environ.get('OBSERVABILITY_CLIENT_SAMPLE', '1.0') or '1.0')
 
 
 # Static files (CSS, JavaScript, Images)

@@ -17,7 +17,11 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import include, path
 
+from c360.api.observability_views import MetricsExporterView
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('c360.api.urls')),
+    # Prometheus scrape target (root path, unauthenticated on a trusted network).
+    path('metrics', MetricsExporterView.as_view(), name='metrics'),
 ]
