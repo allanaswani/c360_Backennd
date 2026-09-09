@@ -13,6 +13,8 @@ import hashlib
 from datetime import date, timedelta
 from typing import Any
 
+from ... import credit_bureau as bureau_shape
+from ... import crm as crm_shape
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..gateway import WarehouseGateway
@@ -358,6 +360,77 @@ class MockWarehouse(WarehouseGateway):
                 statuses.append('Performing')
         return risk_derive.derive_profile(
             identity, statuses, float(c['deposits']), float(c['loans']))
+
+    def get_credit_bureau(self, cust_id):
+        """Preview TransUnion (CRB) record, synthesised deterministically so the panel
+        shows a realistic spread: most customers scored, a minority a 'no-hit' thin
+        file, and a minority with no bureau record at all (returns None). Shaped through
+        the same c360.credit_bureau logic as live, so the panel behaves identically."""
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if not c:
+            return None
+        r = _rng(cust_id + 'crb')
+        roll = r.next()
+        if roll < 0.18:                      # ~18% simply aren't on the bureau
+            return None
+        as_of = (_AS_OF - timedelta(days=int(120 + r.next() * 240))).isoformat()
+        if roll < 0.30:                      # a thin-file no-hit (sentinel row)
+            raw = {'score': 0, 'score_grade': 'YY', 'probability': 999.99,
+                   'non_performing': 0, 'arrears_90_days': 0,
+                   'number_of_enquiries': int(r.next() * 3), 'enquiries_90_days': 0}
+            return bureau_shape.shape_bureau(raw, as_of=as_of)
+        # A scored record. A down-trending / borrowing customer reads worse (higher PD,
+        # some arrears) so the preview shows the full range.
+        down = c['profile'].get('trend') == 'down' and c['loans'] > 0
+        score = int(720 - r.next() * 300 - (140 if down else 0))
+        score = max(250, min(830, score))
+        pd = round(min(95.0, max(2.0, (830 - score) / 8.0 + r.next() * 6)), 2)
+        grades = ['AA', 'BB', 'CC', 'DD', 'EE', 'FF', 'GG', 'HH', 'II', 'JJ']
+        grade = grades[min(9, int((830 - score) / 60))]
+        npl = 1 if (down and r.next() > 0.5) else 0
+        raw = {
+            'score': score, 'score_grade': grade, 'probability': pd,
+            'non_performing': npl,
+            'arrears_90_days': (1 if down and r.next() > 0.6 else 0),
+            'max_arrears_last_6_months': (int(r.next() * 4) if down else 0),
+            'number_of_enquiries': int(r.next() * 8),
+            'enquiries_90_days': int(r.next() * 3),
+        }
+        return bureau_shape.shape_bureau(raw, as_of=as_of)
+
+    def get_property_leads(self, cust_id):
+        """Preview property-sales CRM — a minority of customers carry matched leads, so
+        the panel appears occasionally (mirrors the ~13% live phone-match rate)."""
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if not c:
+            return None
+        r = _rng(cust_id + 'propcrm')
+        if r.next() > 0.35:                 # most customers have no matched lead
+            return None
+        pool = ['SEALED', 'prospect', 'holding', 'potential', 'failed', 'booked']
+        n = 1 + int(r.next() * 4)
+        states = [pool[int(r.next() * len(pool))] for _ in range(n)]
+        fups = int(r.next() * 12)
+        return crm_shape.shape_property_leads(states, fups, int(fups * r.next()))
+
+    def get_insurance_crm(self, cust_id):
+        """Preview insurance CRM profile — appears for a subset of customers."""
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if not c:
+            return None
+        r = _rng(cust_id + 'inscrm')
+        if r.next() > 0.4:
+            return None
+        agents = ['Eric Otieno', 'Faith Wanjiku', 'Peter Kariuki', 'Aisha Noor']
+        occs = ['RETIRED BANKER', 'CIVIL SERVANT', 'BUSINESS OWNER', 'TEACHER', 'ENGINEER']
+        branches = ['Buruburu Branch', 'Westlands Branch', 'Kisumu Branch', 'Nakuru Branch']
+        return crm_shape.shape_insurance_crm({
+            'risk_manager': 'robert.mugo@hfgroup.co.ke',
+            'sales_person': agents[int(r.next() * len(agents))],
+            'occupation': occs[int(r.next() * len(occs))],
+            'branch': branches[int(r.next() * len(branches))],
+            'location': None,
+        })
 
     def segment_product_benchmark(self, segment):
         return seed.SEGMENT_BENCHMARK.get(segment, 3.0)

@@ -30,6 +30,8 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
+from ... import credit_bureau as bureau_shape
+from ... import crm as crm_shape
 from ... import retention as retention_derive
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
@@ -1384,6 +1386,40 @@ class TrinoWarehouse(WarehouseGateway):
         return risk_derive.derive_profile(
             identity, statuses, float(val['deposits']), float(val['loans']))
 
+    def get_credit_bureau(self, cust_id):
+        """Latest TransUnion (CRB) scorecard record for the customer, matched by
+        national ID. The source table repeats each national ID many times, so we take
+        the newest row by ``created_at`` (dedupe). Returns None when the customer has
+        no numeric national ID or no bureau record; a ``no_hit`` record when they are on
+        the bureau but have no scoreable history. Never raises — a probe failure lets the
+        caller fall back to 'not sourced' rather than break the page.
+
+        This is a real external feed but a POINT-IN-TIME pull (the load stopped ~Mar
+        2026), so the shaped record carries ``as_of`` = the row's load date, which the
+        UI shows as provenance. Shaping/sentinel logic lives in c360/credit_bureau.py."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        nrow = self._t.execute(
+            "SELECT TRIM(customer_id_no) nid FROM delta.gold_db.dim_customer "
+            "WHERE customer_id=? LIMIT 1", (cid,))
+        nid = (nrow[0]['nid'] if nrow else None) or ''
+        # The bureau key is a numeric national_id (bigint); a passport/alien id won't
+        # match, so bail rather than mis-join. Guard blank/short ids too.
+        if len(nid) < 5 or not nid.isdigit():
+            return None
+        rows = self._t.execute(
+            "SELECT score, score_grade, probability, non_performing, arrears_90_days, "
+            "max_arrears_last_6_months, number_of_enquiries, enquiries_90_days, "
+            "CAST(created_at AS varchar) created "
+            "FROM delta.gold_db.score_card_review_tu_accounts_summary "
+            "WHERE national_id = ? ORDER BY created_at DESC LIMIT 1", (int(nid),))
+        if not rows:
+            return None
+        r = rows[0]
+        as_of = (self._clean(r.get('created')) or '')[:10] or None
+        return bureau_shape.shape_bureau(r, as_of=as_of)
+
     def portfolio_trends(self, customers, period):
         """Real book / segment / top-mover history for the sample from the EOM
         balance snapshots — no simulation. Two partition-pruned scans (deposits +
@@ -1954,3 +1990,68 @@ class TrinoWarehouse(WarehouseGateway):
             })
         policies.sort(key=lambda p: p['premium'], reverse=True)
         return {'policies': policies}
+
+    def get_property_leads(self, cust_id):
+        """Property-sales CRM (HFDI leads + follow-ups) for a bank customer, matched by
+        PHONE — the lead export carries no customer/national id, so this is the only
+        bridge and it is fuzzy (the caller tags it 'matched by phone'). Only resolves for
+        the ~5.8k leads whose phone is also a bank customer's. Returns None when the
+        customer's mobile is blank/short or matches no lead. Summarised (furthest stage +
+        follow-up engagement), not a raw event dump — the source dates/campaigns are
+        unreliably null. Never raises: a probe failure just yields no panel."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        mrow = self._t.execute(
+            "SELECT regexp_replace(TRIM(primary_mobile_no),'[^0-9]','') p "
+            "FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
+        phone = (mrow[0]['p'] if mrow else None) or ''
+        # A full 9-digit subscriber number is required — a blank/short phone would
+        # over-match every lead with a blank phone (the customer-2 false-match trap).
+        if len(phone) < 9:
+            return None
+        last9 = phone[-9:]
+        leads = self._t.execute(
+            "SELECT lead_id, MAX(TRIM(lead_state)) state "
+            "FROM delta.gold_db.hfdi_lead_data "
+            "WHERE phone IS NOT NULL AND length(regexp_replace(CAST(phone AS varchar),'[^0-9]','')) >= 9 "
+            "AND substr(regexp_replace(CAST(phone AS varchar),'[^0-9]',''), "
+            "  length(regexp_replace(CAST(phone AS varchar),'[^0-9]',''))-8) = ? "
+            "GROUP BY lead_id", (last9,))
+        if not leads:
+            return None
+        states = [self._clean(l.get('state')) for l in leads]
+        lead_ids = [int(l['lead_id']) for l in leads if l.get('lead_id') is not None]
+        n_fup, ok_fup = 0, 0
+        if lead_ids:
+            inlist = ','.join(str(i) for i in lead_ids)
+            frow = self._t.execute(
+                "SELECT COUNT(*) n, "
+                "SUM(CASE WHEN upper(TRIM(followup_success)) IN ('SUCCESSFUL','YES') THEN 1 ELSE 0 END) ok "
+                f"FROM delta.gold_db.hfdi_lead_followup_data WHERE lead_id IN ({inlist})")
+            if frow:
+                n_fup = int(frow[0].get('n') or 0)
+                ok_fup = int(frow[0].get('ok') or 0)
+        return crm_shape.shape_property_leads(states, n_fup, ok_fup)
+
+    def get_insurance_crm(self, cust_id):
+        """Insurance CRM profile (HFBI customer record) for a bank customer, bridged by
+        national ID (dim_customer.customer_id_no = hfbi_customer_data.idno) — a clean,
+        exact join. The HFBI *leads* table is empty, so this is the servicing view:
+        insurance RM/agent, occupation, branch. Returns None when the customer has no
+        HFBI record or it carries nothing worth showing. Never raises."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        nid_rows = self._t.execute(
+            "SELECT TRIM(customer_id_no) nid FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
+        nid = (nid_rows[0]['nid'] if nid_rows else None) or ''
+        if len(nid) < 5 or nid.upper() == 'NULL' or not any(ch.isdigit() for ch in nid):
+            return None
+        rows = self._t.execute(
+            "SELECT MAX(TRIM(risk_manager)) risk_manager, MAX(TRIM(sales_person)) sales_person, "
+            "MAX(TRIM(occupation)) occupation, MAX(TRIM(branch)) branch, MAX(TRIM(location)) location "
+            "FROM delta.gold_db.hfbi_customer_data WHERE TRIM(idno) = ?", (nid,))
+        if not rows:
+            return None
+        return crm_shape.shape_insurance_crm(rows[0])

@@ -91,6 +91,53 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     return ' '.join(parts)
 
 
+def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Fetch the customer's TransUnion (CRB) record and produce (panel, crb_chip).
+
+    ``panel`` is the full bureau card data (or None when there's nothing to show);
+    ``crb_chip`` is the header 'CRB status' Metric dict, kept consistent with the panel.
+
+    Provenance: the bureau is a real external feed, but a point-in-time pull, so the
+    pull date is always shown and the values are badged LIVE (not derived/faked). A
+    customer with no bureau record now reads an honest 'No bureau record' — the feed
+    exists, they simply aren't in it — rather than the old blanket 'not sourced', which
+    is reserved for a genuine load failure. Display-only for now: this does NOT gate the
+    recommendation engine yet (planned next step, per the agreed sequence)."""
+    try:
+        b = gateway.get_credit_bureau(cust_id)
+    except Exception:
+        # A real probe failure — honestly unsourced, not "no record".
+        return None, to_source(note='Credit-bureau feed unavailable for this customer.').to_dict()
+    if not b:
+        return None, live('No bureau record', note='No TransUnion credit-bureau record matched this customer.').to_dict()
+    if b.get('no_hit'):
+        chip = live('No score · thin file',
+                    note=f'On the credit bureau but with no scoreable history (as of {b.get("as_of")}).').to_dict()
+        return b, chip
+    grade = f' · {b["grade"]}' if b.get('grade') else ''
+    pd = f' PD {b["pd"]}%.' if b.get('pd') is not None else ''
+    chip = live(f'{b["score"]}{grade}',
+                note=f'TransUnion bureau score, as of {b.get("as_of")}.{pd}').to_dict()
+    return b, chip
+
+
+def _build_crm(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any] | None:
+    """Subsidiary CRM panels: property-sales leads (HFDI, phone-matched) and the insurance
+    CRM profile (HFBI, national-ID bridged). Returns {'property_leads':…, 'insurance':…}
+    with either sub-key None when absent, or None overall when the customer has neither —
+    so the frontend renders nothing rather than an empty shell. Never raises."""
+    def _safe(fn):
+        try:
+            return fn(cust_id)
+        except Exception:
+            return None
+    prop = _safe(gateway.get_property_leads)
+    ins = _safe(gateway.get_insurance_crm)
+    if not prop and not ins:
+        return None
+    return {'property_leads': prop, 'insurance': ins}
+
+
 def _build_bio(bio: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, val in bio.items():
@@ -121,6 +168,16 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     else:
         risk_metric = to_source(note='Risk profile unavailable for this customer.').to_dict()
         kyc_metric = to_source(note='KYC profile unavailable for this customer.').to_dict()
+
+    # Credit bureau (TransUnion CRB) — a real external feed, matched by national ID.
+    # Display-only: the panel + the header CRB chip are populated here; it does not yet
+    # gate recommendations. Returns (panel, chip); panel is None when there's nothing to
+    # show and the chip then reads 'No bureau record' / 'not sourced' honestly.
+    bureau_panel, crb_metric = _credit_bureau(gateway, cust_id)
+
+    # Subsidiary CRM — property-sales leads (phone-matched) + insurance CRM profile
+    # (national-ID bridged). None when the customer has neither.
+    crm_panel = _build_crm(gateway, cust_id)
 
     # Silent-attrition early warning — DERIVED from the deposit-balance history
     # (c360/retention.py). Optional: None when the gateway has no history or the
@@ -168,9 +225,14 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
         # birthplace) are individual-only, so an organisation carries them as null
         # and the UI simply omits them (a legitimate N/A, not a silent gap).
         'bio': _build_bio(c.get('bio') or {}),
+        # Credit-bureau panel (TransUnion CRB), or None when the customer has no bureau
+        # record / it couldn't be read. The frontend renders the full card from this.
+        'credit_bureau': bureau_panel,
+        # Subsidiary CRM (property leads + insurance CRM), or None when neither applies.
+        'crm': crm_panel,
         'risk': {
             'risk_class': risk_metric,
-            'crb_status': to_source(note='CRB score needs an external credit-bureau feed — not derivable from held data.').to_dict(),
+            'crb_status': crb_metric,
             'kyc_status': kyc_metric,
             # Sourced live from dim_customer.account_opening_date; unsourced in mock.
             'relationship_since': (

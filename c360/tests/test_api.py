@@ -24,11 +24,16 @@ class ApiTests(TestCase):
         r = self.c.get('/api/customers/HF-100238/')
         self.assertEqual(r.status_code, 200)
         body = r.json()
-        # identity is live; risk/KYC are DERIVED from live data; CRB stays not-sourced.
+        # identity is live; risk/KYC are DERIVED from live data; CRB is now sourced from
+        # the TransUnion bureau feed (live) — either a record, or an honest 'No bureau
+        # record'; never the old blanket 'not sourced' (that's reserved for a load failure).
         self.assertEqual(body['header']['identity']['name']['status'], 'live')
         self.assertEqual(body['header']['risk']['risk_class']['status'], 'derived')
         self.assertEqual(body['header']['risk']['kyc_status']['status'], 'derived')
-        self.assertEqual(body['header']['risk']['crb_status']['status'], 'to_source')
+        self.assertEqual(body['header']['risk']['crb_status']['status'], 'live')
+        self.assertTrue(body['header']['risk']['crb_status']['value'])   # never a silent dash
+        # the credit_bureau panel key is always present (a dict when there's a record, else None).
+        self.assertIn('credit_bureau', body['header'])
         # never a silent dash — the derived values are real strings.
         self.assertIn(body['header']['risk']['risk_class']['value'], ('Low', 'Medium', 'High'))
 

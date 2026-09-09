@@ -139,6 +139,28 @@ class WarehouseGateway(abc.ABC):
     def get_bancassurance(self, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
         ...
 
+    # --- external credit bureau (TransUnion CRB scorecard) --------------------
+    # Default: no bureau record. A live gateway overrides this to return the customer's
+    # LATEST deduped bureau record (matched by national ID) from the TransUnion
+    # scorecard table — a point-in-time pull, so callers surface the pull date and never
+    # present it as live. Returns None when the customer has no bureau record at all;
+    # returns a record with ``no_hit=True`` when they are on the bureau but have no
+    # scoreable history (a real 'thin file' answer). See c360/credit_bureau.py.
+    def get_credit_bureau(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
+    # --- subsidiary CRM (property sales leads / insurance CRM) ----------------
+    # Default: nothing. Live gateways override these. Property leads (HFDI) are matched
+    # by PHONE (the only bridge the lead export carries) — fuzzy, and only for the
+    # minority of leads whose phone is a bank customer's. Insurance CRM (HFBI) is the
+    # customer record, bridged cleanly by national ID (the HFBI *leads* table is empty).
+    # Each returns None when the customer has no matching CRM record. See c360/crm.py.
+    def get_property_leads(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
+    def get_insurance_crm(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
     # --- retention / silent-attrition early warning (optional capability) -----
     # Default: not computed. A gateway that holds a deposit-balance history overrides
     # this to return {'flag','trend_pct','note','from','to'} (see c360/retention.py).
