@@ -9,15 +9,17 @@ from datetime import timedelta
 from django.db.models import Avg, Count, Max, Q, Sum
 from django.http import HttpResponse
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from .. import observability as obs
+from .. import changes, observability as obs
 from ..models import AuditEvent, MetricMinute
 from ..rbac.scoping import resolve_scope
+from ..reports import datasets, tabular
 
 
 def _admin_or_403(request):
@@ -140,8 +142,9 @@ class AuditListView(APIView):
             term = qp['q']
             qs = qs.filter(Q(route__icontains=term) | Q(path__icontains=term)
                            | Q(target__icontains=term) | Q(username__icontains=term))
-        if qp.get('since'):
-            qs = qs.filter(ts__gte=qp['since'])
+        since = _since_from(qp)
+        if since is not None:
+            qs = qs.filter(ts__gte=since)
         if qp.get('until'):
             qs = qs.filter(ts__lte=qp['until'])
         limit = max(1, min(200, _int(qp.get('limit')) or 50))
@@ -183,6 +186,140 @@ class TelemetryCollectView(APIView):
                 meta=ev.get('meta') if isinstance(ev.get('meta'), dict) else {})
             accepted += 1
         return Response({'accepted': accepted})
+
+
+class ChangeAuditView(APIView):
+    """GET /api/observability/changes/ — who changed what, with before → after.
+
+    The companion to the activity trail: that one records what was *accessed*, this
+    one records what was *altered*. Filters: ``?model=&user=&action=&q=&since=&
+    until=&limit=``.
+    """
+
+    def get(self, request: Request):
+        denied = _admin_or_403(request)
+        if denied:
+            return denied
+        qp = request.query_params
+        limit = max(1, min(500, _int(qp.get('limit')) or 100))
+        since = _since_from(qp)
+        rows = changes.feed(
+            since=since, until=_parse_dt(qp.get('until')),
+            model=qp.get('model') or None, username=qp.get('user') or None,
+            action=qp.get('action') or None, search=qp.get('q') or None,
+            limit=limit,
+        )
+        return Response({
+            'count': len(rows),
+            'limit': limit,
+            'results': rows,
+            'summary': changes.summary(since=since),
+            'models': [{'model': m['model'], 'label': m['verbose']}
+                       for m in changes.auditable_models()],
+        })
+
+
+class ReportExportView(APIView):
+    """GET /api/observability/export/?dataset=<key>&fmt=csv|xlsx — a whole table.
+
+    The screen paginates; an export must not. This builds the full filtered dataset
+    server-side and streams one file, so a 40,000-row audit export does not depend
+    on the browser having paged through it first.
+
+    Only datasets named in ``EXPORTABLE`` can be requested — caller input selects
+    from a fixed registry, it never becomes a query.
+
+    The parameter is ``fmt`` and not ``format`` on purpose: DRF reserves ``format``
+    for content negotiation and raises 404 for a value with no matching renderer,
+    so ``?format=csv`` would never reach this method.
+    """
+
+    def get(self, request: Request):
+        denied = _admin_or_403(request)
+        if denied:
+            return denied
+
+        qp = request.query_params
+        key = qp.get('dataset') or ''
+        builder = datasets.EXPORTABLE.get(key)
+        if builder is None:
+            return Response(
+                {'error': {'status': 400,
+                           'detail': f'Unknown dataset. Available: {", ".join(sorted(datasets.EXPORTABLE))}.'}},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        fmt = (qp.get('fmt') or 'csv').lower()
+        if fmt not in {'csv', 'xlsx'}:
+            return Response({'error': {'status': 400, 'detail': 'fmt must be csv or xlsx.'}},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            dataset = builder(**_export_kwargs(key, qp))
+        except Exception as exc:                             # noqa: BLE001
+            return Response({'error': {'status': 500,
+                                       'detail': f'Could not build the export: {type(exc).__name__}: {exc}'}},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        if fmt == 'xlsx':
+            payload = tabular.to_xlsx(dataset)
+            content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        else:
+            payload = tabular.to_csv(dataset)
+            content_type = 'text/csv; charset=utf-8'
+
+        response = HttpResponse(payload, content_type=content_type)
+        response['Content-Disposition'] = f'attachment; filename="{tabular.filename(dataset, fmt)}"'
+        response['X-C360-Row-Count'] = str(dataset['row_count'])
+        return response
+
+
+def _export_kwargs(key: str, qp) -> dict:
+    """Translate query parameters into the builder's arguments, per dataset.
+
+    Explicit per dataset rather than passing the query string through, so an
+    unexpected parameter can never reach a builder that would treat it as a filter.
+    """
+    window = max(5, min(43_200, _int(qp.get('window')) or 1440))   # 5 min … 30 days
+    since, until = _since_from(qp), _parse_dt(qp.get('until'))
+    if key == 'activity':
+        return {'since': since, 'until': until, 'kind': qp.get('kind', ''),
+                'status': qp.get('status', ''), 'q': qp.get('q', ''),
+                'user': qp.get('user', '')}
+    if key == 'changes':
+        return {'since': since, 'until': until, 'model': qp.get('model', ''),
+                'username': qp.get('user', ''), 'action': qp.get('action', ''),
+                'q': qp.get('q', '')}
+    if key in {'traffic', 'routes', 'errors', 'users'}:
+        return {'window_minutes': window}
+    return {}
+
+
+def _since_from(qp):
+    """The start of the requested window.
+
+    A caller may pass an absolute ``since``, or a relative ``window`` in minutes.
+    Relative is preferred by the UI: the rows are stamped with the SERVER's clock,
+    so resolving "the last 24 hours" here avoids a browser whose clock is off
+    quietly returning the wrong slice.
+    """
+    explicit = _parse_dt(qp.get('since'))
+    if explicit is not None:
+        return explicit
+    minutes = _int(qp.get('window'))
+    if minutes and minutes > 0:
+        return timezone.now() - timedelta(minutes=min(minutes, 525_600))   # cap at a year
+    return None
+
+
+def _parse_dt(value):
+    if not value:
+        return None
+    parsed = parse_datetime(value)
+    if parsed is None:
+        return None
+    # A naive timestamp from the client is interpreted in the server's timezone
+    # rather than silently compared against aware values (which raises).
+    return timezone.make_aware(parsed) if timezone.is_naive(parsed) else parsed
 
 
 def _audit_row(e: AuditEvent) -> dict:

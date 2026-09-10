@@ -45,5 +45,9 @@ urlpatterns = [
     # --- observability: ops dashboard + audit trail (admin) + client telemetry beacon ---
     path('observability/overview/', observability_views.ObservabilityOverviewView.as_view(), name='obs-overview'),
     path('observability/audit/', observability_views.AuditListView.as_view(), name='obs-audit'),
+    # Change audit — who altered an account, role, RM allocation or feedback label.
+    path('observability/changes/', observability_views.ChangeAuditView.as_view(), name='obs-changes'),
+    # One file for a whole filtered table (CSV / Excel), built server-side.
+    path('observability/export/', observability_views.ReportExportView.as_view(), name='obs-export'),
     path('telemetry/collect/', observability_views.TelemetryCollectView.as_view(), name='telemetry-collect'),
 ]

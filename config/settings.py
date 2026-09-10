@@ -60,6 +60,10 @@ INSTALLED_APPS = [
     'rest_framework_simplejwt',
     'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
+    # Change audit — shadow tables recording every create/update/delete on the
+    # models this app can mutate (accounts, roles, RM allocation, feedback labels),
+    # with the acting user. Read back by c360.changes.
+    'simple_history',
     # Customer 360
     'c360',
 ]
@@ -78,6 +82,11 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    # Attributes each history row to the acting user. Must sit AFTER authentication.
+    # C360 authenticates with JWT inside DRF, not in middleware; DRF assigns the
+    # resolved user back onto the underlying HttpRequest, and simple_history reads
+    # request.user lazily at save time (inside the view), so the attribution lands.
+    'simple_history.middleware.HistoryRequestMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -279,6 +288,36 @@ APP_BRAND_NAME = 'HFCB Customer 360'
 # Login 2FA: when on, sign-in is a two-step flow (password → emailed OTP). On by
 # default; set C360_LOGIN_MFA=false to allow single-step login (e.g. for smoke tests).
 C360_LOGIN_MFA = _env_bool('C360_LOGIN_MFA', True)
+
+# ---------------------------------------------------------------------------
+# Operational reporting — the digests and incident alerts that leave the app by
+# email, so nobody has to be logged in and looking at a dashboard to find out the
+# warehouse went down at 02:00.
+#
+# Sent FROM a reports mailbox (distinct from the no-reply used for OTPs, so a mail
+# rule can file them separately) TO the operations recipients below. Both are
+# overridable by environment so staging can point at a test inbox.
+# ---------------------------------------------------------------------------
+C360_REPORT_FROM = os.environ.get(
+    'C360_REPORT_FROM', 'HFCB Customer 360 Reports <reports.analytics@hfcb.co.ke>')
+C360_REPORT_RECIPIENTS = [
+    a.strip() for a in os.environ.get(
+        'C360_REPORT_RECIPIENTS',
+        'washingtone.amolo@hfcb.co.ke,allan.aswani@hfcb.co.ke',
+    ).split(',') if a.strip()
+]
+# Public base URL used for "open the dashboard" links inside the emails.
+C360_APP_URL = os.environ.get('C360_APP_URL', 'http://localhost:3000').rstrip('/')
+
+# Incident thresholds. An alert fires when a check crosses its threshold and STAYS
+# quiet until the condition clears and recurs (see c360.reports.alerts), so a
+# sustained outage is one email, not one per check interval.
+C360_ALERT_ERROR_RATE_PCT = float(os.environ.get('C360_ALERT_ERROR_RATE_PCT', '5'))
+C360_ALERT_P95_MS = int(os.environ.get('C360_ALERT_P95_MS', '2000'))
+C360_ALERT_DATA_STALE_DAYS = int(os.environ.get('C360_ALERT_DATA_STALE_DAYS', '3'))
+# Re-send a still-firing alert only after this many minutes (0 = never re-send
+# while it stays firing).
+C360_ALERT_RENOTIFY_MINUTES = int(os.environ.get('C360_ALERT_RENOTIFY_MINUTES', '360'))
 
 # ---------------------------------------------------------------------------
 # CORS — the Next.js dev server talks to this API cross-origin.
