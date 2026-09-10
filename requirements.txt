@@ -8,6 +8,16 @@ djangorestframework-simplejwt==5.5.1
 django-cors-headers==4.9.0
 python-dotenv==1.2.2
 
+# Change audit — shadow tables recording every create/update/delete on the models
+# this app can mutate (accounts, roles, RM allocation, feedback labels) with the
+# acting user. Same library and version as the HF Group backend, so the two
+# products' audit trails read alike. Read back by c360/changes.py.
+django-simple-history==3.7.0
+
+# Excel writer for the admin exports and the emailed report attachments
+# (c360/reports/tabular.py). Pure Python, no native build.
+openpyxl==3.1.5
+
 # Production serving — gunicorn is the WSGI server (Linux container); WhiteNoise
 # serves the admin / DRF browsable-API static straight from the app process so no
 # separate static server is needed. Mirrors the HF portfolio backend. Gunicorn is

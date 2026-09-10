@@ -62,6 +62,11 @@ The lines that must be set:
   `DB_NAME=/app/appdb/db.sqlite3` and keep the `-v …/appdb:/app/appdb` mount below.
   (Better long-term: point `DB_*` at a dedicated database on the portfolio's Postgres.)
 - Email (`EMAIL_HOST_USER` / `EMAIL_HOST_PASSWORD`) — needed for real OTP delivery.
+  **Also set `C360_EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend`** — the
+  default is the console backend, which prints mail to the container log and sends
+  nothing. Without this the operations reports below appear to work and never arrive.
+- Operational reporting (section 7): `C360_REPORT_FROM`, `C360_REPORT_RECIPIENTS`,
+  `C360_APP_URL=https://ceo.hfcb.co.ke/customer-360`.
 
 ---
 
@@ -180,3 +185,81 @@ docker run -d --name c360-frontend --restart unless-stopped \
   -e C360_BACKEND_ORIGIN=http://127.0.0.1:9001 \
   node:22 sh -c "npm install && npm run build && npm start"
 ```
+
+---
+
+## 7. Operations reports and alerts (email)
+
+The app measures its own health, but nothing leaves the box on its own — these
+commands do, and they only run if you schedule them. Skip this section and the
+dashboards still work; you simply won't hear about an outage at 02:00.
+
+Recipients and sender come from the env file (section 1):
+
+```bash
+C360_EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+C360_REPORT_FROM=HFCB Customer 360 Reports <reports.analytics@hfcb.co.ke>
+C360_REPORT_RECIPIENTS=washingtone.amolo@hfcb.co.ke,allan.aswani@hfcb.co.ke
+C360_APP_URL=https://ceo.hfcb.co.ke/customer-360
+```
+
+Alert thresholds (all optional, shown with their defaults):
+
+```bash
+C360_ALERT_ERROR_RATE_PCT=5       # server-error rate over the last hour
+C360_ALERT_P95_MS=2000            # p95 latency over the last hour
+C360_ALERT_DATA_STALE_DAYS=3      # warehouse as-of date falling behind
+C360_ALERT_RENOTIFY_MINUTES=360   # quiet period before an OPEN incident re-sends
+```
+
+### Check it before you schedule it
+
+Every command has `--dry-run`: it builds the whole report, prints what it would
+send, and sends nothing.
+
+```bash
+docker exec c360-backend python manage.py send_ops_report --period daily --dry-run
+docker exec c360-backend python manage.py check_ops_alerts --dry-run
+docker exec c360-backend python manage.py send_error_log --minutes 60 --dry-run
+```
+
+To send a one-off to yourself without touching the configured list:
+
+```bash
+docker exec c360-backend python manage.py send_ops_report --period daily --to you@hfcb.co.ke
+```
+
+### The schedule — `sudo crontab -e` on the host
+
+```cron
+# Incident alerts. Safe to run often: state is kept in c360_alert_state, so an
+# incident sends ONE email when it starts, at most one reminder every
+# C360_ALERT_RENOTIFY_MINUTES while it stays open, and one when it clears.
+*/5 * * * *  docker exec c360-backend python manage.py check_ops_alerts >/dev/null 2>&1
+
+# Error log, batched hourly. Silent when the hour had no errors.
+7 * * * *    docker exec c360-backend python manage.py send_error_log --minutes 60 >/dev/null 2>&1
+
+# Daily digest, 07:00 — yesterday's traffic, errors, latency, data health,
+# usage and every administrative change, with the full tables attached.
+0 7 * * *    docker exec c360-backend python manage.py send_ops_report --period daily >/dev/null 2>&1
+
+# Weekly rollup, Monday 07:15.
+15 7 * * 1   docker exec c360-backend python manage.py send_ops_report --period weekly >/dev/null 2>&1
+```
+
+Cron runs in UTC unless the host says otherwise — check with `timedatectl`, and
+shift the hours if the box is not on Africa/Nairobi.
+
+**Do not add `--dry-run` to the cron lines.** And note the alert job is the one
+that must run on a short interval; the digests are the ones that must not (a
+duplicated digest is noise, a missed alert is an outage nobody saw).
+
+### What arrives
+
+| Command | When | Sends |
+|---|---|---|
+| `check_ops_alerts` | on a state change | Warehouse unreachable, data stale, a source emptied or sharply down, error rate or p95 over threshold, no traffic during working hours — and a matching "resolved" mail |
+| `send_error_log` | hourly, only if errors | Every 4xx/5xx grouped by endpoint, CSV + Excel attached |
+| `send_ops_report --period daily` | 07:00 | Traffic, error rate, latency, uptime, data health, who used it, every administrative change |
+| `send_ops_report --period weekly` | Mon 07:15 | The same over seven days |

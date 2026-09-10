@@ -15,6 +15,10 @@ from django.db import models
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
+from simple_history import register as register_history
+from simple_history.models import HistoricalRecords
+
+from .history_actor import acting_user
 
 BRANCH_CHOICES = [
     ('KISII BRANCH', 'KISII BRANCH'), ('NYERI BRANCH', 'NYERI BRANCH'),
@@ -49,6 +53,11 @@ class Profile(models.Model):
     sales_code = models.TextField(blank=True, null=True)
     branch = models.CharField(choices=BRANCH_CHOICES, max_length=32, blank=True, null=True)
     segment = models.CharField(choices=SEGMENT_CHOICES, max_length=32, blank=True, null=True)
+
+    # A change here moves a whole book: sales_code IS the RM's customer list, and
+    # branch/segment drive RBAC scoping. Who re-pointed it, and from what, is the
+    # question the change audit exists to answer.
+    history = HistoricalRecords(get_user=acting_user)
 
     def __str__(self) -> str:  # pragma: no cover - admin/debug convenience
         return str(self.user.username)
@@ -122,6 +131,11 @@ class RecommendationFeedback(models.Model):
                                     related_name='recommendation_feedback')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    # These rows become the model's supervised labels, so a re-marked outcome is a
+    # change to training data. The history table is what lets us reconstruct the
+    # label set as it stood at any past retrain.
+    history = HistoricalRecords(get_user=acting_user)
 
     class Meta:
         indexes = [
@@ -233,6 +247,57 @@ class MetricMinute(models.Model):
 
     def __str__(self) -> str:  # pragma: no cover
         return f'{self.minute:%Y-%m-%d %H:%M} {self.instance} n={self.count} p95={self.p95_ms}ms'
+
+
+class AlertState(models.Model):
+    """One row per alert check, remembering whether it is currently firing.
+
+    This is what makes incident email survivable. Without it, a check that runs
+    every five minutes against a warehouse that is down for a night sends ~150
+    identical emails, everyone filters the sender, and the next real alert is
+    never seen. With it, an incident sends one email when it starts, at most one
+    reminder per ``C360_ALERT_RENOTIFY_MINUTES``, and one when it clears.
+    """
+
+    key = models.CharField(max_length=64, unique=True)      # e.g. 'warehouse_conn'
+    firing = models.BooleanField(default=False)
+    severity = models.CharField(max_length=16, blank=True, default='')
+    detail = models.TextField(blank=True, default='')
+    since = models.DateTimeField(null=True, blank=True)     # when it started firing
+    last_notified_at = models.DateTimeField(null=True, blank=True)
+    notify_count = models.IntegerField(default=0)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'c360_alert_state'
+        ordering = ['key']
+
+    def __str__(self) -> str:  # pragma: no cover
+        return f'{self.key}: {"firing" if self.firing else "clear"}'
+
+
+# --- change audit on the accounts themselves -------------------------------------
+# User is Django's model, so history is attached from the outside rather than by a
+# field on the class. This is what makes "who granted this person admin, and when"
+# answerable.
+#
+# `password` is deliberately EXCLUDED. simple_history would otherwise keep every
+# historical password hash in a table that administrators can read and export —
+# old hashes are still crackable, so that is a real downgrade, not a nicety. A
+# password reset is still recorded: AdminSetPasswordView is an API action and lands
+# in the AuditEvent activity trail with the acting admin and the target user.
+#
+# `groups` IS tracked (m2m_fields) because a role change is the single most
+# security-relevant edit this app allows.
+register_history(
+    User,
+    app='c360',
+    excluded_fields=['password'],
+    m2m_fields=['groups'],
+    table_name='c360_historical_user',
+    # Callers can be portfolio SSO identities with no local row; see history_actor.
+    get_user=acting_user,
+)
 
 
 @receiver(post_save, sender=User)
