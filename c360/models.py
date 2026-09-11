@@ -261,6 +261,37 @@ class MetricMinute(models.Model):
         return f'{self.minute:%Y-%m-%d %H:%M} {self.instance} n={self.count} p95={self.p95_ms}ms'
 
 
+class AppHeartbeat(models.Model):
+    """One row per minute the application was alive.
+
+    Uptime CANNOT be derived from request traffic, which is what this dashboard was
+    doing: it divided the minutes that recorded a request by the minutes in the
+    window, so a healthy but quiet instance reported single-digit "uptime" in red.
+    A quiet night is not an outage, and inferring one from the other puts a
+    fabricated number on an operations screen.
+
+    So the flusher — which already wakes every OBSERVABILITY_FLUSH_SECONDS — stamps
+    the minute it woke in. Uptime for a window is then heartbeat-minutes divided by
+    minutes in the window, which is a measurement rather than a guess. No cron
+    entry: the thread is in-process and starts with the app.
+
+    Rows are per MINUTE, not per worker: the question is whether the service was
+    up, and any worker answering is enough. Concurrent writers collide harmlessly
+    on the unique index (the flusher inserts with ignore_conflicts).
+    """
+
+    minute = models.DateTimeField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'c360_app_heartbeat'
+        ordering = ['-minute']
+        indexes = [models.Index(fields=['-minute'])]
+
+    def __str__(self) -> str:  # pragma: no cover
+        return self.minute.isoformat()
+
+
 class AlertState(models.Model):
     """One row per alert check, remembering whether it is currently firing.
 

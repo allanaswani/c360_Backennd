@@ -113,3 +113,56 @@ class ObservabilityApiTests(TestCase):
         events, _ = obs.audit_buffer.drain()
         kinds = {e['kind'] for e in events}
         self.assertEqual(kinds, {'click', 'nav'})
+
+
+class UptimeFromHeartbeatsTests(TestCase):
+    """Uptime must be a measurement, not an inference from traffic.
+
+    The board divided minutes-that-recorded-a-request by minutes-in-window, so a
+    healthy instance nobody happened to be using reported single-digit uptime in
+    red on an operations screen."""
+
+    def setUp(self):
+        self.c = APIClient()
+
+    def test_quiet_but_alive_is_not_an_outage(self):
+        from datetime import timedelta
+        from django.utils import timezone
+        from c360.models import AppHeartbeat
+        now = timezone.now().replace(second=0, microsecond=0)
+        # Alive for every minute of the last hour, and not one request served.
+        for i in range(60):
+            AppHeartbeat.objects.create(minute=now - timedelta(minutes=i))
+
+        r = self.c.get('/api/observability/overview/?window=60', HTTP_X_C360_ADMIN='1')
+        self.assertEqual(r.status_code, 200)
+        summary = r.json()['summary']
+        self.assertEqual(summary['requests'], 0)
+        self.assertGreaterEqual(summary['uptime_pct'], 99)
+
+    def test_uptime_is_null_when_nothing_is_recording_it(self):
+        """Better to say it isn't measured than to invent 0% or a cheerful 100%."""
+        r = self.c.get('/api/observability/overview/?window=60', HTTP_X_C360_ADMIN='1')
+        self.assertEqual(r.status_code, 200)
+        self.assertIsNone(r.json()['summary']['uptime_pct'])
+
+    def test_short_history_is_measured_over_what_exists(self):
+        """A deploy three minutes old has no evidence about the preceding hour;
+        dividing by the full window would report it as a near-total outage."""
+        from datetime import timedelta
+        from django.utils import timezone
+        from c360.models import AppHeartbeat
+        now = timezone.now().replace(second=0, microsecond=0)
+        for i in range(3):
+            AppHeartbeat.objects.create(minute=now - timedelta(minutes=i))
+
+        summary = self.c.get('/api/observability/overview/?window=60',
+                             HTTP_X_C360_ADMIN='1').json()['summary']
+        self.assertEqual(summary['uptime_pct'], 100.0)
+        self.assertLessEqual(summary['uptime_measured_minutes'], 5)
+
+    def test_flusher_stamps_a_heartbeat(self):
+        from c360 import observability as obs
+        from c360.models import AppHeartbeat
+        obs._flush_once(retain_metric_days=30, retain_audit_days=90, prune=False)
+        self.assertGreater(AppHeartbeat.objects.count(), 0)

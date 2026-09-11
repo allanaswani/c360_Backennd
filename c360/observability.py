@@ -203,9 +203,19 @@ _flusher_lock = threading.Lock()
 
 def _flush_once(retain_metric_days: int, retain_audit_days: int, prune: bool) -> None:
     from django.db import connections
-    from .models import AuditEvent, MetricMinute
+    from .models import AppHeartbeat, AuditEvent, MetricMinute
 
-    # 1) metrics: persist finished minutes for this instance (+ heartbeat any gap minute).
+    # 0) heartbeat: record that the app was alive, independently of whether anybody
+    #    happened to call it. Uptime is measured from these; deriving it from request
+    #    traffic reported a quiet instance as being down (see AppHeartbeat).
+    #    Both the current and previous minute are stamped so a flush interval longer
+    #    than a minute, or a tick that lands late, cannot punch a false gap.
+    now = datetime.now(_tz.utc)
+    beats = [AppHeartbeat(minute=_minute(now)),
+             AppHeartbeat(minute=_minute(now) - timedelta(minutes=1))]
+    AppHeartbeat.objects.bulk_create(beats, ignore_conflicts=True)
+
+    # 1) metrics: persist finished minutes for this instance.
     rolled = collector.roll()
     rows = [MetricMinute(**r) for r in rolled]
     if rows:
@@ -222,9 +232,9 @@ def _flush_once(retain_metric_days: int, retain_audit_days: int, prune: bool) ->
 
     # 3) retention prune (cheap; only when asked, e.g. every Nth tick).
     if prune:
-        now = datetime.now(_tz.utc)
         MetricMinute.objects.filter(minute__lt=now - timedelta(days=retain_metric_days)).delete()
         AuditEvent.objects.filter(ts__lt=now - timedelta(days=retain_audit_days)).delete()
+        AppHeartbeat.objects.filter(minute__lt=now - timedelta(days=retain_metric_days)).delete()
 
     for c in connections.all():
         c.close_if_unusable_or_obsolete()
