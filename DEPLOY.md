@@ -107,17 +107,38 @@ docker run -d --name c360-frontend --restart unless-stopped \
   -p 5401:3000 -v "$(pwd)":/app -w /app \
   -e NEXT_PUBLIC_BASE_PATH=/customer-360 \
   -e NEXT_PUBLIC_API_BASE=/customer-360/api \
-  -e C360_BACKEND_ORIGIN=http://127.0.0.1:9001 \
+  --add-host=host.docker.internal:host-gateway \
+  -e C360_BACKEND_ORIGIN=http://host.docker.internal:9001 \
   node:22 \
   sh -c "npm install && npm run build && npm start"
 
 docker logs -f c360-frontend
 ```
 
-These three envs are read at build time: `BASE_PATH` serves the app under
-`/customer-360`; `API_BASE` makes the SPA call that same-origin path; `C360_BACKEND_ORIGIN`
-lets the Next server proxy `/customer-360/api/*` → `:9001` — which is what makes
-**LAN-direct** access (`128.2.1.25:5401`, no nginx) work.
+These envs are read at build time: `BASE_PATH` serves the app under `/customer-360`;
+`API_BASE` makes the SPA call that same-origin path; `C360_BACKEND_ORIGIN` lets the Next
+server proxy `/customer-360/api/*` to the backend — which is what makes **LAN-direct**
+access (`128.2.1.25:5401`, no nginx) work.
+
+> **`C360_BACKEND_ORIGIN` must NOT be `127.0.0.1`.** The backend runs with
+> `--network=host`; this container does not. Inside it, `127.0.0.1:9001` is its own
+> loopback, where nothing is listening — the rewrite fails and every API call from the
+> LAN returns **500 from the Next server**, with nothing in the backend's log because
+> the request never arrives. Public access hides it completely: nginx routes
+> `/customer-360/api` straight to the backend and never touches this rewrite. The
+> symptom is a LAN user bounced to the login page while already signed in.
+>
+> `--add-host=host.docker.internal:host-gateway` makes the host reachable by name and
+> survives the bridge subnet changing. `http://128.2.1.25:9001` works too.
+
+Check this after every frontend redeploy — it is the one thing that fails silently:
+
+```bash
+docker exec c360-frontend sh -c "wget -qO- http://host.docker.internal:9001/api/meta/ | head -c 80"
+```
+
+That must print JSON. If it prints nothing, the SPA works on the public domain and
+fails on the LAN.
 
 ---
 
@@ -182,7 +203,8 @@ docker rm -f c360-frontend
 docker run -d --name c360-frontend --restart unless-stopped \
   -p 5401:3000 -v "$(pwd)":/app -w /app \
   -e NEXT_PUBLIC_BASE_PATH=/customer-360 -e NEXT_PUBLIC_API_BASE=/customer-360/api \
-  -e C360_BACKEND_ORIGIN=http://127.0.0.1:9001 \
+  --add-host=host.docker.internal:host-gateway \
+  -e C360_BACKEND_ORIGIN=http://host.docker.internal:9001 \
   node:22 sh -c "npm install && npm run build && npm start"
 ```
 
