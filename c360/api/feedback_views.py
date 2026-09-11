@@ -16,6 +16,7 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from ..history_actor import acting_user, actor_name
 from ..models import RecommendationFeedback
 
 
@@ -31,7 +32,11 @@ class FeedbackSerializer(serializers.ModelSerializer):
 
     def get_recorded_by_name(self, obj):
         u = obj.recorded_by
-        return (u.get_full_name() or u.username) if u else None
+        if u:
+            return u.get_full_name() or u.username
+        # An SSO caller has no local account; the username off the token is still
+        # the real person, so the panel shows a name rather than "unknown".
+        return obj.recorded_by_username or None
 
 
 class FeedbackView(APIView):
@@ -48,7 +53,9 @@ class FeedbackView(APIView):
         # An RM sees their own marks for the panel; management sees all.
         mine = request.query_params.get('mine')
         if mine in ('1', 'true'):
-            qs = qs.filter(recorded_by=request.user)
+            # By username, so this works for SSO callers too — filtering on the FK
+            # would match nothing for exactly the users who log the most outcomes.
+            qs = qs.filter(recorded_by_username=actor_name(request))
         qs = qs.select_related('recorded_by').order_by('-updated_at')[:200]
         return Response({'results': FeedbackSerializer(qs, many=True).data})
 
@@ -63,10 +70,14 @@ class FeedbackView(APIView):
                             status=status.HTTP_400_BAD_REQUEST)
 
         # Upsert on (customer, product, this RM): re-marking updates in place.
+        # Keyed on the username, which every authenticated caller has; the FK is set
+        # only when the actor also holds a local account (see c360.history_actor).
         score = data.get('score')
+        username = actor_name(request)
         obj, _created = RecommendationFeedback.objects.update_or_create(
-            cust_id=cust_id, product=product, recorded_by=request.user,
+            cust_id=cust_id, product=product, recorded_by_username=username,
             defaults={
+                'recorded_by': acting_user(request),
                 'product_name': str(data.get('product_name', ''))[:120],
                 'domain': str(data.get('domain', 'HFCB'))[:32],
                 'score': float(score) if score not in (None, '') else None,

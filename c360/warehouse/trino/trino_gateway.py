@@ -378,8 +378,15 @@ class TrinoWarehouse(WarehouseGateway):
         try:
             asof = self.as_of_date()
             days = (date.today() - asof).days
+            # ONE threshold, shared with the alert emails (c360.reports.alerts).
+            # These were separately hard-coded and disagreed: the page called four
+            # days healthy while the alert fired at three, so the dashboard showed
+            # green at the same moment the mail said the data was stale.
+            from django.conf import settings
+            limit = int(getattr(settings, 'C360_ALERT_DATA_STALE_DAYS', 3))
             freshness = {'as_of': asof.isoformat(), 'days_behind': days,
-                         'status': 'ok' if days <= 4 else 'stale'}
+                         'stale_after_days': limit,
+                         'status': 'ok' if days <= limit else 'stale'}
         except Exception as e:
             freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
                          'detail': f'{type(e).__name__}: {str(e)[:140]}'}
