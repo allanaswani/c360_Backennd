@@ -82,3 +82,72 @@ class LabelExtractionTests(TestCase):
         # Feature rows are clean (no scoring-only helper key).
         for row, _ in rows['savings']:
             self.assertNotIn('_held', row)
+
+
+class FeedbackUnderPortfolioSsoTests(TestCase):
+    """The RMs who actually log outcomes arrive on a portfolio SSO token and have no
+    account in this database. Recording used to assign that caller straight to a
+    ForeignKey, which raised — so every outcome they logged was thrown away with a
+    500 while the panel optimistically showed the button as set."""
+
+    def setUp(self):
+        from c360.tests.test_sso import _pin_mock
+        _pin_mock()
+        self.c = APIClient()
+        from c360.tests.test_sso import _portfolio_token
+        self.token = _portfolio_token(user_id=99002, username='brian.rm',
+                                      groups=['c360_rm'], sales_code='SC-1077')
+        self.c.credentials(HTTP_AUTHORIZATION=f'Bearer {self.token}')
+
+    def _post(self, outcome, product='savings'):
+        return self.c.post('/api/recommendations/feedback/', {
+            'cust_id': 'HF-100238', 'product': product, 'product_name': 'Savings',
+            'domain': 'HFCB', 'score': 0.42, 'rule_id': 'ml.savings',
+            'engine_version': 'v3', 'outcome': outcome,
+        }, format='json')
+
+    def test_sso_user_outcome_is_stored(self):
+        r = self._post('accepted')
+        self.assertIn(r.status_code, (200, 201), r.content[:300])
+        self.assertEqual(RecommendationFeedback.objects.count(), 1)
+        row = RecommendationFeedback.objects.get()
+        self.assertEqual(row.outcome, 'accepted')
+        self.assertEqual(row.recorded_by_username, 'brian.rm')
+        self.assertIsNone(row.recorded_by)          # no local account to link to
+        self.assertEqual(r.json()['recorded_by_name'], 'brian.rm')
+
+    def test_remarking_updates_in_place_rather_than_piling_up(self):
+        """The uniqueness rule is keyed on the username. Keyed on the nullable FK,
+        every re-mark by an SSO user would insert a new row (NULLs don't collide)
+        and the same recommendation would be counted repeatedly as a label."""
+        self._post('pitched')
+        self._post('accepted')
+        self._post('declined')
+        self.assertEqual(RecommendationFeedback.objects.count(), 1)
+        self.assertEqual(RecommendationFeedback.objects.get().outcome, 'declined')
+
+    def test_two_rms_keep_separate_marks_on_the_same_recommendation(self):
+        from c360.tests.test_sso import _portfolio_token
+        self._post('accepted')
+        other = _portfolio_token(user_id=99003, username='faith.rm',
+                                 groups=['c360_rm'], sales_code='SC-2088')
+        self.c.credentials(HTTP_AUTHORIZATION=f'Bearer {other}')
+        self._post('declined')
+        self.assertEqual(RecommendationFeedback.objects.count(), 2)
+
+    def test_mine_filter_works_for_an_sso_caller(self):
+        self._post('accepted')
+        r = self.c.get('/api/recommendations/feedback/?cust_id=HF-100238&mine=1')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()['results']), 1)
+
+    def test_outcome_becomes_a_training_label(self):
+        """The whole point: an SSO-logged outcome has to reach the stats the model
+        is judged on. Before the fix these were all zero no matter how many times
+        an RM marked something."""
+        self._post('accepted')
+        self._post('declined', product='mortgage')
+        stats = self.c.get('/api/recommendations/feedback/stats/').json()
+        self.assertEqual(stats['labelled'], 2)
+        self.assertEqual(stats['accepted'], 1)
+        self.assertEqual(stats['acceptance_rate'], 0.5)

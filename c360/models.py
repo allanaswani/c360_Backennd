@@ -127,8 +127,15 @@ class RecommendationFeedback(models.Model):
     outcome = models.CharField(max_length=16, choices=OUTCOME_CHOICES, default=OUTCOME_PITCHED)
     note = models.TextField(blank=True, default='')
 
+    # Who marked it. TWO fields, because the RMs who actually use this arrive on a
+    # portfolio SSO token and have no row in this database: assigning that caller to
+    # the foreign key raises, which silently threw away every outcome an SSO user
+    # logged. `recorded_by_username` always carries the name from the token and is the
+    # field the uniqueness rule uses; the FK is an optional convenience link, set only
+    # when the actor does have a local account.
     recorded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True,
                                     related_name='recommendation_feedback')
+    recorded_by_username = models.CharField(max_length=150, blank=True, default='', db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -144,8 +151,13 @@ class RecommendationFeedback(models.Model):
         ]
         # One current outcome per (customer, product, RM) — re-marking updates it in
         # place rather than piling up rows; history still lives in updated_at.
+        #
+        # Keyed on the USERNAME, not the foreign key. A null FK (every SSO caller)
+        # does not collide with another null in SQL, so keying on it would let one RM
+        # re-marking the same product pile up a new row each time and quietly
+        # double-count in the training labels.
         constraints = [
-            models.UniqueConstraint(fields=['cust_id', 'product', 'recorded_by'],
+            models.UniqueConstraint(fields=['cust_id', 'product', 'recorded_by_username'],
                                     name='uniq_feedback_cust_product_rm'),
         ]
 
