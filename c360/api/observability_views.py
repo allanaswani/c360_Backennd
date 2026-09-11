@@ -17,7 +17,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .. import changes, observability as obs
-from ..models import AuditEvent, MetricMinute
+from ..models import AppHeartbeat, AuditEvent, MetricMinute
 from ..rbac.scoping import resolve_scope
 from ..reports import datasets, tabular
 
@@ -78,9 +78,24 @@ class ObservabilityOverviewView(APIView):
         total = sum(s['count'] for s in series)
         errors = sum(s['errors'] for s in series)
         client_errors = sum(s['client_errors'] for s in series)
-        present = len(series)                       # minutes that actually recorded traffic
-        # Downtime: minutes in the window with no data from any worker.
-        uptime_pct = round(100.0 * present / window, 2) if window else 100.0
+        # Uptime is measured from HEARTBEATS, never from traffic. This previously
+        # divided the minutes that recorded a request by the minutes in the window,
+        # so a healthy instance nobody happened to be using reported single-digit
+        # uptime in red. A quiet hour is not an outage.
+        beat_rows = AppHeartbeat.objects.filter(minute__gte=cutoff)
+        beats = beat_rows.count()
+        first_beat = beat_rows.order_by('minute').values_list('minute', flat=True).first()
+        if beats == 0 or first_beat is None:
+            # No heartbeats at all — the flusher is off, or this is a fresh install.
+            # Say uptime is not being measured rather than report 0% or a cheerful 100%.
+            uptime_pct, measured_minutes = None, 0
+        else:
+            # Measured against the span we actually have records for, not the whole
+            # window. An app started ten minutes ago has no evidence either way about
+            # the fifty before that; dividing by the full window would report a
+            # healthy new deploy as a near-total outage.
+            measured_minutes = max(1, int((now - first_beat).total_seconds() // 60) + 1)
+            uptime_pct = round(min(100.0, 100.0 * beats / measured_minutes), 2)
         last = series[-1] if series else None
 
         # Route breakdown + recent errors come from the audit trail (it carries the route
@@ -112,7 +127,13 @@ class ObservabilityOverviewView(APIView):
                 'rps_now': last['rps'] if last else 0.0,
                 'p95_now_ms': last['p95_ms'] if last else 0,
                 'p99_now_ms': last['p99_ms'] if last else 0,
+                # null = not being measured; the client must not render that as 0%.
                 'uptime_pct': uptime_pct,
+                'uptime_minutes': beats,
+                # The span uptime was actually measured over. Less than the window
+                # means the app has not been running (or recording) that long, and
+                # the screen says so rather than implying the gap was downtime.
+                'uptime_measured_minutes': measured_minutes,
                 'active_users': active_users,
                 'instances': instances,
             },
