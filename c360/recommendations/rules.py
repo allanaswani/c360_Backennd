@@ -20,6 +20,10 @@ class Candidate:
     reason: str           # plain-language, RM-speakable
     rule_id: str          # 'A' | 'B' | 'C' (+ suffix), auditable
     base_score: float     # internal ranking weight (NOT the propensity score)
+    # A few words for a table column. Rule reasons are already short and specific,
+    # so they use the sentence itself; the model's reasons all open with the same
+    # boilerplate and need the drivers pulled out (see ml/model.py::_explain).
+    reason_short: str = ''
 
 
 def _held_keys(holdings: dict) -> set[str]:

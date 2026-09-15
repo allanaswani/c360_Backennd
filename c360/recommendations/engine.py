@@ -111,6 +111,8 @@ def _to_item(c: Candidate, *, eligible: bool | None) -> dict[str, Any]:
         'product_name': c.product_name,
         'domain': c.domain,
         'reason': c.reason,
+        # Falls back to the full sentence — a rule reason is already column-length.
+        'reason_short': c.reason_short or c.reason,
         'rule_id': c.rule_id,
         'score': round(float(c.base_score), 4) if is_ml else None,
         'eligible': eligible,
@@ -140,7 +142,8 @@ def _ml_candidates(gateway: WarehouseGateway, cust_id: str, *, limit: int) -> li
     if not picks:
         return []
     return [Candidate(product=p['product'], product_name=p['product_name'], domain=p['domain'],
-                      reason=p['reason'], rule_id=p['rule_id'], base_score=p['score']) for p in picks]
+                      reason=p['reason'], reason_short=p.get('reason_short', ''),
+                      rule_id=p['rule_id'], base_score=p['score']) for p in picks]
 
 
 def recommend_for_customer(
@@ -340,4 +343,5 @@ def _ml_candidates_batched(gateway, summary, holdings, *, limit) -> list[Candida
     row = row_from_batch(summary=summary, holding_flags=holdings.get('flags', {}))
     picks = model.recommend(row, limit=limit)
     return [Candidate(product=p['product'], product_name=p['product_name'], domain=p['domain'],
-                      reason=p['reason'], rule_id=p['rule_id'], base_score=p['score']) for p in picks]
+                      reason=p['reason'], reason_short=p.get('reason_short', ''),
+                      rule_id=p['rule_id'], base_score=p['score']) for p in picks]
