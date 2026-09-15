@@ -48,7 +48,7 @@ class PropensityModel:
     def is_ready(self) -> bool:
         return bool(self.boosters)
 
-    def _score_one(self, target: str, row: dict) -> tuple[float, str]:
+    def _score_one(self, target: str, row: dict) -> tuple[float, tuple[str, str]]:
         booster = self.boosters[target]
         cols = self.products_meta[target]['features']
         cat = self.products_meta[target].get('categorical', [])
@@ -62,15 +62,19 @@ class PropensityModel:
         reason = self._explain(target, X, cols)
         return prob, reason
 
-    def _explain(self, target: str, X: pd.DataFrame, cols: list[str]) -> str:
-        """Top positive contributors for THIS prediction → one RM-facing sentence.
+    def _explain(self, target: str, X: pd.DataFrame, cols: list[str]) -> tuple[str, str]:
+        """Top positive contributors for THIS prediction → ``(sentence, short)``.
+
         Product-flag drivers are only named when the customer actually holds them, so
-        the reason never cites a product they lack."""
+        the reason never cites a product they lack. The short form is the drivers on
+        their own, for a table column where the sentence would truncate to its
+        boilerplate opening and every row would read identically."""
         label = self.labels.get(target, target)
         try:
             contrib = self.boosters[target].predict(X, pred_contrib=True)[0]  # len = n_feat + 1
         except Exception:
-            return f'Model flags {label} as a strong fit for this customer.'
+            return (f'Model flags {label} as a strong fit for this customer.',
+                    'Strong model fit')
         row = X.iloc[0]
         pairs = sorted(zip(cols, contrib[:-1]), key=lambda kv: kv[1], reverse=True)
         drivers: list[str] = []
@@ -84,8 +88,20 @@ class PropensityModel:
             if len(drivers) == 2:
                 break
         if not drivers:
-            return f'{label} fits this customer’s overall profile versus similar customers.'
-        return f'Recommended because this customer has {" and ".join(drivers)} — customers with this profile typically hold {label.lower()}.'
+            return (f'{label} fits this customer’s overall profile versus similar customers.',
+                    'Overall profile match')
+        joined = ' and '.join(drivers)
+        # Two forms of the same fact. The long one is the sentence an RM reads on the
+        # customer page; the short one is what fits a table column. The worklist used
+        # to truncate the long form, and since every reason opens with the same
+        # nineteen words of preamble, every row showed the identical string
+        # "Recommended because this customer has a profil…" and the part that
+        # actually differs — the driver — never appeared.
+        return (
+            f'Recommended because this customer has {joined} — customers with this '
+            f'profile typically hold {label.lower()}.',
+            joined[0].upper() + joined[1:],
+        )
 
     def recommend(self, row: dict, *, limit: int = 3) -> list[dict]:
         """Rank the customer's UN-held target products by propensity, with reasons.
@@ -102,7 +118,7 @@ class PropensityModel:
             if target in held:
                 continue   # already has it — not a recommendation
             try:
-                prob, reason = self._score_one(target, row)
+                prob, (reason, reason_short) = self._score_one(target, row)
             except Exception:
                 logger.exception('scoring failed for %s', target)
                 continue
@@ -112,6 +128,7 @@ class PropensityModel:
                 'domain': 'HFCB',
                 'score': round(prob, 4),
                 'reason': reason,
+                'reason_short': reason_short,
                 'rule_id': 'ml.lgbm-v1',
             })
         return ranking.select(scored, self.products_meta, limit=limit)
