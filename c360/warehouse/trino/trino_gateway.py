@@ -25,6 +25,7 @@ number): Bancassurance and the true whole-book segment benchmark.
 """
 from __future__ import annotations
 
+import logging
 import re as _re
 import time
 from datetime import date, timedelta
@@ -34,9 +35,12 @@ from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
 from ... import lending as lending_shape
 from ... import retention as retention_derive
+from ... import relationships as rel_shape
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
+
+logger = logging.getLogger('c360')
 from ..gateway import WarehouseGateway
 from ..periods import ResolvedPeriod
 
@@ -1355,6 +1359,92 @@ class TrinoWarehouse(WarehouseGateway):
             'primary_value': prim[0]['value'] if prim else 0,
             'members': self._aggregate_customers(linked_ids),
         }
+
+    def get_related_parties(self, cust_id):
+        """Related parties from the curated Postgres ``public.relationship`` register.
+
+        This is a real related-party table — 42k rows of
+        ``origin_customer → related_customer`` with a ``relationship_type`` — and it
+        answers what ``get_linked_parties`` cannot. That one matches the SAME legal
+        person across several customer numbers (national ID); this one links two
+        DIFFERENT parties and names the role between them: the directors and
+        signatories of a company, the companies a person sits on.
+
+        Notes from the live table, all verified rather than assumed:
+        * ``relationship_type`` is space-padded ('DIRECTOR    ') → must be trimmed.
+        * ``origin_customer`` / ``related_customer`` are varchar but 100% numeric
+          (length 3-7), so they cast cleanly to ``dim_customer.customer_id``.
+        * ``expiry_date`` is a varchar and blank on 42,096 of 42,263 rows; the 167
+          that carry one are closed relationships and are excluded.
+        * The register is DIRECTIONAL, so both columns are searched and the side the
+          row was found on becomes the direction shown.
+
+        Returns None when Postgres is not wired, the table is absent (this deployment
+        may point at a different database), or the customer has no open relationship —
+        the caller then simply shows nothing, exactly as it does today.
+        """
+        if self._pg is None:
+            return None
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        key = str(cid)
+        try:
+            rows = self._pg.execute(
+                """
+                SELECT related_customer AS other, relationship_type AS rel,
+                       'outbound' AS direction, comments, effective_from
+                  FROM public.relationship
+                 WHERE origin_customer = %s AND COALESCE(expiry_date, '') = ''
+                UNION ALL
+                SELECT origin_customer AS other, relationship_type AS rel,
+                       'inbound' AS direction, comments, effective_from
+                  FROM public.relationship
+                 WHERE related_customer = %s AND COALESCE(expiry_date, '') = ''
+                 LIMIT 60
+                """,
+                (key, key),
+            )
+        except Exception:
+            # Absent table, wrong database, or Postgres down. A missing optional
+            # source must never take the customer page with it.
+            logger.warning('related-party lookup failed for %s', cust_id, exc_info=True)
+            return None
+        if not rows:
+            return None
+
+        seen: dict[int, dict] = {}
+        for r in rows:
+            other = self._cid(r.get('other'))
+            if other is None or other == cid:
+                continue
+            rel = rel_shape.normalise(self._clean(r.get('rel')))
+            # One row per counterparty: a pair can be registered under more than one
+            # role (a director who also signs), and the panel should say so once.
+            entry = seen.setdefault(other, {
+                'cust_id': str(other), 'roles': [], 'direction': r.get('direction'),
+            })
+            if rel and rel not in entry['roles']:
+                entry['roles'].append(rel)
+
+        if not seen:
+            return None
+        # Which of those ids the customer master actually still holds. The register
+        # outlives records: it can name a customer number that has since gone. Asked
+        # first because `_aggregate_customers` names anything it is handed, falling
+        # back to 'Customer <id>' — which would read as a resolved name and quietly
+        # assert the record exists. An id we cannot resolve is carried with no name,
+        # and the panel says so on its face.
+        ids = list(seen)
+        inlist = ','.join(str(i) for i in ids)
+        present = {self._cid(r['id']) for r in self._t.execute(
+            f"SELECT CAST(customer_id AS BIGINT) id FROM delta.gold_db.dim_customer "
+            f"WHERE customer_id IN ({inlist})")}
+        detail = {self._cid(d['cust_id']): d
+                  for d in self._aggregate_customers([i for i in ids if i in present])}
+        return rel_shape.shape([
+            rel_shape.shape_member(entry, detail.get(other)) for other, entry in seen.items()
+        ])
 
     # --- derived risk / KYC (computed from held data, no dedicated feed) ------
     def get_risk_profile(self, cust_id):

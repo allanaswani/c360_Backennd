@@ -191,6 +191,15 @@ class WarehouseGateway(abc.ABC):
     def get_linked_parties(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- related parties (optional capability) --------------------------------
+    # Default: not computed. The live gateway overrides this to read the curated
+    # Postgres `public.relationship` table — a genuine related-party register
+    # (DIRECTOR / SIGNATORY / GUARANTOR / PARENT_CHILD …) linking two DIFFERENT
+    # customers, which the lakehouse has no equivalent for. Returns
+    # {'count', 'members': [...]} or None.
+    def get_related_parties(self, cust_id: str) -> dict[str, Any] | None:
+        return None
+
     # --- current RM allocation (optional capability) --------------------------
     # Default: none known (callers keep the account-opening officer). The live gateway
     # overrides this to read the CURRENT customer→RM allocation from the curated

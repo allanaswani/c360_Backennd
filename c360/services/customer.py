@@ -253,6 +253,57 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     }
 
 
+def build_related_parties(gateway: WarehouseGateway, scope, cust_id: str) -> dict[str, Any] | None:
+    """Related parties from the curated register, filtered to what THIS caller may see.
+
+    Distinct from :func:`build_linked_parties`, which finds the SAME legal person
+    under several customer numbers. This finds DIFFERENT parties and names the role
+    between them — a company's directors and signatories, the companies a person
+    sits on.
+
+    Two filters, both deliberate:
+
+    * The same scope + staff sieve as everywhere else, so a related party outside
+      the caller's book, or an HF employee, never leaks through a side door. The
+      register is a legitimate route to a record the caller is not entitled to see,
+      so it gets the same treatment as search.
+    * Family ties (spouse, sibling, next of kin) are dropped. They are personal data
+      about third parties with no bearing on a banking decision, and putting a
+      customer's relatives on an RM's screen is not something the register's
+      existence justifies. `withheld` reports how many were removed so the number
+      on screen is never silently short.
+
+    Returns None when nothing visible remains — the panel then renders nothing.
+    """
+    from ..rbac.scoping import customer_visible, staff_hidden  # local: avoid import cycle
+
+    try:
+        related = gateway.get_related_parties(cust_id)
+    except Exception:
+        related = None
+    if not related or not related.get('members'):
+        return None
+
+    corporate = [m for m in related['members'] if not m.get('personal')]
+    withheld_personal = len(related['members']) - len(corporate)
+    visible = [m for m in corporate
+               if customer_visible(scope, m) and not staff_hidden(scope, m)]
+    if not visible:
+        return None
+    return {
+        'basis': related.get('basis', 'Related-party register'),
+        'count': len(visible),
+        'withheld_personal': withheld_personal,
+        'members': [{
+            'cust_id': m['cust_id'], 'name': m.get('name'), 'segment': m.get('segment'),
+            'branch': m.get('branch'), 'value': m.get('value'),
+            'products_held': m.get('products_held'),
+            'roles': m.get('roles', []), 'role_labels': m.get('role_labels', []),
+            'direction': m.get('direction'),
+        } for m in visible],
+    }
+
+
 def build_linked_parties(gateway: WarehouseGateway, scope, cust_id: str) -> dict[str, Any] | None:
     """Same-person linked records (shared national ID), filtered to what THIS caller may
     see: members outside their book are dropped, and HF-staff records are hidden from

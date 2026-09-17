@@ -16,7 +16,9 @@ from rest_framework.views import APIView
 
 from ..rbac.scoping import customer_visible, resolve_scope, staff_hidden
 from ..recommendations.engine import recommend_for_customer, worklist_across_customers
-from ..services.customer import build_customer_header, build_linked_parties, build_value_summary, relationship_summary
+from ..services.customer import (build_customer_header, build_linked_parties,
+                                 build_related_parties, build_value_summary,
+                                 relationship_summary)
 from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
@@ -132,7 +134,14 @@ class LinkedPartiesView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         linked = build_linked_parties(gateway, scope, cust_id)
-        return Response(linked or {'count': 0, 'members': []})
+        # The related-party register rides along on the same call: both answer
+        # "who else is connected to this customer", the page shows them together,
+        # and a second round trip for a rail panel is not worth it.
+        related = build_related_parties(gateway, scope, cust_id)
+        return Response({
+            **(linked or {'count': 0, 'members': []}),
+            'related': related,
+        })
 
 
 class CustomerLastTransactionView(APIView):

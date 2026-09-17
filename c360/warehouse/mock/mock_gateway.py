@@ -16,6 +16,7 @@ from typing import Any
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
 from ... import lending as lending_shape
+from ... import relationships as rel_shape
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..gateway import WarehouseGateway
@@ -334,6 +335,51 @@ class MockWarehouse(WarehouseGateway):
         # Mock has no real month-end history → return None so the portfolio service
         # falls back to its deterministic simulated (preview) trends.
         return None
+
+    # A small related-party graph mirroring the live register's shape: directional
+    # (origin -> related) edges carrying a role from the real vocabulary. Two
+    # companies in the seed roster have officers; the officers point back. Lets the
+    # panel be built and reviewed without the curated Postgres, which is on a LAN
+    # segment the dev box cannot reach.
+    #
+    # Which side the register files an organisation under is NOT confirmed (see
+    # c360.relationships), so nothing here or in the UI depends on it — these are
+    # simply pairs, and both pages show the same role with the filing side stated.
+    _RELATIONSHIPS = [
+        ('HF-100571', 'HF-102010', 'DIRECTOR'),
+        ('HF-100571', 'HF-102010', 'SIGNATORY'),
+        ('HF-101488', 'HF-102010', 'DIRECTOR'),
+        ('HF-102377', 'HF-102010', 'SIGNATORY'),
+        ('HF-100904', 'HF-100238', 'PROPRIETOR'),
+        ('HF-101755', 'HF-100238', 'GUARANTOR'),
+        ('HF-101755', 'HF-101120', 'PARTNER'),
+        # An id the register names that the customer master no longer holds — the
+        # panel must keep the row and say it cannot name it, never invent a name.
+        ('HF-109404', 'HF-102010', 'SIGNATORY'),
+        # A family tie, so the 'personal' flag is exercised and can be seen to be
+        # held back from the panel.
+        ('HF-100571', 'HF-101488', 'HUSBAND_WIFE'),
+    ]
+
+    def get_related_parties(self, cust_id):
+        """Preview related parties — same contract as the live register."""
+        found: dict[str, dict] = {}
+        for origin, related, rel in self._RELATIONSHIPS:
+            if origin == cust_id:
+                other, direction = related, 'outbound'
+            elif related == cust_id:
+                other, direction = origin, 'inbound'
+            else:
+                continue
+            entry = found.setdefault(other, {'cust_id': other, 'roles': [], 'direction': direction})
+            if rel not in entry['roles']:
+                entry['roles'].append(rel)
+        if not found:
+            return None
+        return rel_shape.shape([
+            rel_shape.shape_member(entry, seed.CUSTOMER_INDEX.get(other))
+            for other, entry in found.items()
+        ])
 
     def get_risk_profile(self, cust_id):
         """Derived KYC + risk, same pure functions as live. Identity uses the real
