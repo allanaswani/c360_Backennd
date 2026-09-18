@@ -2339,7 +2339,7 @@ class TrinoWarehouse(WarehouseGateway):
         }
 
     def get_properties(self, cust_id):
-        """the property register properties for a bank customer. Bridged by national ID
+        """Property units held by a bank customer. Bridged by national ID
         (dim_customer.customer_id_no = hfdi client_idno), sourced from the pre-built
         rpt_c360_customer_property table. That table is event-sourced and repeats
         each unit many times, so we DEDUPE by unit_id (GROUP BY) before summing —
@@ -2377,7 +2377,7 @@ class TrinoWarehouse(WarehouseGateway):
         return self._properties_for_units(units)
 
     def _property_units_by_client(self, client_id: int) -> list[dict[str, Any]]:
-        """the property register units owned by one property-register client, deduped by unit_id.
+        """Units owned by one property-register client, deduped by unit_id.
 
         rpt_c360_customer_property repeats each unit many times (it is event-sourced),
         so this GROUPs before anything sums - the same reason the bank-side query
@@ -2448,7 +2448,7 @@ class TrinoWarehouse(WarehouseGateway):
         return out
 
     def _hfdi_bank_matches(self, idnos: list[str]) -> dict[str, dict[str, Any]]:
-        """Which of these the property register national IDs belong to a bank customer too.
+        """Which of these property-register national IDs belong to a bank customer too.
 
         Matched on the normalised id (punctuation stripped, upper-cased) because the
         two systems punctuate registration numbers differently. That normalisation is
@@ -2492,7 +2492,7 @@ class TrinoWarehouse(WarehouseGateway):
 
     def search_property_clients(self, query: str, *, limit: int = 50,
                                 unbanked_only: bool = False) -> list[dict[str, Any]]:
-        """Search the the property register register by name, national ID or client number.
+        """Search the property register by name, national ID or client number.
 
         `unbanked_only` narrows to the clients with no bank record - the acquisition
         list, and the reason this universe was opened up at all. It is applied AFTER
@@ -2530,7 +2530,7 @@ class TrinoWarehouse(WarehouseGateway):
         return self._hfdi_decorate(rows)[0]
 
     def property_client_coverage(self) -> dict[str, Any] | None:
-        """How much of the the property register register the bank actually holds a relationship with.
+        """How much of the property register the bank actually holds a relationship with.
 
         This is the number that justifies the page existing, so it is measured, not
         asserted - and it is measured over the register itself rather than over the
@@ -2940,7 +2940,7 @@ class TrinoWarehouse(WarehouseGateway):
         }
 
     def get_property_leads(self, cust_id):
-        """Property-sales CRM (the property register leads + follow-ups) for a bank customer, matched by
+        """Property-sales CRM (property-register leads + follow-ups) for a bank customer, matched by
         PHONE — the lead export carries no customer/national id, so this is the only
         bridge and it is fuzzy (the caller tags it 'matched by phone'). Only resolves for
         the ~5.8k leads whose phone is also a bank customer's. Returns None when the

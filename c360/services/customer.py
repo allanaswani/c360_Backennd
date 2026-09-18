@@ -151,7 +151,7 @@ def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, A
 
 
 def _build_crm(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any] | None:
-    """Subsidiary CRM panels: property-sales leads (the property register, phone-matched) and the insurance
+    """Subsidiary CRM panels: property-register leads (phone-matched) and the insurance
     CRM profile (HFBI, national-ID bridged). Returns {'property_leads':…, 'insurance':…}
     with either sub-key None when absent, or None overall when the customer has neither —
     so the frontend renders nothing rather than an empty shell. Never raises."""

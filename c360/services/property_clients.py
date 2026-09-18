@@ -1,4 +1,4 @@
-"""the property register property clients — the service layer, and who is allowed to see them.
+"""Property clients — the service layer, and who is allowed to see them.
 
 The register is a customer list the bank does not own. Most of the people on it
 (3,830 of 4,843 at the last measurement) have no bank record at all, which means

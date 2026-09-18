@@ -97,7 +97,7 @@ class CustomerListView(APIView):
 
 
 class PropertyClientListView(APIView):
-    """The the property register property-client register - the group's property buyers.
+    """The property-client register - the group's property buyers.
 
     Separate from /customers/ because it is a separate universe: these people are in
     the property register's register, not the bank's customer master, and most of them hold no bank

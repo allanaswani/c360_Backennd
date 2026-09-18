@@ -1,6 +1,6 @@
-"""the property register property clients — the universe Customer 360 could not see.
+"""Property clients — the universe Customer 360 could not see.
 
-The bank's customer master is ``dim_customer``. the property register's property buyers mostly are
+The bank's customer master is ``dim_customer``. The property register's buyers mostly are
 not in it (3,830 of 4,843 at the last live measurement), so they had no page, no
 search result and no existence in this app at all — which is how a company with six
 units and KES 50M of property came to be "not on Customer 360".
@@ -58,7 +58,7 @@ class IdNamespaceTests(SimpleTestCase):
                          f'No property clients found in the {brand.PROPERTY} register.')
 
     def test_unbridged_client_does_not_claim_the_staff_rule_ran(self):
-        """the property register's register has no employer, segment or employee id, so for a client
+        """The property register has no employer, segment or employee id, so for a client
         with no bank record there is nothing to evaluate the staff rule against.
         Saying 'not staff' would be an assertion we cannot support."""
         row = {'client_id': 9.0, 'client_name': 'A', 'client_idno': '123456'}
@@ -140,7 +140,7 @@ class PropertyClientApiTests(TestCase):
 
 
 class PropertyClientDetailTests(TestCase):
-    """An the property register id has to survive the whole customer page, not just a list row."""
+    """A property-client id has to survive the whole customer page, not just a list row."""
 
     def setUp(self):
         _pin_mock()

@@ -22,7 +22,11 @@ from c360 import brand
 C360 = Path(__file__).resolve().parent.parent
 
 #: The entity names that must never be typed into a string literal.
-BRAND_WORDS = ('HFCB', 'the property register', 'HFBI')
+# The literal entity names, INCLUDING superseded ones. A rebrand rename once
+# replaced HFDI in this very tuple, so the guard stopped looking for the word it
+# was guarding and missed the same rename corrupting the staff employer list two
+# files away. A guard renamed along with the thing it guards is not a guard.
+BRAND_WORDS = ('HFCB', 'HFDI', 'HFBI')
 
 #: Files that are allowed to contain them, and why.
 ALLOWED_FILES = {
@@ -60,24 +64,37 @@ _STRING_RE = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""")
 def _offending_lines(path: Path) -> list[tuple[int, str]]:
     """Lines where a brand word appears inside a string literal, minus contracts.
 
-    A contract marker counts when it appears on the line OR in the three lines above
-    it. A call such as::
+    A contract marker covers the whole STATEMENT it appears in, tracked by paren
+    balance rather than by a fixed lookbehind. The staff employer list is one
+    assignment spanning several lines with comments inside it::
 
         STAFF_EMPLOYER_PATTERNS = _csv_env(
             'C360_STAFF_EMPLOYER_PATTERNS',
-            'HOUSING FINANCE,HF GROUP,HFC,...',
+            'HOUSING FINANCE,...,HFDI,...'
+            # a comment
+            'HFCB,HFCB PROPERTIES',
         )
 
-    puts the marker and the value on different lines, and it is the value that
-    carries the brand words.
+    A four-line window reached the first continuation line and not the last, so one
+    half of the same contract was exempt and the other half was flagged. Widening the
+    window would only move the cliff.
     """
     out: list[tuple[int, str]] = []
     lines = io.open(path, encoding='utf-8').read().splitlines()
+    depth = 0                 # unclosed parens carried in from a contract statement
     for n, line in enumerate(lines, 1):
-        if line.lstrip().startswith('#'):
-            continue
+        stripped = line.lstrip()
+        # A marker exempts its own line, the rest of its statement (paren depth), and
+        # the few lines beneath it - a class named HFCBDomainView exempts its own
+        # docstring, which is a different shape of contract from a multi-line list.
         window = chr(10).join(lines[max(0, n - 4):n])
-        if any(marker in window for marker in CONTRACT_MARKERS):
+        in_contract = depth > 0 or any(marker in window for marker in CONTRACT_MARKERS)
+        if in_contract:
+            # Follow the statement to its close, so every continuation line is
+            # covered by the marker that opened it.
+            depth = max(0, depth + line.count('(') - line.count(')'))
+            continue
+        if stripped.startswith('#'):
             continue
         for literal in _STRING_RE.findall(line):
             # Docstrings open with triple quotes and are not matched by the regex, so
@@ -130,5 +147,5 @@ class BrandLiteralTests(SimpleTestCase):
         from c360 import property_register
         self.assertEqual(property_register.PREFIX, 'PROP-')
         self.assertEqual(property_register.format_id(415), 'PROP-415')
-        for word in ('HFCB', 'the property register', 'HFBI', 'HF'):
+        for word in ('HFCB', 'HFDI', 'HFBI', 'HF'):
             self.assertNotIn(word, property_register.PREFIX)

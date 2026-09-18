@@ -1,4 +1,4 @@
-"""the property register property clients — the part of the group's customer base that never banked.
+"""Property clients — the part of the group's customer base that never banked.
 
 Customer 360's customer universe has always been ``dim_customer``: the core-banking
 master. the property register (the property development arm) keeps its own client register, and most
@@ -88,7 +88,7 @@ def normalise_idno(value) -> str:
 
 
 def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = None) -> dict:
-    """One the property register client, in the same shape ``get_customer`` returns for a bank customer.
+    """One property client, in the same shape ``get_customer`` returns for a bank customer.
 
     Keeping the contract identical is what lets the existing customer page, scope
     checks and staff sieve run over these records unchanged. The ``hfdi`` key is the
