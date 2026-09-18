@@ -225,7 +225,7 @@ class PropertyClientRecommendationTests(TestCase):
     def test_the_first_product_is_an_account_and_says_why(self):
         item = self._recs('HFDI-902')['items'][0]
         self.assertEqual(item['product'], 'transaction_account')
-        self.assertIn('no HF bank account', item['reason'])
+        self.assertIn('no bank account with us', item['reason'])
         self.assertIn('KES 6,400,000', item['reason'])
 
     def test_part_paid_holding_adds_the_financing_conversation(self):

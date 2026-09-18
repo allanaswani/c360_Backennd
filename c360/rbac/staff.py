@@ -46,6 +46,13 @@ def _flag_env(name: str, default: bool = False) -> bool:
 
 
 # Employer text that means "works for HF" (case-insensitive substring match).
+#
+# THIS LIST DOES NOT MOVE WITH THE BRAND - it grows. The patterns are matched against
+# dim_customer.employer, which holds whatever was typed when each record was opened,
+# going back years. Dropping a superseded name here would stop recognising every
+# colleague onboarded under it and leak their 360 to non-admins. After a rebrand the
+# NEW trading names must be ADDED (via C360_STAFF_EMPLOYER_PATTERNS, no deploy
+# needed) while every historical one stays - see c360/brand.py.
 # NOTE: the match is ``pattern in employer``, so a pattern must be a SUBSTRING of the
 # real value — not the other way round. dim_customer.employer stores the short form
 # ``HFC`` (not ``HFC LTD``), so ``HFC`` must be listed on its own; it also subsumes

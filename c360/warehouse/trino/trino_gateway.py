@@ -32,6 +32,7 @@ from datetime import date, timedelta
 from typing import Any
 
 from ... import credit_bureau as bureau_shape
+from ... import brand
 from ... import crm as crm_shape
 from ... import hfdi as hfdi_ns
 from ... import lending as lending_shape
@@ -2231,7 +2232,7 @@ class TrinoWarehouse(WarehouseGateway):
                 "  LEFT JOIN (SELECT DISTINCT client_id FROM delta.gold_db.rpt_c360_customer_property "
                 "              WHERE unit_id IS NOT NULL) o ON o.client_id = h.client_id")
         except Exception:
-            logger.warning('HFDI coverage query failed', exc_info=True)
+            logger.warning('%s coverage query failed', brand.PROPERTY, exc_info=True)
             return None
         if not rows:
             return None

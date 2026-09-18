@@ -25,6 +25,7 @@ from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
 from ..services import portfolio_cache, property_clients as pc_service
 from .. import hfdi as hfdi_ns
+from .. import brand
 from ..warehouse.factory import data_mode, get_gateway
 from ..warehouse.periods import PRESETS, resolve_period
 
@@ -109,7 +110,7 @@ class PropertyClientListView(APIView):
         if not pc_service.visible_to(scope):
             return Response(
                 {'error': {'status': 403, 'detail': 'The property-client register is '
-                                                    'available to the management and HFDI views.'}},
+                                                    f'available to the management and {brand.PROPERTY} views.'}},
                 status=status.HTTP_403_FORBIDDEN)
         unbanked = (request.query_params.get('unbanked') or '').strip().lower() in ('1', 'true', 'yes')
         return Response(pc_service.build_list(
@@ -132,8 +133,9 @@ class CustomerDetailView(APIView):
         if not customer_visible(scope, raw):
             # A property client is in NOBODY's book, so "outside your book" would be
             # a misleading reason to refuse it - it implies another RM holds it.
-            detail = ('Not allocated to a book. HFDI property clients are visible to '
-                      'the management and HFDI views.') if raw.get('hfdi') else 'Outside your book.'
+            detail = (f'Not allocated to a book. {brand.PROPERTY} property clients are '
+                      f'visible to the management and {brand.PROPERTY} views.'
+                      ) if raw.get('hfdi') else 'Outside your book.'
             return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
         header = build_customer_header(gateway, cust_id)

@@ -15,6 +15,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from .. import brand
 
 from ..history_actor import acting_user, actor_name
 from ..models import RecommendationFeedback
@@ -79,7 +80,10 @@ class FeedbackView(APIView):
             defaults={
                 'recorded_by': acting_user(request),
                 'product_name': str(data.get('product_name', ''))[:120],
-                'domain': str(data.get('domain', 'HFCB'))[:32],
+                # New rows record the CURRENT brand. Existing rows keep whatever was written
+                # at the time - they are a record of what was pitched under the
+                # name then in force, and rewriting that would falsify the audit.
+                'domain': str(data.get('domain', brand.DOMAIN_LABELS['bank']))[:32],
                 'score': float(score) if score not in (None, '') else None,
                 'rule_id': str(data.get('rule_id', ''))[:32],
                 'engine_version': str(data.get('engine_version', ''))[:32],

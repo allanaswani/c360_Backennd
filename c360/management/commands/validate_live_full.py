@@ -11,6 +11,7 @@ import time
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
+from c360 import brand
 
 from c360.recommendations.engine import recommend_for_customer
 from c360.services.customer import build_customer_header, build_value_summary
@@ -67,7 +68,7 @@ class Command(BaseCommand):
                               f"risk={header['risk']['risk_class']['status']}")
         if hfcb:
             m = hfcb['metrics']
-            ok('\nHFCB metrics (live):')
+            ok(f'\n{brand.BANK} metrics (live):')
             self.stdout.write(f"  deposits={m['total_deposits']['value']:,} loans={m['total_loans']['value']:,} "
                               f"products={m['products_held']['value']}")
             ch = hfcb['charts']

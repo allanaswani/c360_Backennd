@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import re
 
+from . import brand
 #: Prefix marking an id as HFDI's rather than core banking's.
 PREFIX = 'HFDI-'
 
@@ -50,7 +51,7 @@ _ID_RE = re.compile(r'^HFDI-(\d+)$', re.IGNORECASE)
 #: What we call these people on screen. They are customers of the group, so the word
 #: "client" alone would be a distinction without a difference to an RM — the segment
 #: label has to carry the fact that there is no bank relationship.
-SEGMENT_LABEL = 'HFDI property client'
+SEGMENT_LABEL = brand.PROPERTY_CLIENT_SEGMENT
 
 
 def format_id(client_id) -> str:
@@ -136,7 +137,7 @@ def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = No
             'has_pin': bool(pin),
         },
         'bio': {
-            'customer_type': 'HFDI property client',
+            'customer_type': brand.PROPERTY_CLIENT_SEGMENT,
             # A Kenyan national ID is all digits. Anything carrying a letter or
             # punctuation is an organisation's registration number ('C.102844',
             # 'CPR/2009/6011', 'BN/2016/447587') — calling those a National ID on
@@ -145,7 +146,7 @@ def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = No
                         ('National ID' if idno.isdigit() else 'Registration number')),
             'id_no': idno,
             'issuing_authority': None,
-            'kra_pin_status': 'Held by HFDI' if pin else None,
+            'kra_pin_status': f'Held by {brand.PROPERTY}' if pin else None,
             'date_of_birth': None,
             'gender': None,
             'city_of_birth': None,
@@ -163,11 +164,11 @@ def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = No
 def coverage_note(total: int, banked: int) -> str:
     """One plain sentence for the top of the list, built from the real counts."""
     if not total:
-        return 'No property clients found in the HFDI register.'
+        return f'No property clients found in the {brand.PROPERTY} register.'
     unbanked = total - banked
     pct = round(100 * banked / total)
     return (
-        f'{total:,} property clients are on the HFDI register. {banked:,} ({pct}%) also '
+        f'{total:,} property clients are on the {brand.PROPERTY} register. {banked:,} ({pct}%) also '
         f'hold a bank record and have a full Customer 360 profile; {unbanked:,} do not '
         f'bank with us at all.'
     )

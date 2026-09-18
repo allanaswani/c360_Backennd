@@ -8,6 +8,7 @@ falls back to the rule engine, so the app always works.
 """
 from __future__ import annotations
 
+from .. import brand
 import json
 import logging
 from functools import lru_cache
@@ -125,7 +126,7 @@ class PropensityModel:
             scored.append({
                 'product': target,
                 'product_name': self.labels.get(target, target),
-                'domain': 'HFCB',
+                'domain': brand.DOMAIN_LABELS['bank'],
                 'score': round(prob, 4),
                 'reason': reason,
                 'reason_short': reason_short,

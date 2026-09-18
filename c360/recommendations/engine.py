@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from .. import brand
 from ..warehouse.gateway import WarehouseGateway
 from . import rules
 from .rules import Candidate
@@ -225,7 +226,7 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
     if not units:
         return RecommendationResult(
             'ok', [], [], {'gate_evaluable': False,
-                           'note': 'On the HFDI register with no unit yet — nothing to base '
+                           'note': f'On the {brand.PROPERTY} register with no unit yet — nothing to base '
                                    'a recommendation on.'},
             engine_version='acquisition-v1')
 
@@ -234,8 +235,8 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
     candidates = [Candidate(
         product='transaction_account',
         product_name='Transaction account',
-        domain='HFCB',
-        reason=(f'Owns {holding} through HFDI but holds no HF bank account. '
+        domain=brand.DOMAIN_LABELS['bank'],
+        reason=(f'Owns {holding} through {brand.PROPERTY} but holds no bank account with us. '
                 f'The instalment payments already go somewhere — an account here is '
                 f'the natural first product.'),
         reason_short='Property owner, no bank account',
@@ -248,7 +249,7 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
         candidates.append(Candidate(
             product='mortgage',
             product_name='Mortgage / property finance',
-            domain='HFCB',
+            domain=brand.DOMAIN_LABELS['bank'],
             reason=(f'{round(paid * 100)}% paid on {holding}. The balance is being financed '
                     f'somewhere; HF can refinance the remainder.'),
             reason_short=f'{round(paid * 100)}% paid, balance financed elsewhere',
@@ -260,7 +261,8 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
         [_to_item(c, eligible=True) for c in candidates],
         [],
         {'gate_evaluable': False,
-         'note': 'Acquisition lead from the HFDI property register. Risk and KYC are '
+         'note': f'Acquisition lead from the {brand.PROPERTY} property register. Risk and '
+                 f'KYC are '
                  'derived from banking history, so no eligibility gate can run until '
                  'they open an account.'},
         engine_version='acquisition-v1',

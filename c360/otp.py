@@ -18,12 +18,16 @@ from django.utils import timezone
 from .models import OTP
 
 logger = logging.getLogger(__name__)
+from . import brand
 
 OTP_TTL_MINUTES = 5
 
 
 def _brand() -> str:
-    return getattr(settings, 'APP_BRAND_NAME', 'HFCB Customer 360')
+    """The name on OTP emails and SMS — the brand string that physically leaves the
+    building, so it is the one that must never be stale. Overridable per deployment
+    via APP_BRAND_NAME; the default follows c360/brand.py."""
+    return getattr(settings, 'APP_BRAND_NAME', f'{brand.BANK} Customer 360')
 
 
 def issue_otp(user, purpose: str) -> str:

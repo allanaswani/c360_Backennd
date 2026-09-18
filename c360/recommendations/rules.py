@@ -7,6 +7,7 @@ an analyst can read one function and know exactly when it fires.
 """
 from __future__ import annotations
 
+from .. import brand
 from dataclasses import dataclass
 
 from . import catalog
@@ -60,13 +61,13 @@ def rule_b_behaviour(holdings: dict, *, value: dict, txn_count: int, **_) -> lis
     if txn_count >= 200 and deposits < 500_000 and loans == 0:
         if 'overdraft' not in held:
             out.append(Candidate(
-                product='overdraft', product_name='Overdraft', domain='HFCB',
+                product='overdraft', product_name='Overdraft', domain=brand.DOMAIN_LABELS['bank'],
                 reason='High transaction volume against a low deposit balance — a short-term overdraft fits the cash-flow pattern.',
                 rule_id='B', base_score=0.66,
             ))
         if 'unsecured' not in held:
             out.append(Candidate(
-                product='unsecured', product_name='Unsecured Loan', domain='HFCB',
+                product='unsecured', product_name='Unsecured Loan', domain=brand.DOMAIN_LABELS['bank'],
                 reason='Consistently active with little idle balance — a pre-qualified personal loan is worth a conversation.',
                 rule_id='B', base_score=0.58,
             ))
@@ -107,7 +108,7 @@ def rule_d_idle_deposits(holdings: dict, *, value: dict, **_) -> list[Candidate]
     deposits = value.get('deposits') or 0
     if deposits >= _IDLE_DEPOSIT_MIN and 'savings' not in held:
         return [Candidate(
-            product='savings', product_name='Savings Account', domain='HFCB',
+            product='savings', product_name='Savings Account', domain=brand.DOMAIN_LABELS['bank'],
             reason=f'Holds ~KES {deposits / 1_000_000:.1f}M in deposits with no dedicated savings product — '
                    f'move idle balance into a yield-bearing account.',
             rule_id='D', base_score=0.64,
@@ -124,13 +125,13 @@ def rule_e_lending_only(holdings: dict, *, value: dict, **_) -> list[Candidate]:
     transactional = held & {'current', 'deposit', 'savings', 'mobile'}
     if lending and loans > 0 and not transactional:
         return [Candidate(
-            product='current', product_name='Current Account', domain='HFCB',
+            product='current', product_name='Current Account', domain=brand.DOMAIN_LABELS['bank'],
             reason='Borrows from us but keeps the day-to-day banking elsewhere — win the primary transactional account.',
             rule_id='E', base_score=0.70,
         )]
     if lending and 'mobile' not in held:
         return [Candidate(
-            product='mobile', product_name='Mobile Banking', domain='HFCB',
+            product='mobile', product_name='Mobile Banking', domain=brand.DOMAIN_LABELS['bank'],
             reason='Active borrower not yet on mobile banking — deepen the relationship with digital servicing.',
             rule_id='E', base_score=0.54,
         )]

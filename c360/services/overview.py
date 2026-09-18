@@ -12,6 +12,7 @@ history is a "must build", derived here from the movement-based balance series).
 """
 from __future__ import annotations
 
+from .. import brand
 from typing import Any
 
 from ..warehouse.factory import data_mode
@@ -36,7 +37,7 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
     banc = _safe(gateway.get_bancassurance, cust_id, period)
 
     # ---- value-by-domain slices ----------------------------------------
-    slices = [{'domain': 'HFCB', 'value': rel_value, 'status': LIVE}]
+    slices = [{'domain': brand.DOMAIN_LABELS['bank'], 'value': rel_value, 'status': LIVE}]
     snapshots = [{
         'domain': 'HFCB', 'tab': 'hfcb', 'status': LIVE,
         'label': 'Relationship value', 'value': rel_value,

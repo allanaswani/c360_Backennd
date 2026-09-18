@@ -11,6 +11,7 @@ from datetime import date
 from typing import Any
 
 from .. import hfdi as hfdi_ns
+from .. import brand
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.provenance import Provenance, derived, live, to_source
 
@@ -64,9 +65,11 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     h = header.get('hfdi')
     if h:
         if h.get('bank_cust_id'):
-            lead = 'On the HFDI property register, and a bank customer in their own right.'
+            lead = (f'On the {brand.PROPERTY} property register, and a bank customer in '
+                    f'their own right.')
         else:
-            lead = ('On the HFDI property register only — no account with the bank.')
+            lead = (f'On the {brand.PROPERTY} property register only — no account '
+                    f'with the bank.')
         if h.get('units'):
             where = f' in {_join_human(h.get("projects") or [])}' if h.get('projects') else ''
             paid = h.get('paid_pct')
@@ -396,17 +399,20 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
         },
         # value-by-domain: HFCB is real; others are placeholders flagged as such.
         'by_domain': [
-            {'domain': 'HFCB', 'value': v['relationship_value'], 'status': Provenance.LIVE.value,
-             **({'note': 'No bank relationship — this client is on the HFDI property '
-                         'register only.'} if hfdi_client is not None else {})},
-            {'domain': 'Whizz', 'value': None, 'status': Provenance.TO_SOURCE.value,
+            {'domain': brand.DOMAIN_LABELS['bank'], 'value': v['relationship_value'],
+             'status': Provenance.LIVE.value,
+             **({'note': f'No bank relationship — this client is on the '
+                          f'{brand.PROPERTY} property register only.'}
+                if hfdi_client is not None else {})},
+            {'domain': brand.DOMAIN_LABELS['digital'], 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Whizz value pending pipeline from the Kocela MySQL estate.'},
-            ({'domain': 'Properties', 'value': hfdi_value, 'status': Provenance.LIVE.value,
-              'note': 'Total unit value from the HFDI property register.'}
+            ({'domain': brand.DOMAIN_LABELS['property'], 'value': hfdi_value,
+              'status': Provenance.LIVE.value,
+              'note': f'Total unit value from the {brand.PROPERTY} property register.'}
              if hfdi_value is not None else
-             {'domain': 'Properties', 'value': None, 'status': Provenance.TO_SOURCE.value,
-              'note': 'Properties value pending HFDI CRM integration.'}),
-            {'domain': 'Bancassurance', 'value': None, 'status': Provenance.TO_SOURCE.value,
+             {'domain': brand.DOMAIN_LABELS['property'], 'value': None, 'status': Provenance.TO_SOURCE.value,
+              'note': f'Properties value pending {brand.PROPERTY} CRM integration.'}),
+            {'domain': brand.DOMAIN_LABELS['insurance'], 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Customer-level bancassurance value is a known gap (§7A.5).'},
         ],
     }

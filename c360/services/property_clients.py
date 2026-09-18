@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import brand
 from ..rbac.scoping import Scope, staff_hidden
 from ..warehouse.gateway import WarehouseGateway
 
@@ -68,7 +69,7 @@ def build_list(gateway: WarehouseGateway, scope: Scope, *, query: str = '',
         # Never a silent omission: say how many rows the staff rule could not be run
         # against, because HFDI's register carries none of the fields it needs.
         'staff_unverified': unchecked,
-        'basis': 'HFDI client register',
+        'basis': f'{brand.PROPERTY} client register',
     }
 
 
