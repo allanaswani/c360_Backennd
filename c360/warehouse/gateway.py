@@ -213,6 +213,15 @@ class WarehouseGateway(abc.ABC):
     def get_property_client(self, client_id: int) -> dict[str, Any] | None:
         return None
 
+    # --- live loan classification (optional capability) ----------------------
+    # Where a customer's lending actually stands at the latest close, read from the
+    # daily loan book rather than a periodic upload. {cust_id: {...}} for customers
+    # with live lending; a customer absent from the result has none, which is NOT the
+    # same as performing. Default: unknown, and callers fall back to whatever flag
+    # they have while labelling it unverified.
+    def live_loan_standing(self, cust_ids) -> dict[int, dict[str, Any]]:
+        return {}
+
     # {'total', 'banked', 'unbanked', 'units'} - the real counts behind the coverage
     # line on the list page, or None when the register is unavailable.
     def property_client_coverage(self) -> dict[str, Any] | None:

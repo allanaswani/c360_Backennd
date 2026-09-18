@@ -54,6 +54,14 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
     channels = gateway.channel_usage(cust_id, period)
     recent = gateway.recent_transactions(cust_id, period=period, limit=8)
 
+    # Where this customer's lending stands in the LIVE book. The allocation upload's
+    # npl column is periodic and was flagging performing customers months after they
+    # cured, so it no longer gets to decide this on its own.
+    try:
+        live_standing = gateway.live_loan_standing([cust_id]).get(_numeric_id(cust_id))
+    except Exception:
+        live_standing = None
+
     products_held = sum(1 for held in holdings['flags'].values() if held)
     deposits = value['deposits'] or 0
     loans = value['loans'] or 0
@@ -84,7 +92,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             # honestly 'not sourced' — never a fabricated figure).
             'aum': _aum_metric(prof),
             'profitability': _profitability_metric(prof),
-            'npl_status': _npl_metric(prof, loans),
+            'npl_status': _npl_metric(prof, loans, live_standing),
         },
         # ---- charts, each answering a stated question ---------------------
         'charts': {
@@ -158,29 +166,65 @@ def _profitability_metric(prof: dict | None) -> dict[str, Any]:
     return to_source(unit='KES', note='Profitability pending the allocation feed.').to_dict()
 
 
-def _npl_metric(prof: dict | None, loans: float) -> dict[str, Any]:
-    """Loan-performance status, reconciled against the LIVE loan book.
+def _numeric_id(cust_id) -> int | None:
+    """The bare customer number, for matching a gateway result keyed by integer."""
+    try:
+        return int(str(cust_id).split('.')[0])
+    except (TypeError, ValueError):
+        return None
 
-    The NPL flag lives on ``customer_allocation_base`` — a periodic snapshot. If we print
-    it blindly we can end up screaming 'Non-performing' next to live loans of KES 0 and a
-    'no loan facilities' panel (the snapshot still reflects a loan the customer has since
-    cleared). So: with no live loan, the status is 'No active loan' and the stale flag is
-    demoted to a note; only when there IS a live loan do we show Performing/Non-performing.
+
+def _npl_metric(prof: dict | None, loans: float,
+                live_standing: dict | None = None) -> dict[str, Any]:
+    """Loan-performance status, decided by the LIVE loan book.
+
+    The allocation upload carries an ``npl`` column, and it is periodic. It was
+    telling relationship managers that KAMEL PARK LIMITED and ARN SECURITY were
+    non-performing while the live book classified both Normal, and it put
+    "Non-performing" on the same screen as "Risk class: Low" and KES 36.0M of
+    healthy lending. The upload is no longer allowed to decide this on its own.
+
+    Order of authority:
+
+    1. The live loan book, read at the latest close. It moves daily and it is the
+       same source the book page now uses, so the two pages cannot disagree.
+    2. No live lending at all, in which case there is nothing to classify - and the
+       upload's flag is demoted to a note rather than shouted, because a cleared
+       loan is the most likely reason for the discrepancy.
+    3. The upload, only when the warehouse could not be read, and labelled as
+       unverified so nobody treats an unchecked flag as a checked one.
     """
     npl = None if prof is None else prof.get('npl')
+
+    if live_standing:
+        status = 'Non-performing' if live_standing.get('npl') else 'Performing'
+        classification = live_standing.get('status')
+        note = (f'Loan classification from the live book: {classification}.'
+                if classification else 'Loan classification from the live book.')
+        # Say when the upload disagreed, so an RM who saw the wrong flag sees it
+        # corrected rather than finding a different answer with no explanation.
+        if npl is not None and bool(npl) != bool(live_standing.get('npl')):
+            note += (' The allocation upload says '
+                     + ('non-performing' if npl else 'performing')
+                     + ', which the live book does not support.')
+        return derived(status, note=note).to_dict()
+
     if not loans:
-        # No live loan today — a bald 'Non-performing' here is the contradiction users flag.
+        # No live loan today. A bald 'Non-performing' here is the contradiction users flag.
         if npl:
             return derived('No active loan', note=(
-                'No loan facility in the live book. The allocation snapshot still flags this '
+                'No loan facility in the live book. The allocation upload still flags this '
                 'customer non-performing, most likely a loan that has since been cleared or '
-                'written off. Re-check once the snapshot is refreshed.')).to_dict()
+                'written off.')).to_dict()
         return derived('No active loan',
                        note='No loan facility in the live book.').to_dict()
+
     if npl is None:
         return to_source(note='Loan-performance flag pending the allocation feed.').to_dict()
     status = 'Non-performing' if npl else 'Performing'
-    return derived(status, note='Loan-performance flag from the allocation snapshot.').to_dict()
+    return derived(status, note=(
+        'From the allocation upload. The live loan book could not be read, so this '
+        'flag is unverified.')).to_dict()
 
 
 def _leverage_metric(deposits: float, loans: float) -> dict[str, Any]:
