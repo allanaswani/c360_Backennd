@@ -58,9 +58,21 @@ def _flag_env(name: str, default: bool = False) -> bool:
 # ``HFC`` (not ``HFC LTD``), so ``HFC`` must be listed on its own; it also subsumes
 # ``HFCB`` / ``HFC LTD`` / ``HFC LIMITED`` / ``HFC BANK``. Under-listing here leaks a
 # colleague's 360 to non-admins, so err toward the broader token.
+#
+# HFDI IS LOAD-BEARING AND MUST STAY. A repo-wide rebrand rename once replaced it
+# here with the new trading name, and because HFDI contains no 'HFC' nothing else
+# caught it: every colleague whose employer reads HFDI silently stopped being
+# recognised as staff. test_staff_patterns.py now asserts the contents of this list
+# precisely so that cannot recur.
 STAFF_EMPLOYER_PATTERNS = _csv_env(
     'C360_STAFF_EMPLOYER_PATTERNS',
-    'HOUSING FINANCE,HF GROUP,HFC,HF BANK,the property register,HF FOUNDATION,HF CUSTODY,HF INSURANCE',
+    # Historical names first - these are what the warehouse actually holds.
+    'HOUSING FINANCE,HF GROUP,HFC,HF BANK,HFDI,HFBI,HF FOUNDATION,HF CUSTODY,'
+    'HF INSURANCE,'
+    # Post-rebrand trading names. HFCB and HFCB PROPERTIES are both subsumed by the
+    # HFC token above; they are listed anyway so this is legible without having to
+    # reason about substrings, and so narrowing HFC later cannot drop them.
+    'HFCB,HFCB PROPERTIES',
 )
 # customer_segment / scheme values that denote a staff scheme (exact match).
 STAFF_SEGMENTS = _csv_env('C360_STAFF_SEGMENTS', 'STAFF,STAFF SCHEME,EMPLOYEE,EMPLOYEES')
