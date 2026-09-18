@@ -43,6 +43,35 @@ from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
 
 logger = logging.getLogger('c360')
+
+
+
+def _match_note(phone_only: int, name_only: int) -> str | None:
+    """Say which policies were reached by a weaker bridge, and why that matters.
+
+    Never a silent fuzzy match. A phone can be shared by a family or a business, and
+    a name match is only made when the name is unique on both sides - both are worth
+    stating so an RM can sense-check before acting on them.
+    """
+    parts = []
+    if phone_only:
+        parts.append(f'{phone_only} matched by phone number rather than ID, so a shared '
+                     f'handset could put another party on this page')
+    if name_only:
+        parts.append(f'{name_only} matched on a name that is unique in both systems, '
+                     f'there being no ID or phone on either side to match on')
+    if not parts:
+        return None
+    return 'Worth a check: ' + '; and '.join(parts) + '.'
+
+def _date_sort_key(value) -> float:
+    """ISO date to a sortable number; missing dates sort last."""
+    if not value:
+        return 0.0
+    try:
+        return float(str(value).replace('-', ''))
+    except (TypeError, ValueError):
+        return 0.0
 from ..gateway import WarehouseGateway
 from ..periods import ResolvedPeriod
 
@@ -2457,49 +2486,235 @@ class TrinoWarehouse(WarehouseGateway):
         cache.set('c360:hfdi:coverage', out, 3600)
         return out
 
+    #: Digits kept when comparing two phone numbers. Nine is a Kenyan subscriber
+    #: number without its country or trunk prefix, so +254 7xx, 254 7xx and 07xx all
+    #: reduce to the same key.
+    _PHONE_KEY_DIGITS = 9
+
+    @classmethod
+    def _phone_key(cls, value) -> str:
+        """Last nine digits of a phone number, or '' when there aren't nine."""
+        digits = _re.sub(r'[^0-9]', '', str(value or ''))
+        return digits[-cls._PHONE_KEY_DIGITS:] if len(digits) >= cls._PHONE_KEY_DIGITS else ''
+
+    @staticmethod
+    def _sql_phone_key(column: str) -> str:
+        """The same reduction, in Trino, so both sides of a join agree."""
+        digits = f"REGEXP_REPLACE({column}, '[^0-9]', '')"
+        return (f"CASE WHEN LENGTH({digits}) >= 9 "
+                f"THEN SUBSTR({digits}, LENGTH({digits}) - 8) ELSE '' END")
+
+    def _insurance_clients(self, nid: str, phone_key: str) -> dict[str, str]:
+        """HFBI client numbers belonging to this bank customer, and how each matched.
+
+        Returns {client_no: 'national ID' | 'phone'}. The ID match is preferred when a
+        client is reachable both ways, because it is the stronger claim.
+        """
+        clauses, params = [], []
+        if nid:
+            clauses.append('TRIM(h.idno) = ?')
+            params.append(nid)
+        if phone_key:
+            clauses.append(f'{self._sql_phone_key("h.phone")} = ?')
+            params.append(phone_key)
+        if not clauses:
+            return {}
+        rows = self._t.execute(
+            "SELECT DISTINCT TRIM(h.client_no) client_no, TRIM(h.idno) idno, h.phone "
+            "FROM delta.gold_db.hfbi_customer_data h "
+            f"WHERE TRIM(COALESCE(h.client_no, '')) <> '' AND ({' OR '.join(clauses)})",
+            tuple(params))
+        out: dict[str, str] = {}
+        for r in rows:
+            client_no = self._clean(r.get('client_no'))
+            if not client_no:
+                continue
+            by_id = bool(nid) and (self._clean(r.get('idno')) or '') == nid
+            # An ID match outranks a phone match for the same client.
+            if by_id or client_no not in out:
+                out[client_no] = 'national ID' if by_id else 'phone'
+        return out
+
+    #: A normalised name shorter than this is not distinctive enough to bridge on,
+    #: however unique it happens to be in today's data.
+    _NAME_BRIDGE_MIN_CHARS = 6
+
+    @staticmethod
+    def _name_key(value) -> str:
+        """Upper-case, letters and digits only. 'Rajaa Stones Limited' ->
+        'RAJAASTONESLIMITED', which is how the same company survives being typed
+        differently in two systems."""
+        return _re.sub(r'[^A-Za-z0-9]', '', str(value or '')).upper()
+
+    def _insurance_client_by_name(self, full_name: str) -> str | None:
+        """The insurance client whose name matches this customer's, when that name
+        can only mean one party.
+
+        Returns None unless the normalised name appears exactly once in the insurance
+        register AND exactly once in the bank's customer master. Either duplicate
+        makes the match a guess, and a guess is not worth putting someone else's
+        policies on a customer's page.
+        """
+        key = self._name_key(full_name)
+        if len(key) < self._NAME_BRIDGE_MIN_CHARS:
+            return None
+        norm_h = "UPPER(REGEXP_REPLACE(COALESCE(name, ''), '[^A-Za-z0-9]', ''))"
+        hrows = self._t.execute(
+            f"SELECT count(*) n, MIN(TRIM(client_no)) client_no "
+            f"FROM delta.gold_db.hfbi_customer_data WHERE {norm_h} = ?", (key,))
+        if not hrows or int(hrows[0].get('n') or 0) != 1:
+            return None
+        client_no = self._clean(hrows[0].get('client_no'))
+        if not client_no:
+            return None
+        norm_d = "UPPER(REGEXP_REPLACE(COALESCE(full_name, ''), '[^A-Za-z0-9]', ''))"
+        drows = self._t.execute(
+            f"SELECT count(*) n FROM delta.gold_db.dim_customer WHERE {norm_d} = ?", (key,))
+        if not drows or int(drows[0].get('n') or 0) != 1:
+            # The name means more than one bank customer, so it cannot identify this
+            # one. SUSAN WANJIKU KARIUKI (five records) lands here.
+            return None
+        return client_no
+
     def get_bancassurance(self, cust_id, period):
-        """Bancassurance policies for a bank customer. Bridged by national ID
-        (dim_customer.customer_id_no = rpt_c360_customer_policies_summary.idno — the
-        summary carries both HFBI's own client_no and the national id, so the national
-        id is the reliable bridge to the CBS customer). DEDUPE by policy_policy_no
-        (the summary can repeat a policy) before aggregating. Returns None when the
-        customer holds no policy → honest empty state. ``period`` is unused: a policy
-        book is a current holdings snapshot, not a windowed activity feed."""
+        """Insurance policies held by a bank customer.
+
+        Bridged three ways, because the one bridge this used to rely on is empty far
+        more often than it is populated:
+
+        1. ``policy_client_no`` -> ``hfbi_customer_data.client_no``, reached from the
+           customer's national ID. The register carries identifiers the policy
+           summary does not.
+        2. The same, reached by phone, which recovers clients whose register row has
+           no national ID - 76% of policy rows have none.
+        3. The policy summary's own ``idno``, kept so nothing that used to resolve
+           stops resolving.
+
+        Every policy says which bridge found it. A phone match is indicative rather
+        than confirmed: a shared handset can put two people on one number, and the
+        panel must not present that as a certainty.
+
+        Deduped by policy number (the summary repeats a policy). ``period`` is unused:
+        a policy book is a current holdings snapshot, not a windowed activity feed.
+        """
         cid = self._cid(cust_id)
         if cid is None:
             return None
-        nid_rows = self._t.execute(
-            "SELECT TRIM(customer_id_no) nid FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
-        nid = (nid_rows[0]['nid'] if nid_rows else None) or ''
-        # Guard against blank/placeholder ids matching many insurance clients.
+        idrows = self._t.execute(
+            "SELECT TRIM(customer_id_no) nid, primary_mobile_no mobile, mobile_tel2 alt, "
+            "TRIM(full_name) full_name "
+            "FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
+        if not idrows:
+            return None
+        row = idrows[0]
+        nid = (self._clean(row.get('nid')) or '')
+        # Same guard as before: a blank or placeholder id would match many clients.
         if len(nid) < 5 or nid.upper() == 'NULL' or not any(ch.isdigit() for ch in nid):
+            nid = ''
+        phone_key = self._phone_key(row.get('mobile')) or self._phone_key(row.get('alt'))
+
+        try:
+            clients = self._insurance_clients(nid, phone_key) if (nid or phone_key) else {}
+        except Exception:
+            logger.warning('bancassurance: client lookup failed for %s', cust_id, exc_info=True)
+            clients = {}
+
+        # Last resort, and only when the stronger bridges found nothing: a name that
+        # is unique on both sides. Rajaa Stones Limited has no national ID and no
+        # phone on either side, so this is the only link that exists for them.
+        if not clients:
+            try:
+                by_name = self._insurance_client_by_name(row.get('full_name'))
+            except Exception:
+                logger.warning('bancassurance: name lookup failed for %s', cust_id, exc_info=True)
+                by_name = None
+            if by_name:
+                clients = {by_name: 'name'}
+
+        if not clients and not nid:
             return None
+
+        clauses, params = [], []
+        if clients:
+            placeholders = ','.join(['?'] * len(clients))
+            clauses.append(f'TRIM(s.policy_client_no) IN ({placeholders})')
+            params.extend(clients)
+        if nid:
+            clauses.append('TRIM(s.idno) = ?')
+            params.append(nid)
+        if not clauses:
+            return None
+
+        # Deduped on the natural key, NOT on the policy number. policy_policy_no is
+        # blank on 98% of rows (57,188 of 58,504), so filtering or grouping by it
+        # discards almost the whole book - which is precisely why a customer with four
+        # annual renewals on file was shown nothing at all.
         rows = self._t.execute(
-            "SELECT policy_policy_no pol, MAX(TRIM(product)) product, MAX(status) status, "
-            "MAX(policy_total_premium) premium, MAX(policy_sum_insured) insured, "
-            "MAX(policy_start_date) start_dt, MAX(policy_end_date) end_dt "
-            "FROM delta.gold_db.rpt_c360_customer_policies_summary "
-            "WHERE TRIM(idno) = ? AND policy_policy_no IS NOT NULL AND TRIM(policy_policy_no) <> '' "
-            "GROUP BY policy_policy_no", (nid,))
+            "SELECT TRIM(s.policy_client_no) client_no, TRIM(s.product) product, "
+            "TRIM(s.policy_start_date) start_dt, TRIM(s.policy_end_date) end_dt, "
+            "COALESCE(s.policy_sum_insured, 0) insured, "
+            "MAX(TRIM(COALESCE(s.policy_policy_no, ''))) pol, "
+            "MAX(s.status) status, MAX(s.policy_total_premium) premium, "
+            "MAX(TRIM(COALESCE(s.idno, ''))) idno "
+            "FROM delta.gold_db.rpt_c360_customer_policies_summary s "
+            f"WHERE ({' OR '.join(clauses)}) "
+            "GROUP BY TRIM(s.policy_client_no), TRIM(s.product), "
+            "TRIM(s.policy_start_date), TRIM(s.policy_end_date), "
+            "COALESCE(s.policy_sum_insured, 0)", tuple(params))
         if not rows:
-            # No policies for this national ID. Distinguish a genuinely policy-free
-            # customer from an empty/unreachable policy source (see get_properties).
+            # Distinguish a genuinely policy-free customer from an empty or
+            # unreachable source (see get_properties).
             if not self._source_has_rows('delta.gold_db.rpt_c360_customer_policies_summary'):
-                raise LiveDataNotReady('bancassurance source (rpt_c360_customer_policies_summary) is empty or unreachable')
+                raise LiveDataNotReady(
+                    'bancassurance source (rpt_c360_customer_policies_summary) is empty '
+                    'or unreachable')
             return None
+
         policies = []
         for r in rows:
+            client_no = self._clean(r.get('client_no'))
+            # The summary's own id is the strongest claim; otherwise credit whichever
+            # bridge found the client.
+            if nid and (self._clean(r.get('idno')) or '') == nid:
+                matched_by = 'national ID'
+            else:
+                matched_by = clients.get(client_no or '', 'national ID')
+            status = (self._clean(r.get('status')) or 'unknown').title()
             policies.append({
-                'policy': self._clean(r.get('pol')) or '—',
+                # Shown when the feed carries one (1,316 rows of 58,504 do). Null
+                # otherwise, so the panel can say the number is missing rather than
+                # print a placeholder that looks like a reference.
+                'policy': self._clean(r.get('pol')),
+                # product is null on this customer's rows and many others, so the
+                # fallback has to be a description, not a guess at cover type.
                 'product': self._clean(r.get('product')) or 'Insurance policy',
                 'premium': round(float(r.get('premium') or 0)),
                 'sum_insured': round(float(r.get('insured') or 0)),
-                'status': (self._clean(r.get('status')) or 'unknown').title(),
+                'status': status,
                 'start': self._safe_date(r.get('start_dt')),
                 'end': self._safe_date(r.get('end_dt')),
+                'matched_by': matched_by,
             })
-        policies.sort(key=lambda p: p['premium'], reverse=True)
-        return {'policies': policies}
+        # Active first, then newest, then by premium. Most of the book is expired
+        # (55,093 of 58,504 rows), so premium alone buries what is actually in force,
+        # and a customer with four annual renewals should read newest-first.
+        policies.sort(key=lambda p: (p['status'].lower() != 'active',
+                                     -_date_sort_key(p['end']), -p['premium']))
+        phone_only = sum(1 for p in policies if p['matched_by'] == 'phone')
+        name_only = sum(1 for p in policies if p['matched_by'] == 'name')
+        return {
+            'policies': policies,
+            'active': sum(1 for p in policies if p['status'].lower() == 'active'),
+            # Said out loud: a book that is entirely expired is a retention
+            # conversation, and it should not look like an empty panel.
+            'expired': sum(1 for p in policies if p['status'].lower() != 'active'),
+            'unnumbered': sum(1 for p in policies if not p['policy']),
+            # Never a silent fuzzy match: when any policy was reached only by phone,
+            # the panel says so and says how many.
+            'phone_matched': phone_only,
+            'name_matched': name_only,
+            'match_note': _match_note(phone_only, name_only),
+        }
 
     def get_property_leads(self, cust_id):
         """Property-sales CRM (the property register leads + follow-ups) for a bank customer, matched by

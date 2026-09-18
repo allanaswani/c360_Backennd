@@ -204,6 +204,10 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
     # (annual by default). Injected onto each row so the table shows it too.
     for p in policies:
         p['monthly'] = round(p['premium'] / _term_months(p.get('start'), p.get('end')))
+        # The feed carries a policy number on 1,316 of 58,504 rows. Say it is absent
+        # rather than leaving a blank cell that looks like a failure to load.
+        if not p.get('policy'):
+            p['policy'] = 'No policy number on file'
 
     total_premium = sum(p['premium'] for p in policies)
     total_insured = sum(p['sum_insured'] for p in policies)
@@ -222,8 +226,21 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
             _metric('Monthly payments', total_monthly, 'KES', status=st),
             _metric('Sum insured', total_insured, 'KES', status=st),
             _metric('Policies', len(policies), 'count', status=st,
-                    meta=f'{n_active} active' if n_active else 'none active'),
+                    meta=(f'{n_active} active' if n_active
+                          else 'none currently active')),
         ],
+        # How these policies were linked to this customer, when it was by something
+        # weaker than a national ID. Null when every one matched on ID.
+        'match_note': data.get('match_note'),
+        'coverage': {
+            'active': n_active,
+            'expired': len(policies) - n_active,
+            # 98% of the policy feed carries no policy number. Stated, so a blank
+            # column reads as a gap in the source rather than a rendering fault.
+            'unnumbered': data.get('unnumbered', 0),
+            'matched_by_phone': data.get('phone_matched', 0),
+            'matched_by_name': data.get('name_matched', 0),
+        },
         'charts': [
             {'kind': 'bars', 'id': 'monthly', 'title': 'Monthly payment per policy',
              'question': 'What does this customer pay each month, per policy?', 'status': st, 'fmt': 'kes',
@@ -239,7 +256,9 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
         ],
         'tables': [
             {'id': 'policies', 'title': 'Policies held', 'status': st,
-             'columns': ['policy', 'product', 'premium', 'monthly', 'sum_insured', 'status'], 'rows': policies},
+             'columns': ['policy', 'product', 'premium', 'monthly', 'sum_insured',
+                         'status', 'matched_by'],
+             'rows': policies},
         ],
     }
 
