@@ -38,6 +38,7 @@ from ... import property_register as prop_reg
 from ... import lending as lending_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
+from .. import rm_balances as rm_bal
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
@@ -732,6 +733,10 @@ class TrinoWarehouse(WarehouseGateway):
 
         npl_live = self._verify_book_npl(members)
         live_totals = self._live_book_totals(members)
+        # The RM Portfolio tool's own definition of the same three figures, so the
+        # two screens can be reconciled instead of merely differing.
+        portfolio_view = self.get_rm_balances(sales_code)
+        portfolio_customers = self.get_rm_book_size(sales_code)
         return {
             'sales_code': sales_code,
             'whole_book': sales_code is None,
@@ -752,6 +757,13 @@ class TrinoWarehouse(WarehouseGateway):
             # it differs from a tool that reads live instead of hiding the gap. None
             # when the book is too large to total on a page load, or Trino is down.
             'live': live_totals,
+            # What the RM Portfolio tool would show for this same book. Present so a
+            # relationship manager comparing the two screens sees one reconciliation
+            # rather than two numbers and no explanation.
+            'portfolio_view': (
+                {**portfolio_view, 'customers': portfolio_customers}
+                if portfolio_view else
+                ({'customers': portfolio_customers} if portfolio_customers else None)),
             # customer_allocation_base records no load date (all 47 columns checked),
             # so the page must not imply it knows how current these figures are.
             'snapshot_dated': False,
@@ -807,6 +819,87 @@ class TrinoWarehouse(WarehouseGateway):
             'customers': len(holding),
             'as_of': self.as_of_date().isoformat(),
         }
+
+    def _pg_table_columns(self, table: str) -> set[str]:
+        """The columns a reporting-Postgres table actually has, lower-cased.
+
+        Asked of the catalogue rather than assumed: the balance-movement tables are
+        NOT a uniform monthly series. 2026 is monthly, older periods are quarterly,
+        so jun_25_bal exists and jul_25_bal does not. Naming a column that was never
+        created fails the whole statement.
+        """
+        rows = self._pg.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
+            (table,))
+        return {str(r.get('column_name') or '').lower() for r in rows}
+
+    def _movement_balance(self, table: str, sales_code: str) -> tuple[float, str | None]:
+        """Latest trustworthy balance for an RM in one movement table."""
+        columns = self._pg_table_columns(table)
+        if not columns:
+            return 0.0, None
+        sql, _ = rm_bal.build_sql(table, columns,
+                                  has_segment='customer_segment' in columns)
+        if not sql:
+            return 0.0, None
+        params: list[Any] = [str(sales_code)]
+        if 'customer_segment' in columns:
+            params.append(list(rm_bal.EXCLUDED_SEGMENTS))
+        rows = self._pg.execute(sql, tuple(params))
+        if not rows:
+            return 0.0, None
+        return rm_bal.pick(dict(rows[0]), rm_bal.ladder(columns))
+
+    def get_rm_balances(self, sales_code: str | None) -> dict[str, Any] | None:
+        """An RM's deposit and loan position, defined as the RM Portfolio tool defines it.
+
+        Customer 360 and that tool disagreed for the same relationship manager, and
+        the RM was right to report it. The difference was definitional: balances key
+        on the ACCOUNT's rm_code rather than on who the customer is allocated to, and
+        they come from the movement tables rather than a customer-master aggregate on
+        its own refresh cycle. See c360/warehouse/rm_balances.py.
+
+        Returns None when Postgres is absent or the tables are not there, so the page
+        keeps the allocation upload's figures and says they are unverified rather
+        than reporting a zero position.
+        """
+        if self._pg is None or not sales_code:
+            return None
+        try:
+            dep, dep_at = self._movement_balance('daily_balance_movement', sales_code)
+            loan, loan_at = self._movement_balance('loan_daily_balance_movement', sales_code)
+        except Exception:
+            logger.warning('rm balances unavailable for %s', sales_code, exc_info=True)
+            return None
+        if dep_at is None and loan_at is None:
+            return None
+        return {
+            'deposits': round(dep),
+            'deposits_as_at': dep_at,
+            'loans': round(loan),
+            'loans_as_at': loan_at,
+            'basis': 'Balance movement, by account RM code',
+        }
+
+    def get_rm_book_size(self, sales_code: str | None) -> int | None:
+        """How many customers are allocated to this RM, counted as the RM Portfolio
+        tool counts them: DISTINCT cust_id in retail_allocated_portfolio.
+
+        Customer 360 counted customer_allocation_base instead, which is a different
+        table with a different population - 191 against the portfolio tool's 220 for
+        the same RM.
+        """
+        if self._pg is None or not sales_code:
+            return None
+        try:
+            rows = self._pg.execute(
+                "SELECT COUNT(DISTINCT cust_id) AS n FROM retail_allocated_portfolio "
+                "WHERE TRIM(sales_code::text) = TRIM(%s) AND cust_id IS NOT NULL",
+                (str(sales_code),))
+        except Exception:
+            logger.warning('rm book size unavailable for %s', sales_code, exc_info=True)
+            return None
+        return int(rows[0].get('n') or 0) if rows else None
 
     def _verify_book_npl(self, members: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Recount non-performing customers from the live loan book.
