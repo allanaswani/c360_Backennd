@@ -782,6 +782,43 @@ class MockWarehouse(WarehouseGateway):
         return {'properties': props}
 
     def get_bancassurance(self, cust_id, period):
+        # An insurance client IS the insurance record, so their id resolves straight
+        # to their policies. Mirrored from live: without it the preview would show a
+        # client's own page reporting "no policies" while the list showed the policy,
+        # which is the exact bug this pairing exists to catch before production does.
+        ins_key = ins_reg.parse_id(cust_id)
+        if ins_key is not None:
+            for entry in self._INSURANCE_CLIENTS:
+                if (entry[0] or '').upper() != str(ins_key).upper():
+                    continue
+                _, name, _, _, total, active, premium, receipts = entry
+                if not total:
+                    return ({'policies': [], 'active': 0, 'expired': 0, 'unnumbered': 0,
+                             'phone_matched': 0, 'name_matched': 0,
+                             'receipts': {'receipts': receipts, 'risknotes': [],
+                                          'amounts_available': False,
+                                          'dates_available': False},
+                             'claims': None,
+                             'match_note': (
+                                 'No policy record survives in the warehouse for this '
+                                 f'client, but {receipts} premium receipts do. The policy '
+                                 'detail is missing from the insurance extract, not from '
+                                 'the relationship.')} if receipts else None)
+                each = round(premium / total)
+                policies = [{
+                    'policy': None, 'product': 'Insurance policy', 'premium': each,
+                    'sum_insured': each * 20,
+                    'status': 'Active' if i < active else 'Expired',
+                    'start': f'{2020 + i}-01-01', 'end': f'{2020 + i}-12-31',
+                    'matched_by': 'client number',
+                } for i in range(total)]
+                return {'policies': policies, 'active': active,
+                        'expired': total - active, 'unnumbered': total,
+                        'phone_matched': 0, 'name_matched': 0,
+                        'receipts': {'receipts': receipts, 'risknotes': [],
+                                     'amounts_available': False, 'dates_available': False},
+                        'claims': None, 'match_note': None}
+            return None
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if c is None:
             return None

@@ -50,6 +50,25 @@ _ID_RE = re.compile(r'^INS-([A-Za-z0-9]{2,64})$', re.IGNORECASE)
 SEGMENT_LABEL = 'Insurance client'
 
 
+def _person_name(value) -> str | None:
+    """A readable name from whatever the register stores for a person.
+
+    The risk-manager column holds an email address. 'Brian.Gumba@hfgroup.co.ke'
+    becomes 'Brian Gumba'; anything that is already a name is returned as it is,
+    because guessing twice is how a real name gets mangled.
+    """
+    raw = (value or '').strip()
+    if not raw:
+        return None
+    if '@' not in raw:
+        return raw
+    local = raw.split('@', 1)[0]
+    parts = [p for p in local.replace('_', '.').split('.') if p]
+    if not parts:
+        return raw
+    return ' '.join(p[:1].upper() + p[1:] for p in parts)
+
+
 def format_id(key) -> str:
     """``'RA386'`` -> ``'INS-RA386'``."""
     return f'{PREFIX}{str(key).strip()}'
@@ -94,8 +113,10 @@ def shape_client(row: dict, *, policies: dict | None = None, receipts: dict | No
         'name': name,
         'segment': SEGMENT_LABEL,
         'branch': (row.get('branch') or '').strip() or None,
-        # Not allocated to anyone's book, same as a property client.
-        'rm_name': (row.get('risk_manager') or '').strip() or None,
+        # Not allocated to anyone's book, same as a property client. The register
+        # stores its risk manager as an email address, and an address is not a name:
+        # the header rendered "RM Brian.Gumba@hfgroup.co.ke".
+        'rm_name': _person_name(row.get('risk_manager')),
         'sales_code': None,
         'rm_source': None,
         'mobile': (row.get('phone') or '').strip() or None,

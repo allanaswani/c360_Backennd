@@ -165,6 +165,14 @@ def recommend_for_customer(
     if hfdi and not hfdi.get('bank_cust_id'):
         return _acquisition_result(customer, hfdi)
 
+    # Same argument for an insurance client with no bank record: the ranker reasons
+    # from a product gap against a peer segment, and this customer has neither. Left
+    # alone it recommended a Current Account at "51% fit" because they have "a
+    # long-standing relationship" - with a company they have never banked with.
+    ins = customer.get('insurance')
+    if ins and not ins.get('bank_cust_id'):
+        return _insurance_acquisition_result(ins)
+
     # Prefer the trained ML model; fall back to the rule engine when it isn't available
     # OR when it yields no *confident* pick for this customer (an empty list). The rules
     # are specific and auditable, so a weak ML guess never crowds out an honest rule —
@@ -210,6 +218,64 @@ def recommend_for_customer(
     except Exception:
         profile = None
     return _result_from(ranked, profile)
+
+
+def _insurance_acquisition_result(ins: dict) -> RecommendationResult:
+    """What to say to somebody who insures with the group and banks elsewhere.
+
+    Built only from facts on the insurance register - policies held, whether any is
+    live, premiums actually paid - with no propensity score and no peer comparison,
+    because neither exists for a person the bank has never held.
+    """
+    policies = int(ins.get('policies') or 0)
+    active = int(ins.get('active_policies') or 0)
+    premium = float(ins.get('premium') or 0)
+    receipts = int(ins.get('receipts') or 0)
+
+    if not policies and not receipts:
+        return RecommendationResult(
+            'ok', [], [], {'gate_evaluable': False,
+                           'note': 'On the insurance register with no policy or premium '
+                                   'on file - nothing to base a recommendation on.'},
+            engine_version='acquisition-v1')
+
+    if policies:
+        held = (f'{policies} {"policy" if policies == 1 else "policies"}'
+                + (f', {active} still active' if active else ', none currently active'))
+    else:
+        held = f'{receipts} premium {"receipt" if receipts == 1 else "receipts"} on file'
+
+    candidates = [Candidate(
+        product='transaction_account',
+        product_name='Transaction account',
+        domain=brand.DOMAIN_LABELS['bank'],
+        reason=(f'Insures with the group ({held}) but holds no account with us. '
+                f'The premiums are already being paid from somewhere.'),
+        reason_short='Insures with us, banks elsewhere',
+        rule_id='acq.insurance.1',
+        base_score=min(1.0, premium / 500_000) if premium else 0.3,
+    )]
+    # A live policy is a renewal conversation with a date attached; a lapsed book is
+    # a different pitch, so the second prompt is only offered when cover is in force.
+    if active:
+        candidates.append(Candidate(
+            product='mobile',
+            product_name='Mobile banking',
+            domain=brand.DOMAIN_LABELS['bank'],
+            reason=(f'{active} active {"policy" if active == 1 else "policies"} means a '
+                    f'renewal conversation is already scheduled. Digital servicing is '
+                    f'the easiest thing to open alongside it.'),
+            reason_short=f'{active} active policy renewal due',
+            base_score=0.45,
+            rule_id='acq.insurance.2',
+        ))
+    return RecommendationResult(
+        'ok', [_to_item(c, eligible=True) for c in candidates], [],
+        {'gate_evaluable': False,
+         'note': 'Acquisition lead from the insurance register. Risk and KYC are '
+                 'derived from banking history, so no eligibility gate can run until '
+                 'they open an account.'},
+        engine_version='acquisition-v1')
 
 
 def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:

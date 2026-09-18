@@ -3083,6 +3083,92 @@ class TrinoWarehouse(WarehouseGateway):
             logger.warning('insurance claims lookup failed', exc_info=True)
             return None
 
+    def _bancassurance_for_client(self, key: str) -> dict[str, Any] | None:
+        """Policies for an insurance client, addressed by their own client number.
+
+        The bank-side path has to bridge - national ID, phone, then a unique name -
+        because it starts from a customer and has to find the insurance record. This
+        one starts from the insurance record, so it just reads it.
+
+        ``key`` is a client_no, or a normalised name for one of the ~454 clients who
+        exist only in the premium receipts. Those have no policy to show and the
+        caller says so with the receipts that prove the relationship.
+        """
+        rows = self._t.execute(
+            "SELECT TRIM(s.policy_client_no) client_no, TRIM(s.product) product, "
+            "TRIM(s.policy_start_date) start_dt, TRIM(s.policy_end_date) end_dt, "
+            "COALESCE(s.policy_sum_insured, 0) insured, "
+            "MAX(TRIM(COALESCE(s.policy_policy_no, ''))) pol, "
+            "MAX(s.status) status, MAX(s.policy_total_premium) premium "
+            "FROM delta.gold_db.rpt_c360_customer_policies_summary s "
+            "WHERE UPPER(TRIM(s.policy_client_no)) = ? "
+            "GROUP BY TRIM(s.policy_client_no), TRIM(s.product), "
+            "TRIM(s.policy_start_date), TRIM(s.policy_end_date), "
+            "COALESCE(s.policy_sum_insured, 0)", (str(key).upper(),))
+
+        # Receipts, found by the register's spelling of this client's name.
+        receipts = None
+        try:
+            nrows = self._t.execute(
+                self._INS_SELECT + "WHERE UPPER(TRIM(client_no)) = ? LIMIT 1",
+                (str(key).upper(),))
+            name = self._clean(nrows[0].get('name')) if nrows else None
+            if name:
+                receipts = self._insurance_receipts([name])
+            elif not rows:
+                # Receipt-only client: the key IS the normalised name.
+                rc = self._t.execute(
+                    f"SELECT count(*) n, ARRAY_AGG(DISTINCT TRIM(COALESCE(receipt_risknote_no, ''))) rn "
+                    f"FROM delta.gold_db.hfbi_receipt_data "
+                    f"WHERE {self._sql_name_key('receipt_client')} = ?", (str(key).upper(),))
+                if rc and int(rc[0].get('n') or 0):
+                    receipts = {'receipts': int(rc[0]['n']),
+                                'risknotes': sorted({x for x in (rc[0].get('rn') or []) if x}),
+                                'amounts_available': False, 'dates_available': False}
+        except Exception:
+            logger.warning('insurance receipts lookup failed for %s', key, exc_info=True)
+
+        if not rows:
+            if receipts:
+                return {
+                    'policies': [], 'active': 0, 'expired': 0, 'unnumbered': 0,
+                    'phone_matched': 0, 'name_matched': 0, 'receipts': receipts,
+                    'claims': self._safe_claims(receipts.get('risknotes') or []),
+                    'match_note': (
+                        f"No policy record survives in the warehouse for this client, but "
+                        f"{receipts['receipts']} premium receipts do. The policy detail is "
+                        f'missing from the insurance extract, not from the relationship.'),
+                }
+            return None
+
+        policies = []
+        for r in rows:
+            status = (self._clean(r.get('status')) or 'unknown').title()
+            policies.append({
+                'policy': self._clean(r.get('pol')),
+                'product': self._clean(r.get('product')) or 'Insurance policy',
+                'premium': round(float(r.get('premium') or 0)),
+                'sum_insured': round(float(r.get('insured') or 0)),
+                'status': status,
+                'start': self._safe_date(r.get('start_dt')),
+                'end': self._safe_date(r.get('end_dt')),
+                # Their own record: no bridge was needed and none is claimed.
+                'matched_by': 'client number',
+            })
+        policies.sort(key=lambda p: (p['status'].lower() != 'active',
+                                     -_date_sort_key(p['end']), -p['premium']))
+        return {
+            'policies': policies,
+            'active': sum(1 for p in policies if p['status'].lower() == 'active'),
+            'expired': sum(1 for p in policies if p['status'].lower() != 'active'),
+            'unnumbered': sum(1 for p in policies if not p['policy']),
+            'phone_matched': 0,
+            'name_matched': 0,
+            'receipts': receipts,
+            'claims': self._safe_claims((receipts or {}).get('risknotes') or []),
+            'match_note': None,
+        }
+
     def _insurance_claims(self, risknotes: list[str]) -> dict[str, Any] | None:
         """Claims registered against this client's risknotes.
 
@@ -3147,6 +3233,14 @@ class TrinoWarehouse(WarehouseGateway):
         Deduped by policy number (the summary repeats a policy). ``period`` is unused:
         a policy book is a current holdings snapshot, not a windowed activity feed.
         """
+        # An insurance client IS the insurance record. There is nothing to bridge to,
+        # so the id resolves straight to their policies. Without this the namespace
+        # guard below (an int() cast that correctly rejects INS-) made their own page
+        # report "no policies" while the list beside it showed the policy.
+        ins_key = ins_reg.parse_id(cust_id)
+        if ins_key is not None:
+            return self._bancassurance_for_client(ins_key)
+
         cid = self._cid(cust_id)
         if cid is None:
             return None
