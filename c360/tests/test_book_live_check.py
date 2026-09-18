@@ -50,6 +50,13 @@ class _StaleSnapshotPG:
             return [{'customers': 191, 'aum': 185_800_000, 'deposits': 47_200_000,
                      'loans': 138_600_000, 'contribution': 900_000,
                      'npl_customers': 2, 'npl_aum': 47_000_000}]
+        # The member list the headline recount reads: every customer in the book,
+        # id and AUM only.
+        if 'aum_cust_id as aum, npl' in s:
+            return [{'cust_id': str(KAMEL), 'aum': 36_200_000, 'npl': 1},
+                    {'cust_id': str(ARN), 'aum': 10_800_000, 'npl': 1},
+                    {'cust_id': str(CHANDARANA), 'aum': 9_310_000, 'npl': 0},
+                    {'cust_id': str(HEALTHY), 'aum': 5_000_000, 'npl': 0}]
         return []
 
 
@@ -177,3 +184,52 @@ class LiveStandingTests(SimpleTestCase):
         gw = TrinoWarehouse(_LiveBook(fail=True), postgres=_StaleSnapshotPG())
         self.assertEqual(gw.live_loan_standing([]), {})
         self.assertEqual(gw.live_deposit_totals([]), {})
+
+
+class HeadlineReconciliationTests(SimpleTestCase):
+    """The rail and the list must agree.
+
+    Verifying only the visible rows left the rail saying "2 non-performing" from the
+    upload while the list below showed no badges. A page that contradicts itself is
+    worse than one uniformly wrong, because then neither number can be trusted.
+    """
+
+    def test_headline_npl_is_recounted_from_the_live_book(self):
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        book = gw.get_book_summary('SC1')
+        # The upload claimed two. Live: Kamel and ARN are Normal, Chandarana has no
+        # lending, and only GENUINELY OVERDUE LTD is actually non-performing.
+        self.assertEqual(book['npl_customers'], 1)
+        self.assertEqual(book['npl_source'], 'live')
+        self.assertEqual(book['npl_snapshot_customers'], 2)
+
+    def test_headline_and_list_agree(self):
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        book = gw.get_book_summary('SC1')
+        badged = sum(1 for c in book['top_customers'] if c['npl'])
+        self.assertEqual(book['npl_customers'], badged)
+
+    def test_npl_aum_is_summed_over_the_right_customers(self):
+        """AUM stays the upload's number because only the upload has an AUM column.
+        What changes is which customers it is summed over."""
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        self.assertEqual(gw.get_book_summary('SC1')['npl_aum'], 5_000_000)
+
+    def test_falls_back_to_the_snapshot_when_live_is_unavailable(self):
+        gw = TrinoWarehouse(_LiveBook(fail=True), postgres=_StaleSnapshotPG())
+        book = gw.get_book_summary('SC1')
+        self.assertEqual(book['npl_source'], 'snapshot')
+        self.assertEqual(book['npl_customers'], 2)
+
+    def test_a_book_larger_than_the_bound_is_not_scanned_synchronously(self):
+        """The whole-book view is the entire bank. It keeps the upload's figure and
+        says so rather than scanning the loan book on a page load."""
+        class _HugeBook(_StaleSnapshotPG):
+            def execute(self, sql, params=None):
+                if 'aum_cust_id as aum, npl' in sql.lower():
+                    return [{'cust_id': str(i), 'aum': 1, 'npl': 0}
+                            for i in range(TrinoWarehouse._BOOK_VERIFY_LIMIT + 1)]
+                return super().execute(sql, params)
+
+        gw = TrinoWarehouse(_LiveBook(), postgres=_HugeBook())
+        self.assertEqual(gw.get_book_summary(None)['npl_source'], 'snapshot')

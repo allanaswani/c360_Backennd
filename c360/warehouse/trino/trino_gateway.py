@@ -679,6 +679,13 @@ class TrinoWarehouse(WarehouseGateway):
                            aum_cust_id AS aum, net_after_expense AS contribution, npl
                     FROM customer_allocation_base {where}
                     ORDER BY aum_cust_id DESC NULLS LAST LIMIT 10""", params)
+            # Every customer id in the book, so the headline NPL count can be checked
+            # against the live book rather than left disagreeing with the list below
+            # it. Bounded on purpose - see _BOOK_VERIFY_LIMIT.
+            members = self._pg.execute(
+                f"""SELECT CAST(cust_id AS text) AS cust_id, aum_cust_id AS aum, npl
+                    FROM customer_allocation_base {where}
+                    LIMIT {self._BOOK_VERIFY_LIMIT + 1}""", params)
         except Exception:
             return None
         if not head:
@@ -691,6 +698,7 @@ class TrinoWarehouse(WarehouseGateway):
             except (TypeError, ValueError):
                 return 0.0
 
+        npl_live = self._verify_book_npl(members)
         return {
             'sales_code': sales_code,
             'whole_book': sales_code is None,
@@ -699,8 +707,14 @@ class TrinoWarehouse(WarehouseGateway):
             'deposits': round(_n(h.get('deposits'))),
             'loans': round(_n(h.get('loans'))),
             'contribution': round(_n(h.get('contribution'))),
-            'npl_customers': int(h.get('npl_customers') or 0),
-            'npl_aum': round(_n(h.get('npl_aum'))),
+            'npl_customers': (npl_live['customers'] if npl_live
+                              else int(h.get('npl_customers') or 0)),
+            'npl_aum': (npl_live['aum'] if npl_live else round(_n(h.get('npl_aum')))),
+            # Where the two NPL figures came from, so the page never shows a
+            # live-checked list under a snapshot-derived headline without saying so.
+            'npl_source': 'live' if npl_live else 'snapshot',
+            'npl_snapshot_customers': int(h.get('npl_customers') or 0),
+            'npl_snapshot_aum': round(_n(h.get('npl_aum'))),
             'segments': [{'segment': self._clean(s.get('segment')) or 'Unsegmented',
                           'customers': int(s.get('n') or 0), 'aum': round(_n(s.get('aum')))}
                          for s in segs],
@@ -711,6 +725,45 @@ class TrinoWarehouse(WarehouseGateway):
                   'aum': round(_n(t.get('aum'))),
                   'contribution': round(_n(t.get('contribution'))),
                   'npl_snapshot': bool(_n(t.get('npl')) or 0)} for t in top]),
+        }
+
+    #: How many customers the book will live-check on a page load. An RM's book is a
+    #: few hundred and one grouped query answers it; the whole-book view is the entire
+    #: bank, so beyond this the upload's own NPL figure is kept and labelled as such
+    #: rather than scanning the loan book synchronously.
+    _BOOK_VERIFY_LIMIT = 800
+
+    def _verify_book_npl(self, members: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Recount non-performing customers from the live loan book.
+
+        Returns None when the check cannot or should not run (no member list, a book
+        larger than the bound, or the warehouse unreachable), and the caller then
+        keeps the upload's figure and marks it as the upload's.
+        """
+        if not members or len(members) > self._BOOK_VERIFY_LIMIT:
+            return None
+        by_id: dict[int, float] = {}
+        for m in members:
+            cid = self._cid(m.get('cust_id'))
+            if cid is None:
+                continue
+            try:
+                by_id[cid] = float(m.get('aum') or 0)
+            except (TypeError, ValueError):
+                by_id[cid] = 0.0
+        if not by_id:
+            return None
+        try:
+            standing = self.live_loan_standing(list(by_id))
+        except Exception:
+            logger.warning('book: live NPL recount failed', exc_info=True)
+            return None
+        npl_ids = [cid for cid, st in standing.items() if st['npl']]
+        return {
+            'customers': len(npl_ids),
+            # AUM stays the upload's number, because only the upload has an AUM
+            # column. What changes is WHICH customers it is summed over.
+            'aum': round(sum(by_id.get(cid, 0.0) for cid in npl_ids)),
         }
 
     def live_loan_standing(self, cust_ids: list[int]) -> dict[int, dict[str, Any]]:
