@@ -233,3 +233,48 @@ class HeadlineReconciliationTests(SimpleTestCase):
 
         gw = TrinoWarehouse(_LiveBook(), postgres=_HugeBook())
         self.assertEqual(gw.get_book_summary(None)['npl_source'], 'snapshot')
+
+
+class LiveTotalsTests(SimpleTestCase):
+    """The RM compared this page against the RM portfolio tool and found deposits
+    47.2M vs 55.77M and loans 138.6M vs 250.82M. The other tool reads live and says
+    "yesterday"; this one read an upload with no load date on it.
+
+    customer_allocation_base carries no date column at all (all 47 checked), so the
+    page cannot say how stale it is. Showing the live figures beside it is what lets
+    an RM reconcile the two instead of filing a defect.
+    """
+
+    def test_live_totals_are_reported_beside_the_upload(self):
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        book = gw.get_book_summary('SC1')
+        # The upload's figures are untouched.
+        self.assertEqual(book['deposits'], 47_200_000)
+        self.assertEqual(book['loans'], 138_600_000)
+        # And the live book's are alongside them.
+        live = book['live']
+        self.assertIsNotNone(live)
+        self.assertEqual(live['loans'], round(36_025_515.57 + 19_908_147.31 + 5_000_000))
+        self.assertEqual(live['deposits'],
+                         round(-1_344_093.97 + 182_693.50 + 0.00 + 10_000.0))
+
+    def test_a_closed_customer_is_not_counted_as_still_holding(self):
+        """Chandarana sits at a flat zero with no loans, which is what 'no longer on
+        the book' looks like in the live data."""
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        live = gw.get_book_summary('SC1')['live']
+        self.assertEqual(live['customers'], 3)          # of the upload's 4
+
+    def test_an_overdrawn_customer_still_counts(self):
+        """Kamel Park is at -1.34M. Overdrawn is not gone."""
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        self.assertEqual(gw.get_book_summary('SC1')['live']['customers'], 3)
+
+    def test_the_page_is_told_the_upload_has_no_date(self):
+        """So it cannot imply it knows how current the figures are."""
+        gw = TrinoWarehouse(_LiveBook(), postgres=_StaleSnapshotPG())
+        self.assertFalse(gw.get_book_summary('SC1')['snapshot_dated'])
+
+    def test_live_totals_are_absent_rather_than_wrong_when_unavailable(self):
+        gw = TrinoWarehouse(_LiveBook(fail=True), postgres=_StaleSnapshotPG())
+        self.assertIsNone(gw.get_book_summary('SC1')['live'])

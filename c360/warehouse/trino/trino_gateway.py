@@ -699,6 +699,7 @@ class TrinoWarehouse(WarehouseGateway):
                 return 0.0
 
         npl_live = self._verify_book_npl(members)
+        live_totals = self._live_book_totals(members)
         return {
             'sales_code': sales_code,
             'whole_book': sales_code is None,
@@ -715,6 +716,13 @@ class TrinoWarehouse(WarehouseGateway):
             'npl_source': 'live' if npl_live else 'snapshot',
             'npl_snapshot_customers': int(h.get('npl_customers') or 0),
             'npl_snapshot_aum': round(_n(h.get('npl_aum'))),
+            # The same two figures read from the live book, so the page can show why
+            # it differs from a tool that reads live instead of hiding the gap. None
+            # when the book is too large to total on a page load, or Trino is down.
+            'live': live_totals,
+            # customer_allocation_base records no load date (all 47 columns checked),
+            # so the page must not imply it knows how current these figures are.
+            'snapshot_dated': False,
             'segments': [{'segment': self._clean(s.get('segment')) or 'Unsegmented',
                           'customers': int(s.get('n') or 0), 'aum': round(_n(s.get('aum')))}
                          for s in segs],
@@ -732,6 +740,41 @@ class TrinoWarehouse(WarehouseGateway):
     #: bank, so beyond this the upload's own NPL figure is kept and labelled as such
     #: rather than scanning the loan book synchronously.
     _BOOK_VERIFY_LIMIT = 800
+
+    def _live_book_totals(self, members: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Deposits, loans and how many customers still hold anything, read live.
+
+        Shown ALONGSIDE the upload's figures rather than replacing them. The upload
+        owns AUM and net contribution - no other source has those columns - so
+        swapping in live totals would leave a page mixing two vintages with no way to
+        tell which was which. Two numbers with a stated difference is the honest
+        version, and it is what lets an RM reconcile this page against the RM
+        portfolio tool instead of filing a defect.
+        """
+        if not members or len(members) > self._BOOK_VERIFY_LIMIT:
+            return None
+        ids = [i for i in {self._cid(m.get('cust_id')) for m in members} if i is not None]
+        if not ids:
+            return None
+        try:
+            standing = self.live_loan_standing(ids)
+            deposits = self.live_deposit_totals(ids)
+        except Exception:
+            logger.warning('book: live totals unavailable', exc_info=True)
+            return None
+        loans = sum(float(v.get('loans') or 0) for v in standing.values())
+        dep = sum(deposits.values())
+        # A customer counts as still on the book when they hold lending or carry any
+        # deposit position, overdrawn included. Chandarana Supermarket, sitting at a
+        # flat zero with no loans, is exactly who this leaves out.
+        holding = {cid for cid in ids
+                   if cid in standing or abs(deposits.get(cid, 0.0)) >= 1}
+        return {
+            'deposits': round(dep),
+            'loans': round(loans),
+            'customers': len(holding),
+            'as_of': self.as_of_date().isoformat(),
+        }
 
     def _verify_book_npl(self, members: list[dict[str, Any]]) -> dict[str, Any] | None:
         """Recount non-performing customers from the live loan book.
