@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
+from .. import hfdi as hfdi_ns
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.provenance import Provenance, derived, live, to_source
 
@@ -41,6 +42,14 @@ def _seg_human(seg: str | None) -> str:
     return s.title() if s.isupper() else s
 
 
+def _join_human(items: list[str]) -> str:
+    """'A', 'A and B', 'A, B and C' — a list a person would read aloud."""
+    items = [i for i in items if i]
+    if len(items) <= 1:
+        return items[0] if items else ''
+    return ', '.join(items[:-1]) + ' and ' + items[-1]
+
+
 def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     """A single plain-language sentence an RM can read at a glance — 'who is this
     customer', composed from the same facts already on the page (no new query, no
@@ -49,6 +58,24 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
 
     e.g. 'Mass customer of 8 years with the bank. Holds KES 2.1M in deposits against
     KES 1.3M in loans — KES 0.8M net. Low risk.'"""
+    # An HFDI property client has no bank relationship for this sentence to describe.
+    # The generic template produces 'HFDI property client customer.' - true of nobody
+    # and useful to no one - so these get a sentence about what they DO hold.
+    h = header.get('hfdi')
+    if h:
+        if h.get('bank_cust_id'):
+            lead = 'On the HFDI property register, and a bank customer in their own right.'
+        else:
+            lead = ('On the HFDI property register only — no account with the bank.')
+        if h.get('units'):
+            where = f' in {_join_human(h.get("projects") or [])}' if h.get('projects') else ''
+            paid = h.get('paid_pct')
+            paid_txt = f', {round(paid * 100)}% paid' if paid is not None else ''
+            unit_word = 'unit' if h['units'] == 1 else 'units'
+            return (f'{lead} Holds {h["units"]} {unit_word} worth '
+                    f'{_kes_short(h["units_value"])}{where}{paid_txt}.')
+        return f'{lead} No unit on the register yet.'
+
     idy, risk = header['identity'], header['risk']
     hl = value.get('headline', {})
     dep = hl.get('deposits', {}).get('value') or 0
@@ -214,6 +241,12 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
 
     return {
         'cust_id': c['cust_id'],
+        # Present ONLY for an HFDI property client. The page keys off it to say, in
+        # one line at the top, that this is not a bank customer - otherwise a screen
+        # full of zeroes and 'not sourced' badges reads as a broken page rather than
+        # an accurate one. Carries the bank id when the client also banks with us, so
+        # the thin profile can hand over to the real one.
+        **({'hfdi': c['hfdi']} if c.get('hfdi') else {}),
         'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
         'identity': {
             'name': live(c['name']).to_dict(),
@@ -340,6 +373,20 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     are declared but PREVIEW/TO_SOURCE until their pipelines land, so the donut
     never shows a phantom slice as if it were real."""
     v = gateway.get_relationship_value(cust_id)
+    # An HFDI property client has no bank relationship at all, and their entire
+    # holding with the group is the property. Leaving the Properties row on the
+    # generic 'pending HFDI CRM integration' placeholder would report a known,
+    # exact figure as unsourced - and leave the page reading as if we hold nothing
+    # on someone with six units. Their number comes straight off the register.
+    hfdi_value = None
+    hfdi_client = hfdi_ns.parse_id(cust_id)
+    if hfdi_client is not None:
+        try:
+            client = gateway.get_property_client(hfdi_client)
+        except Exception:
+            client = None
+        if client:
+            hfdi_value = client['hfdi']['units_value']
     return {
         'headline': {
             'relationship_value': live(v['relationship_value'], unit='KES').to_dict(),
@@ -349,11 +396,16 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
         },
         # value-by-domain: HFCB is real; others are placeholders flagged as such.
         'by_domain': [
-            {'domain': 'HFCB', 'value': v['relationship_value'], 'status': Provenance.LIVE.value},
+            {'domain': 'HFCB', 'value': v['relationship_value'], 'status': Provenance.LIVE.value,
+             **({'note': 'No bank relationship — this client is on the HFDI property '
+                         'register only.'} if hfdi_client is not None else {})},
             {'domain': 'Whizz', 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Whizz value pending pipeline from the Kocela MySQL estate.'},
-            {'domain': 'Properties', 'value': None, 'status': Provenance.TO_SOURCE.value,
-             'note': 'Properties value pending HFDI CRM integration.'},
+            ({'domain': 'Properties', 'value': hfdi_value, 'status': Provenance.LIVE.value,
+              'note': 'Total unit value from the HFDI property register.'}
+             if hfdi_value is not None else
+             {'domain': 'Properties', 'value': None, 'status': Provenance.TO_SOURCE.value,
+              'note': 'Properties value pending HFDI CRM integration.'}),
             {'domain': 'Bancassurance', 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Customer-level bancassurance value is a known gap (§7A.5).'},
         ],

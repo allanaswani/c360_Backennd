@@ -200,6 +200,24 @@ class WarehouseGateway(abc.ABC):
     def get_related_parties(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
+    # --- HFDI property clients (optional capability) --------------------------
+    # The group's property arm keeps its own client register, and most of its buyers
+    # never opened a bank account - so they are absent from dim_customer and, until
+    # now, from Customer 360 entirely. These three read that register directly. A
+    # gateway without it simply has no property-client universe: the list is empty,
+    # no client resolves, and the page says so. See c360/hfdi.py.
+    def search_property_clients(self, query: str, *, limit: int = 50,
+                                unbanked_only: bool = False) -> list[dict[str, Any]]:
+        return []
+
+    def get_property_client(self, client_id: int) -> dict[str, Any] | None:
+        return None
+
+    # {'total', 'banked', 'unbanked', 'units'} - the real counts behind the coverage
+    # line on the list page, or None when the register is unavailable.
+    def property_client_coverage(self) -> dict[str, Any] | None:
+        return None
+
     # --- current RM allocation (optional capability) --------------------------
     # Default: none known (callers keep the account-opening officer). The live gateway
     # overrides this to read the CURRENT customer→RM allocation from the curated

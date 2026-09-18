@@ -23,7 +23,8 @@ from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
-from ..services import portfolio_cache
+from ..services import portfolio_cache, property_clients as pc_service
+from .. import hfdi as hfdi_ns
 from ..warehouse.factory import data_mode, get_gateway
 from ..warehouse.periods import PRESETS, resolve_period
 
@@ -94,6 +95,31 @@ class CustomerListView(APIView):
         return Response({'count': len(rows), 'results': rows})
 
 
+class PropertyClientListView(APIView):
+    """The HFDI property-client register - the group's property buyers.
+
+    Separate from /customers/ because it is a separate universe: these people are in
+    HFDI's register, not the bank's customer master, and most of them hold no bank
+    record at all. See c360/hfdi.py for why they were invisible until now.
+    """
+
+    def get(self, request: Request):
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        if not pc_service.visible_to(scope):
+            return Response(
+                {'error': {'status': 403, 'detail': 'The property-client register is '
+                                                    'available to the management and HFDI views.'}},
+                status=status.HTTP_403_FORBIDDEN)
+        unbanked = (request.query_params.get('unbanked') or '').strip().lower() in ('1', 'true', 'yes')
+        return Response(pc_service.build_list(
+            gateway, scope,
+            query=request.query_params.get('q', ''),
+            limit=min(int(request.query_params.get('limit', 50)), 200),
+            unbanked_only=unbanked,
+        ))
+
+
 class CustomerDetailView(APIView):
     """Level 2 landing payload — header + cross-domain value summary."""
 
@@ -104,7 +130,11 @@ class CustomerDetailView(APIView):
         if hidden:
             return hidden
         if not customer_visible(scope, raw):
-            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+            # A property client is in NOBODY's book, so "outside your book" would be
+            # a misleading reason to refuse it - it implies another RM holds it.
+            detail = ('Not allocated to a book. HFDI property clients are visible to '
+                      'the management and HFDI views.') if raw.get('hfdi') else 'Outside your book.'
+            return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
         header = build_customer_header(gateway, cust_id)
         if header is None:

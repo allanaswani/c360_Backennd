@@ -33,6 +33,7 @@ from typing import Any
 
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
+from ... import hfdi as hfdi_ns
 from ... import lending as lending_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
@@ -799,6 +800,15 @@ class TrinoWarehouse(WarehouseGateway):
 
     # --- identity (dim_customer only → guaranteed one row) ---------------
     def get_customer(self, cust_id: str) -> dict[str, Any] | None:
+        # An HFDI id resolves against the property register instead of the bank's
+        # customer master. Routing it here rather than in the view means the customer
+        # page, the scope check and the staff sieve all work on these records
+        # unchanged - and every OTHER gateway method still parses the id through
+        # _cid(), which rejects it, so no bank figure can ever be attached to a
+        # client who has no bank relationship.
+        hfdi_client = hfdi_ns.parse_id(cust_id)
+        if hfdi_client is not None:
+            return self.get_property_client(hfdi_client)
         cid = self._cid(cust_id)
         if cid is None:
             return None
@@ -2002,6 +2012,13 @@ class TrinoWarehouse(WarehouseGateway):
         each unit many times, so we DEDUPE by unit_id (GROUP BY) before summing —
         rpt_c360_property_value's own totals are inflated by that duplication and are
         NOT trusted. Returns None when the customer owns no HFDI unit."""
+        # An HFDI client owns their units directly - no national-ID bridge needed,
+        # and none available for the 78% who are not bank customers. The property
+        # table keys on client_id, so this is the exact path rather than the
+        # best-effort one the bank side has to use.
+        hfdi_client = hfdi_ns.parse_id(cust_id)
+        if hfdi_client is not None:
+            return self._properties_for_units(self._property_units_by_client(hfdi_client))
         cid = self._cid(cust_id)
         if cid is None:
             return None
@@ -2024,6 +2041,26 @@ class TrinoWarehouse(WarehouseGateway):
             if not self._source_has_rows('delta.gold_db.rpt_c360_customer_property'):
                 raise LiveDataNotReady('property source (rpt_c360_customer_property) is empty or unreachable')
             return None
+        return self._properties_for_units(units)
+
+    def _property_units_by_client(self, client_id: int) -> list[dict[str, Any]]:
+        """HFDI units owned by one property-register client, deduped by unit_id.
+
+        rpt_c360_customer_property repeats each unit many times (it is event-sourced),
+        so this GROUPs before anything sums - the same reason the bank-side query
+        does, and the reason rpt_c360_property_value's own totals are not trusted.
+        """
+        return self._t.execute(
+            "SELECT cp.unit_id, MAX(TRIM(cp.project_name)) project, MAX(TRIM(cp.unit_name)) unit, "
+            "MAX(TRY_CAST(cp.unit_value AS double)) value, MAX(cp.perc_paid) paid "
+            "FROM delta.gold_db.rpt_c360_customer_property cp "
+            "WHERE cp.client_id = ? AND cp.unit_id IS NOT NULL "
+            "GROUP BY cp.unit_id", (float(client_id),))
+
+    def _properties_for_units(self, units: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Shape deduped unit rows into the properties payload, flagging mortgages."""
+        if not units:
+            return None
         unit_ids = [int(u['unit_id']) for u in units if u['unit_id'] is not None]
         mortgaged: set[int] = set()
         if unit_ids:
@@ -2044,6 +2081,173 @@ class TrinoWarehouse(WarehouseGateway):
             })
         properties.sort(key=lambda p: p['value'], reverse=True)
         return {'properties': properties}
+
+    # --- HFDI property clients (their own universe, see c360/hfdi.py) --------
+
+    _HFDI_SELECT = (
+        "SELECT client_id, TRIM(client_name) client_name, TRIM(client_idno) client_idno, "
+        "TRIM(client_phone) client_phone, TRIM(client_email) client_email, "
+        "TRIM(client_pin) client_pin FROM delta.gold_db.hfdi_client_data "
+    )
+
+    def _hfdi_units_summary(self, client_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Unit count, total value and payment progress per client, deduped by unit."""
+        if not client_ids:
+            return {}
+        inlist = ','.join(str(float(i)) for i in client_ids)
+        rows = self._t.execute(
+            "SELECT client_id, count(*) units, SUM(value) units_value, AVG(paid) paid_pct, "
+            "ARRAY_AGG(DISTINCT project) projects FROM ("
+            "  SELECT cp.client_id, cp.unit_id, MAX(TRY_CAST(cp.unit_value AS double)) value, "
+            "         MAX(cp.perc_paid) paid, MAX(TRIM(cp.project_name)) project "
+            "    FROM delta.gold_db.rpt_c360_customer_property cp "
+            f"   WHERE cp.client_id IN ({inlist}) AND cp.unit_id IS NOT NULL "
+            "   GROUP BY cp.client_id, cp.unit_id) u GROUP BY client_id")
+        out: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            paid = r.get('paid_pct')
+            out[int(float(r['client_id']))] = {
+                'units': int(r.get('units') or 0),
+                'units_value': float(r.get('units_value') or 0),
+                'paid_pct': round(min(max(float(paid), 0.0), 1.0), 3) if paid is not None else None,
+                'projects': sorted(p for p in (r.get('projects') or []) if p),
+            }
+        return out
+
+    def _hfdi_bank_matches(self, idnos: list[str]) -> dict[str, dict[str, Any]]:
+        """Which of these HFDI national IDs belong to a bank customer too.
+
+        Matched on the normalised id (punctuation stripped, upper-cased) because the
+        two systems punctuate registration numbers differently. That normalisation is
+        worth two extra clients out of 3,429 - the gap is real, not cosmetic - but it
+        costs nothing and removes a class of false 'not a customer'.
+        """
+        clean = [i for i in {(i or '').strip() for i in idnos} if len(i) >= 5]
+        if not clean:
+            return {}
+        quoted = ','.join("'" + i.replace("'", "''") + "'" for i in clean)
+        rows = self._t.execute(
+            "SELECT CAST(customer_id AS BIGINT) id, TRIM(customer_id_no) idno, "
+            "customer_segment, employer, fk_bankemployeeid "
+            f"FROM delta.gold_db.dim_customer WHERE TRIM(customer_id_no) IN ({quoted})")
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            key = hfdi_ns.normalise_idno(r.get('idno'))
+            if not key or key in out:
+                continue
+            out[key] = {
+                'cust_id': str(r['id']),
+                'is_staff': is_staff_from_fields(
+                    employer=r.get('employer'), segment=r.get('customer_segment'),
+                    bank_employee_id=r.get('fk_bankemployeeid')),
+            }
+        return out
+
+    def _hfdi_decorate(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Attach unit totals and the bank bridge to raw register rows."""
+        if not rows:
+            return []
+        ids = [int(float(r['client_id'])) for r in rows if r.get('client_id') is not None]
+        units = self._hfdi_units_summary(ids)
+        banked = self._hfdi_bank_matches([r.get('client_idno') for r in rows])
+        out = []
+        for r in rows:
+            cid = int(float(r['client_id']))
+            key = hfdi_ns.normalise_idno(r.get('client_idno'))
+            out.append(hfdi_ns.shape_client(r, units=units.get(cid), bank=banked.get(key)))
+        return out
+
+    def search_property_clients(self, query: str, *, limit: int = 50,
+                                unbanked_only: bool = False) -> list[dict[str, Any]]:
+        """Search the HFDI register by name, national ID or client number.
+
+        `unbanked_only` narrows to the clients with no bank record - the acquisition
+        list, and the reason this universe was opened up at all. It is applied AFTER
+        the bank bridge is resolved, so it reflects the same match the row displays.
+        """
+        raw = (query or '').strip()
+        like = f'%{raw.lower()}%'
+        id_norm = hfdi_ns.normalise_idno(raw)
+        id_guard = id_norm if len(id_norm) >= 5 else ''
+        # Over-fetch when a filter runs after the query, so the page still fills.
+        fetch = min(int(limit) * 4, 400) if unbanked_only else int(limit)
+        if raw:
+            rows = self._t.execute(
+                self._HFDI_SELECT +
+                "WHERE client_name IS NOT NULL AND ("
+                "  lower(TRIM(client_name)) LIKE ? "
+                "  OR CAST(CAST(client_id AS BIGINT) AS varchar) = ? "
+                "  OR (? <> '' AND UPPER(REGEXP_REPLACE(TRIM(client_idno), '[^A-Za-z0-9]', '')) LIKE ?)) "
+                "LIMIT ?", (like, raw, id_guard, f'%{id_norm}%', fetch))
+        else:
+            rows = self._t.execute(
+                self._HFDI_SELECT + "WHERE client_name IS NOT NULL LIMIT ?", (fetch,))
+        out = self._hfdi_decorate(rows)
+        if unbanked_only:
+            out = [c for c in out if not c['hfdi']['bank_cust_id']]
+        # Biggest holdings first: this is a sales list, not a directory.
+        out.sort(key=lambda c: (-(c['hfdi']['units_value'] or 0), c['name'] or ''))
+        return out[:int(limit)]
+
+    def get_property_client(self, client_id: int) -> dict[str, Any] | None:
+        rows = self._t.execute(self._HFDI_SELECT + "WHERE client_id = ? LIMIT 1",
+                               (float(client_id),))
+        if not rows:
+            return None
+        return self._hfdi_decorate(rows)[0]
+
+    def property_client_coverage(self) -> dict[str, Any] | None:
+        """How much of the HFDI register the bank actually holds a relationship with.
+
+        This is the number that justifies the page existing, so it is measured, not
+        asserted - and it is measured over the register itself rather than over the
+        property table, because a client with no unit yet is still a client. Cached
+        for an hour: it is a full scan of both sides and it moves daily at most.
+        """
+        from django.core.cache import cache  # local: keeps the gateway import-light
+
+        cached = cache.get('c360:hfdi:coverage')
+        if cached is not None:
+            return cached
+        try:
+            # Both sides are reduced to DISTINCT id sets BEFORE the join. A national
+            # id can appear on several dim_customer rows, and joining the raw table
+            # fans each client out into as many rows as it matched - which is how a
+            # 4,843-client register first reported 8,300 clients here. Units are a
+            # separate scalar for the same reason.
+            rows = self._t.execute(
+                "WITH h AS (SELECT DISTINCT client_id, TRIM(client_idno) idno "
+                "             FROM delta.gold_db.hfdi_client_data WHERE client_name IS NOT NULL), "
+                "     d AS (SELECT DISTINCT TRIM(customer_id_no) idno "
+                "             FROM delta.gold_db.dim_customer "
+                "            WHERE TRIM(COALESCE(customer_id_no, '')) <> '') "
+                "SELECT count(*) total, "
+                "       count(CASE WHEN d.idno IS NOT NULL THEN 1 END) banked, "
+                "       count(CASE WHEN o.client_id IS NOT NULL THEN 1 END) owners, "
+                "       (SELECT count(DISTINCT unit_id) "
+                "          FROM delta.gold_db.rpt_c360_customer_property "
+                "         WHERE unit_id IS NOT NULL) units "
+                "  FROM h LEFT JOIN d ON d.idno = h.idno "
+                "  LEFT JOIN (SELECT DISTINCT client_id FROM delta.gold_db.rpt_c360_customer_property "
+                "              WHERE unit_id IS NOT NULL) o ON o.client_id = h.client_id")
+        except Exception:
+            logger.warning('HFDI coverage query failed', exc_info=True)
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        total = int(r.get('total') or 0)
+        banked = int(r.get('banked') or 0)
+        out = {
+            'total': total,
+            'banked': banked,
+            'unbanked': max(total - banked, 0),
+            'owners': int(r.get('owners') or 0),
+            'units': int(r.get('units') or 0),
+            'note': hfdi_ns.coverage_note(total, banked),
+        }
+        cache.set('c360:hfdi:coverage', out, 3600)
+        return out
 
     def get_bancassurance(self, cust_id, period):
         """Bancassurance policies for a bank customer. Bridged by national ID

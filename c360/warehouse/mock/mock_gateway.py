@@ -15,6 +15,7 @@ from typing import Any
 
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
+from ... import hfdi as hfdi_ns
 from ... import lending as lending_shape
 from ... import relationships as rel_shape
 from ... import risk as risk_derive
@@ -56,6 +57,10 @@ class MockWarehouse(WarehouseGateway):
 
     # --- identity & scope ------------------------------------------------
     def get_customer(self, cust_id: str) -> dict[str, Any] | None:
+        # HFDI ids resolve against the property register, exactly as they do live.
+        hfdi_client = hfdi_ns.parse_id(cust_id)
+        if hfdi_client is not None:
+            return self.get_property_client(hfdi_client)
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if not c:
             return None
@@ -174,14 +179,21 @@ class MockWarehouse(WarehouseGateway):
 
     # --- holdings & value ------------------------------------------------
     def get_product_holdings(self, cust_id):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return {'flags': {}, 'product_map': {}}
         return {
             'flags': dict(c['flags']),
             'product_map': {k: seed.PRODUCT_LABELS[k] for k in c['flags']},
         }
 
     def get_relationship_value(self, cust_id):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            # Same answer the live gateway gives for an id it cannot resolve. An
+            # HFDI property client reaches this: they hold no bank product, and the
+            # page must say zero rather than borrow somebody else's balance.
+            return {'relationship_value': 0, 'deposits': 0, 'loans': 0, 'revenue': 0}
         return {
             'relationship_value': c['value'],
             'deposits': c['deposits'],
@@ -190,7 +202,9 @@ class MockWarehouse(WarehouseGateway):
         }
 
     def get_deposit_accounts(self, cust_id):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return []
         r = _rng(cust_id + 'dep')
         accts = []
         products = [(k, v) for k, v in c['flags'].items()
@@ -211,7 +225,9 @@ class MockWarehouse(WarehouseGateway):
         return accts
 
     def get_loan_accounts(self, cust_id):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return []
         r = _rng(cust_id + 'loan')
         accts = []
         loan_products = [(k, v) for k, v in c['flags'].items()
@@ -254,7 +270,9 @@ class MockWarehouse(WarehouseGateway):
         return vals
 
     def deposit_loan_series(self, cust_id, period):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return {'deposits': [], 'loans': []}
         slope = _TREND_SLOPE[c['profile']['trend']]
         ds = self._dates(period)
         dep = self._walk(c['deposits'] or 1, slope, len(ds), _rng(cust_id + 'ds-dep'))
@@ -265,8 +283,8 @@ class MockWarehouse(WarehouseGateway):
         }
 
     def disbursement_vs_balance_series(self, cust_id, period):
-        c = seed.CUSTOMER_INDEX[cust_id]
-        if not c['loans']:
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None or not c['loans']:
             return {'disbursed': [], 'balance': []}
         ds = self._dates(period)
         r = _rng(cust_id + 'disb')
@@ -284,7 +302,9 @@ class MockWarehouse(WarehouseGateway):
 
     def transaction_series(self, cust_id, period):
         # Daily transaction *count* — matches the live fact_dep_trx_recording shape.
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return []
         base = _INTENSITY[c['profile']['txn_intensity']]
         slope = _TREND_SLOPE[c['profile']['trend']]
         ds = self._dates(period)
@@ -292,7 +312,9 @@ class MockWarehouse(WarehouseGateway):
         return [{'period': d.isoformat(), 'count': int(round(v))} for d, v in zip(ds, vals)]
 
     def channel_usage(self, cust_id, period):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return []
         r = _rng(cust_id + 'chan')
         weights = []
         for ch in _CHANNELS:
@@ -306,7 +328,9 @@ class MockWarehouse(WarehouseGateway):
         return [{'channel': ch, 'share': round(w / total, 4)} for ch, w in zip(_CHANNELS, weights)]
 
     def recent_transactions(self, cust_id, *, period=None, limit=8, lookback_months=24):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return []
         r = _rng(cust_id + 'recent')
         kinds = [('Mobile transfer', 'Mobile'), ('POS purchase', 'ATM'), ('Standing order', 'Branch'),
                  ('Salary credit', 'Branch'), ('Airtime', 'Mobile'), ('Loan repayment', 'Mobile'),
@@ -509,13 +533,17 @@ class MockWarehouse(WarehouseGateway):
         return {'delinquency': delinquency, 'collateral': collateral}
 
     def segment_product_benchmark(self, segment):
-        return seed.SEGMENT_BENCHMARK.get(segment, 3.0)
+        # None, not a default, for a segment with no measured benchmark. Rule C then
+        # abstains instead of comparing a customer against a number nobody computed -
+        # the behaviour the live gateway already documents. A property client has no
+        # peer group here at all, and used to be told they were 3.0 products behind it.
+        return seed.SEGMENT_BENCHMARK.get(segment)
 
     # --- non-core domains (preview) -------------------------------------
     def get_whizz(self, cust_id, period):
         # Mirrors the live shape: Whizz activity sourced from KOCELA transactions.
-        c = seed.CUSTOMER_INDEX[cust_id]
-        if not c['flags'].get('mobile'):
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None or not c['flags'].get('mobile'):
             return None
         r = _rng(cust_id + 'whizz')
         base = _INTENSITY[c['profile']['txn_intensity']] * (0.5 + r.next())
@@ -550,10 +578,115 @@ class MockWarehouse(WarehouseGateway):
             'recent': recent,
         }
 
+    # HFDI property clients - the group's property buyers, most of whom hold no bank
+    # account and so have no dim_customer record at all. Live, 3,830 of 4,843
+    # register clients are in that position; the preview carries the same two cases
+    # so the page can be built and reviewed without the warehouse.
+    #
+    # (client_id, name, idno, phone, email, has_pin, units)
+    # Each unit is (project, unit, value, paid_pct, mortgage).
+    _HFDI_CLIENTS = [
+        # Bridges to a seed customer: id_no matches HF-102010 (Zawadi Enterprises),
+        # so the panel must offer their real profile rather than this thinner one.
+        (415, 'Zawadi Enterprises Ltd', 'C.102844', '+254722000415',
+         'accounts@zawadi.co.ke', True, [
+             ('Ngong Town', '54', 8_000_000, 0.0, False),
+             ('Clay City Undeveloped Land', '6', 9_000_000, 0.0, True),
+             ('Ngong Town', '53', 8_000_000, 0.0, False),
+         ]),
+        # No bank record - the acquisition case this page exists for.
+        (902, 'Halima Yusuf Abdi', '24551903', '+254733000902', None, False, [
+            ('Komarock Heights', 'B12', 6_400_000, 0.62, False),
+        ]),
+        (1177, 'Tumaini Investments Limited', 'PVT/2014/88213', '+254720001177',
+         'info@tumaini.co.ke', True, [
+             ('Tatu City Villas', 'V7', 21_500_000, 0.35, True),
+             ('Tatu City Villas', 'V8', 21_500_000, 0.35, True),
+         ]),
+        # Punctuated differently on each side ('C.088310' vs 'C/088310'): the bridge
+        # normalises before comparing, so this still resolves to the bank record.
+        (1503, 'Kipchoge Farms Cooperative', 'C/088310', '+254711001503', None, True, [
+            ('Ngong View Estate', 'A3', 11_200_000, 0.88, False),
+        ]),
+        # On the register with no unit yet - still a client, and the count has to
+        # reconcile, so the row is kept rather than filtered out of existence.
+        (1688, 'Rehema Chepkoech Too', '30114872', '+254701001688', None, False, []),
+    ]
+
+    def _hfdi_row(self, entry):
+        cid, name, idno, phone, email, pin, units = entry
+        return {
+            'client_id': float(cid), 'client_name': name, 'client_idno': idno,
+            'client_phone': phone, 'client_email': email,
+            'client_pin': 'A00' + str(cid) + 'X' if pin else None,
+        }
+
+    def _hfdi_shape(self, entry):
+        cid, name, idno, phone, email, pin, units = entry
+        summary = {
+            'units': len(units),
+            'units_value': sum(u[2] for u in units),
+            'paid_pct': round(sum(u[3] for u in units) / len(units), 3) if units else None,
+            'projects': sorted({u[0] for u in units}),
+        }
+        # The bank bridge, resolved the same way as live: normalised national id.
+        bank = None
+        key = hfdi_ns.normalise_idno(idno)
+        for c in seed.CUSTOMER_INDEX.values():
+            if key and hfdi_ns.normalise_idno(c.get('id_no')) == key:
+                bio = self._bio(c)
+                bank = {'cust_id': c['cust_id'], 'is_staff': self._is_staff(c, bio)}
+                break
+        return hfdi_ns.shape_client(self._hfdi_row(entry), units=summary, bank=bank)
+
+    def search_property_clients(self, query, *, limit=50, unbanked_only=False):
+        raw = (query or '').strip().lower()
+        norm = hfdi_ns.normalise_idno(raw)
+        out = []
+        for entry in self._HFDI_CLIENTS:
+            cid, name, idno, *_ = entry
+            if raw and not (raw in name.lower() or raw == str(cid)
+                            or (len(norm) >= 5 and norm in hfdi_ns.normalise_idno(idno))):
+                continue
+            out.append(self._hfdi_shape(entry))
+        if unbanked_only:
+            out = [c for c in out if not c['hfdi']['bank_cust_id']]
+        out.sort(key=lambda c: (-(c['hfdi']['units_value'] or 0), c['name'] or ''))
+        return out[:int(limit)]
+
+    def get_property_client(self, client_id):
+        for entry in self._HFDI_CLIENTS:
+            if entry[0] == int(client_id):
+                return self._hfdi_shape(entry)
+        return None
+
+    def property_client_coverage(self):
+        total = len(self._HFDI_CLIENTS)
+        banked = sum(1 for e in self._HFDI_CLIENTS if self._hfdi_shape(e)['hfdi']['bank_cust_id'])
+        return {
+            'total': total,
+            'banked': banked,
+            'unbanked': total - banked,
+            'owners': sum(1 for e in self._HFDI_CLIENTS if e[6]),
+            'units': sum(len(e[6]) for e in self._HFDI_CLIENTS),
+            'note': hfdi_ns.coverage_note(total, banked),
+        }
+
     def get_properties(self, cust_id):
+        hfdi_client = hfdi_ns.parse_id(cust_id)
+        if hfdi_client is not None:
+            for entry in self._HFDI_CLIENTS:
+                if entry[0] == hfdi_client:
+                    units = [{'unit': u[1], 'project': u[0], 'value': u[2],
+                              'paid_pct': u[3], 'mortgage': u[4]} for u in entry[6]]
+                    if not units:
+                        return None
+                    units.sort(key=lambda p: p['value'], reverse=True)
+                    return {'properties': units}
+            return None
         # Mirrors the live HFDI shape: distinct units with value, % paid, mortgage.
-        c = seed.CUSTOMER_INDEX[cust_id]
-        if not c['flags'].get('mortgage'):
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None or not c['flags'].get('mortgage'):
             return None
         r = _rng(cust_id + 'prop')
         n = 1 + int(r.next() * 2.4)
@@ -572,7 +705,9 @@ class MockWarehouse(WarehouseGateway):
         return {'properties': props}
 
     def get_bancassurance(self, cust_id, period):
-        c = seed.CUSTOMER_INDEX[cust_id]
+        c = seed.CUSTOMER_INDEX.get(cust_id)
+        if c is None:
+            return None
         insurable = c['flags'].get('ipf') or c['flags'].get('mortgage') or c['flags'].get('asset_finance')
         if not insurable:
             return None

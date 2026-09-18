@@ -156,6 +156,14 @@ def recommend_for_customer(
     if not customer:
         return RecommendationResult('ok', [], [], {'gate_evaluable': False, 'note': 'Unknown customer.'})
 
+    # An HFDI property client with no bank record is an ACQUISITION lead, not a
+    # cross-sell one. The ranker below reasons from a gap between what a customer
+    # holds and what their peers hold; run on somebody who holds nothing and belongs
+    # to no peer group, it invents both. See _acquisition_result.
+    hfdi = customer.get('hfdi')
+    if hfdi and not hfdi.get('bank_cust_id'):
+        return _acquisition_result(customer, hfdi)
+
     # Prefer the trained ML model; fall back to the rule engine when it isn't available
     # OR when it yields no *confident* pick for this customer (an empty list). The rules
     # are specific and auditable, so a weak ML guess never crowds out an honest rule —
@@ -201,6 +209,62 @@ def recommend_for_customer(
     except Exception:
         profile = None
     return _result_from(ranked, profile)
+
+
+def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
+    """What to say to somebody who owns an HF property and banks somewhere else.
+
+    Built only from facts on the register - unit count, value, how much is paid -
+    with no propensity score and no peer comparison, because neither exists for a
+    person the bank has never held. The eligibility gate is reported as not
+    evaluable, which is the truth: risk and KYC are derived from banking history.
+    """
+    units = int(hfdi.get('units') or 0)
+    value = float(hfdi.get('units_value') or 0)
+    paid = hfdi.get('paid_pct')
+    if not units:
+        return RecommendationResult(
+            'ok', [], [], {'gate_evaluable': False,
+                           'note': 'On the HFDI register with no unit yet — nothing to base '
+                                   'a recommendation on.'},
+            engine_version='acquisition-v1')
+
+    unit_word = 'unit' if units == 1 else 'units'
+    holding = f'{units} {unit_word} worth KES {value:,.0f}'
+    candidates = [Candidate(
+        product='transaction_account',
+        product_name='Transaction account',
+        domain='HFCB',
+        reason=(f'Owns {holding} through HFDI but holds no HF bank account. '
+                f'The instalment payments already go somewhere — an account here is '
+                f'the natural first product.'),
+        reason_short='Property owner, no bank account',
+        rule_id='acq.property.1',
+        base_score=min(1.0, value / 50_000_000),
+    )]
+    # Part-paid means a live payment stream and a financing conversation. Fully paid
+    # (or unpaid) does not, so the second prompt is only offered when it applies.
+    if paid is not None and 0.05 < paid < 0.95:
+        candidates.append(Candidate(
+            product='mortgage',
+            product_name='Mortgage / property finance',
+            domain='HFCB',
+            reason=(f'{round(paid * 100)}% paid on {holding}. The balance is being financed '
+                    f'somewhere; HF can refinance the remainder.'),
+            reason_short=f'{round(paid * 100)}% paid, balance financed elsewhere',
+            rule_id='acq.property.2',
+            base_score=0.5,
+        ))
+    return RecommendationResult(
+        'ok',
+        [_to_item(c, eligible=True) for c in candidates],
+        [],
+        {'gate_evaluable': False,
+         'note': 'Acquisition lead from the HFDI property register. Risk and KYC are '
+                 'derived from banking history, so no eligibility gate can run until '
+                 'they open an account.'},
+        engine_version='acquisition-v1',
+    )
 
 
 def _result_from(ranked: list[Candidate], profile: dict | None,
