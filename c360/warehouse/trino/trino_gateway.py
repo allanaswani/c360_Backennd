@@ -704,13 +704,124 @@ class TrinoWarehouse(WarehouseGateway):
             'segments': [{'segment': self._clean(s.get('segment')) or 'Unsegmented',
                           'customers': int(s.get('n') or 0), 'aum': round(_n(s.get('aum')))}
                          for s in segs],
-            'top_customers': [{'cust_id': str(t.get('cust_id') or '').strip(),
-                               'name': self._clean(t.get('customer_name')),
-                               'segment': self._clean(t.get('segment')),
-                               'aum': round(_n(t.get('aum'))),
-                               'contribution': round(_n(t.get('contribution'))),
-                               'npl': bool(_n(t.get('npl')) or 0)} for t in top],
+            'top_customers': self._verify_against_live(
+                [{'cust_id': str(t.get('cust_id') or '').strip(),
+                  'name': self._clean(t.get('customer_name')),
+                  'segment': self._clean(t.get('segment')),
+                  'aum': round(_n(t.get('aum'))),
+                  'contribution': round(_n(t.get('contribution'))),
+                  'npl_snapshot': bool(_n(t.get('npl')) or 0)} for t in top]),
         }
+
+    def live_loan_standing(self, cust_ids: list[int]) -> dict[int, dict[str, Any]]:
+        """Where each customer's lending actually stands at the latest close.
+
+        eom_loans is the only delinquency source that moves daily; npl_accounts is a
+        monthly file and was three months behind when this was written. Classification
+        is taken worst-first across the customer's accounts, so one Overdue facility
+        makes the customer Overdue even when the rest are Normal.
+
+        Returns {cust_id: {'status', 'npl', 'loans', 'accounts'}} for customers that
+        have at least one loan row; a customer absent from the result has no live
+        lending, which is NOT the same as performing and is why the caller checks
+        deposits too before calling anyone closed.
+        """
+        ids = [i for i in {self._cid(c) for c in cust_ids} if i is not None]
+        if not ids:
+            return {}
+        inlist = ','.join(str(i) for i in ids)
+        d, p = self._as_of_lit(), self._asof_part()
+        rows = self._t.execute(
+            f"SELECT cust_id, TRIM(loan_status_ind_name) status, count(*) accounts, "
+            f"SUM(gross_total) gross FROM delta.gold_db.eom_loans "
+            f"WHERE eom_date = {d} {p} AND cust_id IN ({inlist}) GROUP BY cust_id, 2")
+        # Worst classification wins. 'Normal' is the only performing value in the
+        # live vocabulary (the others are 'Overdue' and 'Write Off').
+        rank = {'NORMAL': 0, 'OVERDUE': 1, 'WRITE OFF': 2}
+        out: dict[int, dict[str, Any]] = {}
+        for r in rows:
+            cid = self._cid(r.get('cust_id'))
+            if cid is None:
+                continue
+            status = self._clean(r.get('status')) or 'Unclassified'
+            entry = out.setdefault(cid, {'status': status, 'npl': False, 'loans': 0.0,
+                                         'accounts': 0})
+            entry['loans'] += float(r.get('gross') or 0)
+            entry['accounts'] += int(r.get('accounts') or 0)
+            if rank.get(status.upper(), 0) >= rank.get(str(entry['status']).upper(), 0):
+                entry['status'] = status
+        for entry in out.values():
+            entry['npl'] = str(entry['status']).upper() in ('OVERDUE', 'WRITE OFF')
+            entry['loans'] = round(entry['loans'])
+        return out
+
+    def live_deposit_totals(self, cust_ids: list[int]) -> dict[int, float]:
+        """Deposit balance per customer at the latest close, for customers that have one."""
+        ids = [i for i in {self._cid(c) for c in cust_ids} if i is not None]
+        if not ids:
+            return {}
+        inlist = ','.join(str(i) for i in ids)
+        d, p = self._as_of_lit(), self._asof_part()
+        rows = self._t.execute(
+            f"SELECT cust_id, SUM(book_balance) bal, count(*) accounts "
+            f"FROM delta.gold_db.eom_deposits WHERE eom_date = {d} {p} "
+            f"AND cust_id IN ({inlist}) GROUP BY cust_id")
+        return {self._cid(r['cust_id']): float(r.get('bal') or 0)
+                for r in rows if self._cid(r.get('cust_id')) is not None}
+
+    def _verify_against_live(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reconcile snapshot rows against the live book, and say where they disagree.
+
+        The snapshot is not overwritten quietly. Each row carries what the snapshot
+        said, what the live book says, and a flag when the two differ - an RM who was
+        shown a wrong badge yesterday needs to see that it was corrected, not just
+        find a different answer today with no explanation.
+        """
+        if not rows:
+            return rows
+        ids = [r['cust_id'] for r in rows]
+        try:
+            standing = self.live_loan_standing(ids)
+            deposits = self.live_deposit_totals(ids)
+        except Exception:
+            # Live check unavailable: fall back to the snapshot, but say so rather
+            # than presenting an unverified flag as if it had been checked.
+            logger.warning('book: live verification failed, falling back to snapshot',
+                           exc_info=True)
+            for r in rows:
+                r['npl'] = r.pop('npl_snapshot', False)
+                r['npl_source'] = 'snapshot'
+                r['verified'] = False
+            return rows
+
+        out = []
+        for r in rows:
+            cid = self._cid(r['cust_id'])
+            live = standing.get(cid)
+            bal = deposits.get(cid)
+            snap = r.pop('npl_snapshot', False)
+            if live is not None:
+                r['npl'] = live['npl']
+                r['npl_source'] = 'live'
+                r['live_status'] = live['status']
+                r['live_loans'] = live['loans']
+            else:
+                # No live lending. That is not evidence of performing, so the badge
+                # is dropped rather than flipped to a confident 'performing'.
+                r['npl'] = False
+                r['npl_source'] = 'no_live_lending'
+                r['live_status'] = None
+                r['live_loans'] = 0
+            r['verified'] = True
+            r['npl_was_snapshot'] = snap
+            r['npl_corrected'] = bool(snap) != bool(r['npl'])
+            r['live_deposits'] = round(bal) if bal is not None else None
+            # Closed: nothing lent and no deposit balance left. Chandarana Supermarket
+            # sat at the top of a book on KES 9.31M of snapshot AUM in exactly this
+            # state, three months after the customer closed the account.
+            r['closed'] = live is None and (bal is None or abs(bal) < 1)
+            out.append(r)
+        return out
 
     # 'INTERNAL ACCOUNTS' is the bank's own ledger/clearing/suspense estate (CBK
     # clearing, M-Pesa float, treasury margin, nostro) — NOT customers. They carry
