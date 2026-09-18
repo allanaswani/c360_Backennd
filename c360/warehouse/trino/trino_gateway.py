@@ -2914,7 +2914,7 @@ class TrinoWarehouse(WarehouseGateway):
             cn = self._clean(r.get('client_no')) or ''
             out.append(ins_reg.shape_client(
                 r, policies=policies.get(cn), bank=banked.get(cn),
-                receipts={'receipts': receipts.get(self._name_key(r.get('name')), 0)},
+                receipts={'receipts': receipts.get(self._name_key(r.get('name')))},
                 name_key=self._name_key(r.get('name'))))
         return out
 
@@ -3017,6 +3017,7 @@ class TrinoWarehouse(WarehouseGateway):
 
         receipts_only = self._ins_receipts_only_count()
         banked = self._ins_banked_by_id()
+        receipts_reach = self._ins_receipt_reach()
 
         if banked is None:
             note = (f'{total:,} clients on the insurance register.'
@@ -3028,15 +3029,39 @@ class TrinoWarehouse(WarehouseGateway):
             # phone half cannot be run across the whole register on a page load.
             note += ' Matched on national ID; a client sharing only a phone number is not counted.'
 
+        if receipts_reach is not None and total:
+            note += (f' Premium receipts are on file for {receipts_reach:,} of them; '
+                     f'the receipts feed does not cover the rest.')
         out = {
             'total': total,
             'banked': banked,
             'unbanked': (max(total - banked, 0) if banked is not None else None),
             'receipts_only': receipts_only or 0,
+            'receipts_reach': receipts_reach,
             'note': note,
         }
         cache.set('c360:ins:coverage', out, 3600)
         return out
+
+    def _ins_receipt_reach(self) -> int | None:
+        """Register clients the premium-receipts feed actually has a row for.
+
+        7,757 of 16,952 at the last measurement. Stated on the page because without
+        it a blank receipts column reads as "this client has never paid" rather than
+        "the feed stops short of them".
+        """
+        try:
+            rows = self._t.execute(
+                f"WITH r AS (SELECT DISTINCT {self._sql_name_key('receipt_client')} k "
+                "             FROM delta.gold_db.hfbi_receipt_data "
+                "            WHERE TRIM(COALESCE(receipt_client, '')) <> '') "
+                f"SELECT count(*) n FROM (SELECT DISTINCT {self._sql_name_key('name')} k "
+                "   FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL) h "
+                "JOIN r ON r.k = h.k")
+        except Exception:
+            logger.warning('insurance coverage: receipt reach failed', exc_info=True)
+            return None
+        return int(rows[0].get('n') or 0) if rows else None
 
     def _ins_receipts_only_count(self) -> int | None:
         """Names in the premium receipts with no row on the register."""

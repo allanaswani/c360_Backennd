@@ -138,7 +138,12 @@ def shape_client(row: dict, *, policies: dict | None = None, receipts: dict | No
             'active_policies': int(p.get('active') or 0),
             'premium': round(float(p.get('premium') or 0)),
             'sum_insured': round(float(p.get('sum_insured') or 0)),
-            'receipts': int(r.get('receipts') or 0),
+            # None when the receipts feed holds no row for this client, which is
+            # 54% of the register. 0 would mean it holds rows summing to nothing,
+            # and that never happens - so a bare 0 reads as 'never paid' about a
+            # client the feed simply does not cover.
+            'receipts': (None if r.get('receipts') is None
+                         else int(r.get('receipts') or 0)),
             # True when the register never got this client and the only evidence they
             # exist is the premiums they have paid.
             'receipts_only': client_no is None,
