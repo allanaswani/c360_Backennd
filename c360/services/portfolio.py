@@ -109,8 +109,9 @@ def _assemble_whole_book(wb: dict[str, Any], period: ResolvedPeriod) -> dict[str
         'risk_distribution': {
             'question': 'How exposed is the book right now?',
             'status': DERIVED,
-            'note': 'Derived across the whole book from balance-sheet leverage (loans vs deposits) — '
-                    'a book-level proxy; per-customer risk also factors loan performance & KYC.',
+            'note': 'Derived across the whole book from balance-sheet leverage (loans vs '
+                    'deposits). This is a book-level proxy; per-customer risk also '
+                    'factors in loan performance and KYC.',
             'rows': wb['risk_rows'],
         },
         'book_trend': {
@@ -189,7 +190,7 @@ def _build_from_roster(gateway: WarehouseGateway, sales_codes: list[str] | None,
             'deposits': _walk(tot_dep or 1, 0.35, dates, 'pf-dep' + _sk(sales_codes)),
             'loans': _walk(tot_loan or 1, 0.18, dates, 'pf-loan' + _sk(sales_codes), vol=0.03),
         }
-        book_note = 'Portfolio book trend — preview until the nightly summary table is built.'
+        book_note = 'Portfolio book trend, shown as preview until the nightly summary table is built.'
         seg_names = [s['segment'] for s in segment_mix]
         seg_series = {s['segment']: _walk(s['value'] or 1, 0.3 + 0.1 * (i % 3), dates, f'pf-seg{i}')
                       for i, s in enumerate(segment_mix)}
@@ -199,9 +200,9 @@ def _build_from_roster(gateway: WarehouseGateway, sales_codes: list[str] | None,
             for name in seg_names:
                 row[name] = seg_series[name][idx]['balance']
             seg_trend_data.append(row)
-        seg_note = 'Segment value trend — preview until per-period history is materialised.'
+        seg_note = 'Segment value trend, shown as preview until per-period history is materialised.'
         movers = _simulated_movers(customers)
-        movers_note = 'Period-over-period movement needs a historical snapshot — simulated for now.'
+        movers_note = 'Period-over-period movement needs a historical snapshot, so it is simulated for now.'
 
     # In live mode Level 1 is served from a bounded real sample (the whole-book
     # roll-up is nightly-precompute territory, §6). Say so — never imply the sample
@@ -213,8 +214,8 @@ def _build_from_roster(gateway: WarehouseGateway, sales_codes: list[str] | None,
             'customers_in_view': n,
             'live_sample': live_sample,
             'sample_note': (
-                f'Live sample of {n:,} real customers — whole-book aggregation runs in the '
-                'nightly precompute (not a live full-book scan).' if live_sample else None),
+                f'Live sample of {n:,} real customers. Whole-book aggregation runs in the '
+                'nightly precompute, not as a live full-book scan.' if live_sample else None),
         },
         'period': period.to_dict(),
         'summary': {
@@ -233,8 +234,9 @@ def _build_from_roster(gateway: WarehouseGateway, sales_codes: list[str] | None,
         'risk_distribution': {
             'question': 'How exposed is the book right now?',
             'status': DERIVED,
-            'note': 'Derived from balance-sheet leverage (loans vs deposits) across the sample — '
-                    'a book-level proxy; per-customer risk also factors loan performance & KYC.',
+            'note': 'Derived from balance-sheet leverage (loans vs deposits) across the '
+                    'sample. This is a book-level proxy; per-customer risk also '
+                    'factors in loan performance and KYC.',
             'rows': risk_rows,
         },
         'book_trend': {

@@ -13,7 +13,7 @@ What is deliberately NOT here, and must not be changed with the brand:
 
 * ``delta.gold_db.hfdi_client_data`` and every other warehouse table name.
 * The ``hfcb`` domain key in the API path and payloads, and the ``HFCBDomain`` type.
-* The ``HFDI-`` customer-id prefix (``c360.hfdi.PREFIX``) — it is in URLs, in the
+* The ``the property register-`` customer-id prefix (``c360.property_register.PREFIX``) — it is in URLs, in the
   audit trail and in logged recommendation outcomes going back months.
 * The ``hfdi_admin`` role name, which arrives in portfolio-issued JWT claims.
 * ``RecommendationFeedback.domain``, whose stored values are historical records of
@@ -32,8 +32,8 @@ from __future__ import annotations
 #: The banking entity - core banking.
 BANK = 'HFCB'
 
-#: The property development arm, whose client register the property-clients page lists.
-PROPERTY = 'HFDI'
+#: The property arm, whose client register the property-clients page lists.
+PROPERTY = 'HFCB Properties'
 
 #: The bancassurance arm behind the insurance CRM panel.
 INSURANCE = 'HFBI'
@@ -54,10 +54,9 @@ DOMAIN_LABELS = {
     'insurance': 'Bancassurance',
 }
 
-#: How a property client's segment reads on screen. They are customers of the group,
-#: so "client" alone would be a distinction without a difference to an RM - the label
-#: has to carry the fact that there is no bank relationship.
-PROPERTY_CLIENT_SEGMENT = f'{PROPERTY} property client'
+#: How a property client's segment reads on screen. Built from PROPERTY so the
+#: entity name and the segment label can never disagree.
+PROPERTY_CLIENT_SEGMENT = f'{PROPERTY} client'
 
 #: Sender name on emailed reports and alerts.
 REPORT_SENDER_NAME = f'{BANK} Customer 360 Reports'

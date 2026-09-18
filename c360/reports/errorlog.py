@@ -73,7 +73,7 @@ def build(window_minutes: int = 60) -> dict | None:
             limit=10, tone_key='tone'),
     ]
 
-    subject = (f"[C360] Error log — {len(server):,} server / {len(client):,} client "
+    subject = (f"[C360] Error log: {len(server):,} server / {len(client):,} client "
                f"({window_text})")
     html = render.shell(
         title='Error log',
@@ -85,7 +85,7 @@ def build(window_minutes: int = 60) -> dict | None:
     text = render.to_text(subject, [
         f'{len(server):,} server errors (5xx), {len(client):,} client errors (4xx) in the {window_text}.',
         '',
-        *[f"{b['status']} {b['method']} {b['route']} — {b['count']}x" for b in top[:20]],
+        *[f"{b['status']} {b['method']} {b['route']} ({b['count']}x)" for b in top[:20]],
     ])
 
     return {

@@ -30,7 +30,7 @@ CATALOG = {
 COMPLEMENTS = [
     {
         'held': 'mortgage', 'suggest': 'ipf', 'suggest_domain': brand.DOMAIN_LABELS['bank'],
-        'reason': 'Holds a mortgage but no insurance premium finance — cover the property risk on the loan.',
+        'reason': 'Holds a mortgage but no insurance premium finance, so the property risk on the loan is uncovered.',
     },
     {
         'held': 'mortgage', 'suggest': 'home_cover', 'suggest_domain': 'Bancassurance',
@@ -38,15 +38,15 @@ COMPLEMENTS = [
     },
     {
         'held': 'asset_finance', 'suggest': 'asset_cover', 'suggest_domain': 'Bancassurance',
-        'reason': 'Financing an asset with no asset insurance — a natural attach.',
+        'reason': 'Financing an asset with no asset insurance, which is a natural attach.',
     },
     {
         'held': 'asset_finance', 'suggest': 'mobile', 'suggest_domain': brand.DOMAIN_LABELS['bank'],
-        'reason': 'Active borrower not yet on mobile banking — push digital servicing.',
+        'reason': 'Active borrower not yet on mobile banking, so digital servicing is the obvious next step.',
     },
     {
         'held': 'trade', 'suggest': 'overdraft', 'suggest_domain': brand.DOMAIN_LABELS['bank'],
-        'reason': 'Trade-finance customer with no overdraft — likely needs working-capital headroom.',
+        'reason': 'Trade-finance customer with no overdraft, so they likely need working-capital headroom.',
     },
     {
         'held': 'current', 'suggest': 'savings', 'suggest_domain': brand.DOMAIN_LABELS['bank'],
@@ -57,7 +57,7 @@ COMPLEMENTS = [
 # Products that make sense to recommend when Rule C (peer gap) fires but no
 # specific complement matched — ordered by general priority for retail/SME.
 GENERIC_GROWTH_PRODUCTS = [
-    ('mobile', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings — start with mobile banking to deepen the relationship.'),
-    ('savings', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings — a savings product is the natural next step.'),
-    ('overdraft', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings — an overdraft facility fits this profile.'),
+    ('mobile', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings. Mobile banking is the place to start.'),
+    ('savings', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings. A savings product is the natural next step.'),
+    ('overdraft', brand.DOMAIN_LABELS['bank'], 'Below the segment average on product holdings. An overdraft facility fits this profile.'),
 ]

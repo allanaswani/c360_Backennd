@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from .. import hfdi as hfdi_ns
+from .. import property_register as prop_reg
 from .. import brand
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.provenance import Provenance, derived, live, to_source
@@ -59,17 +59,16 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
 
     e.g. 'Mass customer of 8 years with the bank. Holds KES 2.1M in deposits against
     KES 1.3M in loans — KES 0.8M net. Low risk.'"""
-    # An HFDI property client has no bank relationship for this sentence to describe.
-    # The generic template produces 'HFDI property client customer.' - true of nobody
+    # An property client has no bank relationship for this sentence to describe.
+    # The generic template produces 'property client customer.' - true of nobody
     # and useful to no one - so these get a sentence about what they DO hold.
-    h = header.get('hfdi')
+    h = header.get('property_client')
     if h:
         if h.get('bank_cust_id'):
-            lead = (f'On the {brand.PROPERTY} property register, and a bank customer in '
+            lead = (f'On the {brand.PROPERTY} register, and a bank customer in '
                     f'their own right.')
         else:
-            lead = (f'On the {brand.PROPERTY} property register only — no account '
-                    f'with the bank.')
+            lead = (f'On the {brand.PROPERTY} register only, with no account here.')
         if h.get('units'):
             where = f' in {_join_human(h.get("projects") or [])}' if h.get('projects') else ''
             paid = h.get('paid_pct')
@@ -100,7 +99,7 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
 
     if dep > 0 and loan > 0:
         net_txt = f'{_kes_short(net)} net' if net >= 0 else f'{_kes_short(-net)} net borrowing'
-        parts.append(f'Holds {_kes_short(dep)} in deposits against {_kes_short(loan)} in loans — {net_txt}.')
+        parts.append(f'Holds {_kes_short(dep)} in deposits against {_kes_short(loan)} in loans, {net_txt}.')
     elif dep > 0:
         parts.append(f'Holds {_kes_short(dep)} in deposits, no active lending.')
     elif loan > 0:
@@ -152,7 +151,7 @@ def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, A
 
 
 def _build_crm(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any] | None:
-    """Subsidiary CRM panels: property-sales leads (HFDI, phone-matched) and the insurance
+    """Subsidiary CRM panels: property-sales leads (the property register, phone-matched) and the insurance
     CRM profile (HFBI, national-ID bridged). Returns {'property_leads':…, 'insurance':…}
     with either sub-key None when absent, or None overall when the customer has neither —
     so the frontend renders nothing rather than an empty shell. Never raises."""
@@ -228,7 +227,7 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     # allocation); 'onboarding' = the account-opening officer we fall back to when the
     # allocation source is unavailable. Label the fallback so a stale name is never
     # shown as the current RM (no rm_source, e.g. mock/preview, carries no caveat).
-    rm_note = ('Account-opening officer — current RM allocation not available.'
+    rm_note = ('Account-opening officer. The current RM allocation is not available.'
                if c.get('rm_source') == 'onboarding' and c.get('rm_name') else None)
 
     # Previous RM (reassignment signal) from the allocation base, shown only when it
@@ -244,12 +243,12 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
 
     return {
         'cust_id': c['cust_id'],
-        # Present ONLY for an HFDI property client. The page keys off it to say, in
+        # Present ONLY for an property client. The page keys off it to say, in
         # one line at the top, that this is not a bank customer - otherwise a screen
         # full of zeroes and 'not sourced' badges reads as a broken page rather than
         # an accurate one. Carries the bank id when the client also banks with us, so
         # the thin profile can hand over to the real one.
-        **({'hfdi': c['hfdi']} if c.get('hfdi') else {}),
+        **({'property_client': c['property_client']} if c.get('property_client') else {}),
         'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
         'identity': {
             'name': live(c['name']).to_dict(),
@@ -376,20 +375,20 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     are declared but PREVIEW/TO_SOURCE until their pipelines land, so the donut
     never shows a phantom slice as if it were real."""
     v = gateway.get_relationship_value(cust_id)
-    # An HFDI property client has no bank relationship at all, and their entire
+    # An property client has no bank relationship at all, and their entire
     # holding with the group is the property. Leaving the Properties row on the
-    # generic 'pending HFDI CRM integration' placeholder would report a known,
+    # generic 'pending the property register CRM integration' placeholder would report a known,
     # exact figure as unsourced - and leave the page reading as if we hold nothing
     # on someone with six units. Their number comes straight off the register.
     hfdi_value = None
-    hfdi_client = hfdi_ns.parse_id(cust_id)
-    if hfdi_client is not None:
+    client_id_int = prop_reg.parse_id(cust_id)
+    if client_id_int is not None:
         try:
-            client = gateway.get_property_client(hfdi_client)
+            client = gateway.get_property_client(client_id_int)
         except Exception:
             client = None
         if client:
-            hfdi_value = client['hfdi']['units_value']
+            hfdi_value = client['property_client']['units_value']
     return {
         'headline': {
             'relationship_value': live(v['relationship_value'], unit='KES').to_dict(),
@@ -401,17 +400,17 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
         'by_domain': [
             {'domain': brand.DOMAIN_LABELS['bank'], 'value': v['relationship_value'],
              'status': Provenance.LIVE.value,
-             **({'note': f'No bank relationship — this client is on the '
-                          f'{brand.PROPERTY} property register only.'}
-                if hfdi_client is not None else {})},
+             **({'note': f'No bank relationship. This client is on the '
+                          f'{brand.PROPERTY} register only.'}
+                if client_id_int is not None else {})},
             {'domain': brand.DOMAIN_LABELS['digital'], 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Whizz value pending pipeline from the Kocela MySQL estate.'},
             ({'domain': brand.DOMAIN_LABELS['property'], 'value': hfdi_value,
               'status': Provenance.LIVE.value,
-              'note': f'Total unit value from the {brand.PROPERTY} property register.'}
+              'note': f'Total unit value from the {brand.PROPERTY} register.'}
              if hfdi_value is not None else
              {'domain': brand.DOMAIN_LABELS['property'], 'value': None, 'status': Provenance.TO_SOURCE.value,
-              'note': f'Properties value pending {brand.PROPERTY} CRM integration.'}),
+              'note': f'Properties value pending the {brand.PROPERTY} CRM feed.'}),
             {'domain': brand.DOMAIN_LABELS['insurance'], 'value': None, 'status': Provenance.TO_SOURCE.value,
              'note': 'Customer-level bancassurance value is a known gap (§7A.5).'},
         ],

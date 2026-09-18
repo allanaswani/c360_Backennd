@@ -100,7 +100,7 @@ def build(window_minutes: int, title: str) -> dict:
     if health.get('unavailable'):
         blocks.append(render.callout(
             f"The health check could not run: {health['unavailable']}", tone='bad'))
-        text_lines.append(f"Data health: CHECK FAILED — {health['unavailable']}")
+        text_lines.append(f"Data health: CHECK FAILED. {health['unavailable']}")
     elif not (health.get('checks') or []):
         blocks.append(render.empty(
             'No source checks ran. Source health is only measured against the live '
@@ -175,7 +175,7 @@ def build(window_minutes: int, title: str) -> dict:
             ds_changes['rows'], limit=10))
         text_lines.append(f"Changes: {ds_changes['row_count']} field change(s) (attached).")
 
-    subject = f'[C360] {title} — {now:%a %d %b %Y}'
+    subject = f'[C360] {title}, {now:%a %d %b %Y}'
     if not had_traffic:
         subject += ' · no traffic'
     elif error_rate >= float(getattr(settings, 'C360_ALERT_ERROR_RATE_PCT', 5)):

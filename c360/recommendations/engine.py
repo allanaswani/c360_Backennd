@@ -65,7 +65,7 @@ def _evaluate_gate(profile: dict | None) -> dict[str, Any]:
             'gate_evaluable': False,
             'risk_class': None,
             'kyc_status': None,
-            'note': 'Eligibility gate cannot run — no risk/KYC profile for this customer.',
+            'note': 'Eligibility gate cannot run. There is no risk or KYC profile for this customer.',
         }
     risk = profile['risk']['class']
     kyc = profile['kyc']['status']
@@ -85,7 +85,7 @@ def _evaluate_gate(profile: dict | None) -> dict[str, Any]:
         'basis': 'derived',   # risk/KYC are computed from live data, not a source feed
         'risk_factors': profile['risk'].get('factors', []),
         'kyc_checks': profile['kyc'].get('checks', []),
-        'note': None if passed else 'Held — ' + ' and '.join(reasons) + '.',
+        'note': None if passed else 'Held because ' + ' and '.join(reasons) + '.',
     }
 
 
@@ -157,11 +157,11 @@ def recommend_for_customer(
     if not customer:
         return RecommendationResult('ok', [], [], {'gate_evaluable': False, 'note': 'Unknown customer.'})
 
-    # An HFDI property client with no bank record is an ACQUISITION lead, not a
+    # An property client with no bank record is an ACQUISITION lead, not a
     # cross-sell one. The ranker below reasons from a gap between what a customer
     # holds and what their peers hold; run on somebody who holds nothing and belongs
     # to no peer group, it invents both. See _acquisition_result.
-    hfdi = customer.get('hfdi')
+    hfdi = customer.get('property_client')
     if hfdi and not hfdi.get('bank_cust_id'):
         return _acquisition_result(customer, hfdi)
 
@@ -226,8 +226,8 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
     if not units:
         return RecommendationResult(
             'ok', [], [], {'gate_evaluable': False,
-                           'note': f'On the {brand.PROPERTY} register with no unit yet — nothing to base '
-                                   'a recommendation on.'},
+                           'note': f'On the {brand.PROPERTY} register with no unit yet, so there '
+                                   'is nothing to base a recommendation on.'},
             engine_version='acquisition-v1')
 
     unit_word = 'unit' if units == 1 else 'units'
@@ -236,9 +236,9 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
         product='transaction_account',
         product_name='Transaction account',
         domain=brand.DOMAIN_LABELS['bank'],
-        reason=(f'Owns {holding} through {brand.PROPERTY} but holds no bank account with us. '
-                f'The instalment payments already go somewhere — an account here is '
-                f'the natural first product.'),
+        reason=(f'Owns {holding} through {brand.PROPERTY} but holds no account with us. '
+                f'The instalment payments already go somewhere, so an account here '
+                f'is the natural first product.'),
         reason_short='Property owner, no bank account',
         rule_id='acq.property.1',
         base_score=min(1.0, value / 50_000_000),
@@ -250,8 +250,8 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
             product='mortgage',
             product_name='Mortgage / property finance',
             domain=brand.DOMAIN_LABELS['bank'],
-            reason=(f'{round(paid * 100)}% paid on {holding}. The balance is being financed '
-                    f'somewhere; HF can refinance the remainder.'),
+            reason=(f'{round(paid * 100)}% paid on {holding}. Someone is financing the '
+                    f'balance and it is not us. {brand.BANK} can refinance the rest.'),
             reason_short=f'{round(paid * 100)}% paid, balance financed elsewhere',
             rule_id='acq.property.2',
             base_score=0.5,
@@ -261,10 +261,9 @@ def _acquisition_result(customer: dict, hfdi: dict) -> RecommendationResult:
         [_to_item(c, eligible=True) for c in candidates],
         [],
         {'gate_evaluable': False,
-         'note': f'Acquisition lead from the {brand.PROPERTY} property register. Risk and '
-                 f'KYC are '
-                 'derived from banking history, so no eligibility gate can run until '
-                 'they open an account.'},
+         'note': f'Acquisition lead from the {brand.PROPERTY} register. Risk and KYC '
+                 'are derived from banking history, so no eligibility gate can run '
+                 'until they open an account.'},
         engine_version='acquisition-v1',
     )
 

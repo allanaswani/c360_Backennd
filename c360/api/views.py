@@ -24,7 +24,7 @@ from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
 from ..services import portfolio_cache, property_clients as pc_service
-from .. import hfdi as hfdi_ns
+from .. import property_register as prop_reg
 from .. import brand
 from ..warehouse.factory import data_mode, get_gateway
 from ..warehouse.periods import PRESETS, resolve_period
@@ -74,9 +74,9 @@ class MetaView(APIView):
                 'can_view_portfolio': scope.can_view_portfolio(),
             },
             'provenance_legend': {
-                'live': 'Live data — from queries running today.',
-                'preview': 'Preview data — simulated until the source series is built.',
-                'to_source': 'Not yet sourced — pending a warehouse feed.',
+                'live': 'Live data, from queries running today.',
+                'preview': 'Preview data, simulated until the source series is built.',
+                'to_source': 'Not yet sourced, pending a warehouse feed.',
             },
         })
 
@@ -97,11 +97,11 @@ class CustomerListView(APIView):
 
 
 class PropertyClientListView(APIView):
-    """The HFDI property-client register - the group's property buyers.
+    """The the property register property-client register - the group's property buyers.
 
     Separate from /customers/ because it is a separate universe: these people are in
-    HFDI's register, not the bank's customer master, and most of them hold no bank
-    record at all. See c360/hfdi.py for why they were invisible until now.
+    the property register's register, not the bank's customer master, and most of them hold no bank
+    record at all. See c360/property_register.py for why they were invisible until now.
     """
 
     def get(self, request: Request):
@@ -110,7 +110,8 @@ class PropertyClientListView(APIView):
         if not pc_service.visible_to(scope):
             return Response(
                 {'error': {'status': 403, 'detail': 'The property-client register is '
-                                                    f'available to the management and {brand.PROPERTY} views.'}},
+                                                    f'available to the management and '
+                                                    f'{brand.PROPERTY} views.'}},
                 status=status.HTTP_403_FORBIDDEN)
         unbanked = (request.query_params.get('unbanked') or '').strip().lower() in ('1', 'true', 'yes')
         return Response(pc_service.build_list(
@@ -133,9 +134,9 @@ class CustomerDetailView(APIView):
         if not customer_visible(scope, raw):
             # A property client is in NOBODY's book, so "outside your book" would be
             # a misleading reason to refuse it - it implies another RM holds it.
-            detail = (f'Not allocated to a book. {brand.PROPERTY} property clients are '
-                      f'visible to the management and {brand.PROPERTY} views.'
-                      ) if raw.get('hfdi') else 'Outside your book.'
+            detail = (f'Not allocated to a book. Property clients are visible to the '
+                      f'management and {brand.PROPERTY} views.'
+                      ) if raw.get('property_client') else 'Outside your book.'
             return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
         header = build_customer_header(gateway, cust_id)
@@ -342,11 +343,11 @@ class BookSummaryView(APIView):
         whole = scope.can_view_portfolio() and not sales_code
         if not whole and not sales_code:
             return Response({'available': False,
-                             'detail': 'No sales code on your profile yet — ask an admin to set it so your book can load.'})
+                             'detail': 'No sales code on your profile yet. Ask an admin to set one so your book can load.'})
         summary = get_gateway().get_book_summary(None if whole else sales_code)
         if not summary:
             return Response({'available': False,
-                             'detail': 'Book analytics need the live reporting warehouse — not available in preview mode.'})
+                             'detail': 'Book analytics need the live reporting warehouse, which is not available in preview mode.'})
         return Response({'available': True, **summary})
 
 
@@ -398,7 +399,7 @@ def _annotate_drops(report: dict, prior: dict) -> None:
         c['delta_pct'] = round(change * 100, 1)
         if change <= -_HEALTH_DROP_FRACTION and c.get('status') == 'ok':
             c['status'] = 'warn'
-            c['detail'] = f"{c.get('detail', '')} — down {abs(round(change * 100))}% from {int(prev):,}"
+            c['detail'] = f"{c.get('detail', '')}, down {abs(round(change * 100))}% from {int(prev):,}"
 
 
 def _health_history() -> list[dict]:

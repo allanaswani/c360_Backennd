@@ -15,7 +15,7 @@ from typing import Any
 
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
-from ... import hfdi as hfdi_ns
+from ... import property_register as prop_reg
 from ... import lending as lending_shape
 from ... import relationships as rel_shape
 from ... import risk as risk_derive
@@ -57,10 +57,10 @@ class MockWarehouse(WarehouseGateway):
 
     # --- identity & scope ------------------------------------------------
     def get_customer(self, cust_id: str) -> dict[str, Any] | None:
-        # HFDI ids resolve against the property register, exactly as they do live.
-        hfdi_client = hfdi_ns.parse_id(cust_id)
-        if hfdi_client is not None:
-            return self.get_property_client(hfdi_client)
+        # the property register ids resolve against the property register, exactly as they do live.
+        client_id_int = prop_reg.parse_id(cust_id)
+        if client_id_int is not None:
+            return self.get_property_client(client_id_int)
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if not c:
             return None
@@ -191,7 +191,7 @@ class MockWarehouse(WarehouseGateway):
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if c is None:
             # Same answer the live gateway gives for an id it cannot resolve. An
-            # HFDI property client reaches this: they hold no bank product, and the
+            # property client reaches this: they hold no bank product, and the
             # page must say zero rather than borrow somebody else's balance.
             return {'relationship_value': 0, 'deposits': 0, 'loans': 0, 'revenue': 0}
         return {
@@ -578,14 +578,14 @@ class MockWarehouse(WarehouseGateway):
             'recent': recent,
         }
 
-    # HFDI property clients - the group's property buyers, most of whom hold no bank
+    # the property register property clients - the group's property buyers, most of whom hold no bank
     # account and so have no dim_customer record at all. Live, 3,830 of 4,843
     # register clients are in that position; the preview carries the same two cases
     # so the page can be built and reviewed without the warehouse.
     #
     # (client_id, name, idno, phone, email, has_pin, units)
     # Each unit is (project, unit, value, paid_pct, mortgage).
-    _HFDI_CLIENTS = [
+    _REGISTER_CLIENTS = [
         # Bridges to a seed customer: id_no matches HF-102010 (Zawadi Enterprises),
         # so the panel must offer their real profile rather than this thinner one.
         (415, 'Zawadi Enterprises Ltd', 'C.102844', '+254722000415',
@@ -631,52 +631,52 @@ class MockWarehouse(WarehouseGateway):
         }
         # The bank bridge, resolved the same way as live: normalised national id.
         bank = None
-        key = hfdi_ns.normalise_idno(idno)
+        key = prop_reg.normalise_idno(idno)
         for c in seed.CUSTOMER_INDEX.values():
-            if key and hfdi_ns.normalise_idno(c.get('id_no')) == key:
+            if key and prop_reg.normalise_idno(c.get('id_no')) == key:
                 bio = self._bio(c)
                 bank = {'cust_id': c['cust_id'], 'is_staff': self._is_staff(c, bio)}
                 break
-        return hfdi_ns.shape_client(self._hfdi_row(entry), units=summary, bank=bank)
+        return prop_reg.shape_client(self._hfdi_row(entry), units=summary, bank=bank)
 
     def search_property_clients(self, query, *, limit=50, unbanked_only=False):
         raw = (query or '').strip().lower()
-        norm = hfdi_ns.normalise_idno(raw)
+        norm = prop_reg.normalise_idno(raw)
         out = []
-        for entry in self._HFDI_CLIENTS:
+        for entry in self._REGISTER_CLIENTS:
             cid, name, idno, *_ = entry
             if raw and not (raw in name.lower() or raw == str(cid)
-                            or (len(norm) >= 5 and norm in hfdi_ns.normalise_idno(idno))):
+                            or (len(norm) >= 5 and norm in prop_reg.normalise_idno(idno))):
                 continue
             out.append(self._hfdi_shape(entry))
         if unbanked_only:
-            out = [c for c in out if not c['hfdi']['bank_cust_id']]
-        out.sort(key=lambda c: (-(c['hfdi']['units_value'] or 0), c['name'] or ''))
+            out = [c for c in out if not c['property_client']['bank_cust_id']]
+        out.sort(key=lambda c: (-(c['property_client']['units_value'] or 0), c['name'] or ''))
         return out[:int(limit)]
 
     def get_property_client(self, client_id):
-        for entry in self._HFDI_CLIENTS:
+        for entry in self._REGISTER_CLIENTS:
             if entry[0] == int(client_id):
                 return self._hfdi_shape(entry)
         return None
 
     def property_client_coverage(self):
-        total = len(self._HFDI_CLIENTS)
-        banked = sum(1 for e in self._HFDI_CLIENTS if self._hfdi_shape(e)['hfdi']['bank_cust_id'])
+        total = len(self._REGISTER_CLIENTS)
+        banked = sum(1 for e in self._REGISTER_CLIENTS if self._hfdi_shape(e)['property_client']['bank_cust_id'])
         return {
             'total': total,
             'banked': banked,
             'unbanked': total - banked,
-            'owners': sum(1 for e in self._HFDI_CLIENTS if e[6]),
-            'units': sum(len(e[6]) for e in self._HFDI_CLIENTS),
-            'note': hfdi_ns.coverage_note(total, banked),
+            'owners': sum(1 for e in self._REGISTER_CLIENTS if e[6]),
+            'units': sum(len(e[6]) for e in self._REGISTER_CLIENTS),
+            'note': prop_reg.coverage_note(total, banked),
         }
 
     def get_properties(self, cust_id):
-        hfdi_client = hfdi_ns.parse_id(cust_id)
-        if hfdi_client is not None:
-            for entry in self._HFDI_CLIENTS:
-                if entry[0] == hfdi_client:
+        client_id_int = prop_reg.parse_id(cust_id)
+        if client_id_int is not None:
+            for entry in self._REGISTER_CLIENTS:
+                if entry[0] == client_id_int:
                     units = [{'unit': u[1], 'project': u[0], 'value': u[2],
                               'paid_pct': u[3], 'mortgage': u[4]} for u in entry[6]]
                     if not units:
@@ -684,7 +684,7 @@ class MockWarehouse(WarehouseGateway):
                     units.sort(key=lambda p: p['value'], reverse=True)
                     return {'properties': units}
             return None
-        # Mirrors the live HFDI shape: distinct units with value, % paid, mortgage.
+        # Mirrors the live the property register shape: distinct units with value, % paid, mortgage.
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if c is None or not c['flags'].get('mortgage'):
             return None

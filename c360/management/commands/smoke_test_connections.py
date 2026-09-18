@@ -25,7 +25,7 @@ PROBES = [
      '0 = risk still unsourced -> eligibility gate stays pending'),
     ('eom_deposits reachable', 'SELECT COUNT(*) AS n FROM delta.gold_db.eom_deposits LIMIT 1', 'deposit snapshot'),
     ('eom_loans reachable', 'SELECT COUNT(*) AS n FROM delta.gold_db.eom_loans LIMIT 1', 'loan snapshot'),
-    ('hfdi_client_data (properties)', 'SELECT COUNT(*) AS n FROM delta.gold_db.hfdi_client_data', 'HFDI clients'),
+    ('hfdi_client_data (properties)', 'SELECT COUNT(*) AS n FROM delta.gold_db.hfdi_client_data', 'the property register clients'),
     ('customers_whizz (digital)', 'SELECT COUNT(*) AS n FROM delta.gold_db.customers_whizz', 'Whizz customers'),
 ]
 

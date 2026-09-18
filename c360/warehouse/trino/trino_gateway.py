@@ -18,7 +18,7 @@ disbursement balance series (grouped per EOM day), transaction-value trend / cha
 mix / recent transactions (from the purpose-built ``rpt_c360_*`` summary tables), and
 a *bounded* live portfolio sample for Level 1.
 
-Whizz (KOCELA transactions + customers_whizz profile) and Properties (HFDI, bridged by
+Whizz (KOCELA transactions + customers_whizz profile) and Properties (the property register, bridged by
 national ID, deduped by unit_id) are now live too. Still deferred (raise
 ``LiveDataNotReady`` so the service degrades to an honest empty state rather than a wrong
 number): Bancassurance and the true whole-book segment benchmark.
@@ -34,7 +34,7 @@ from typing import Any
 from ... import credit_bureau as bureau_shape
 from ... import brand
 from ... import crm as crm_shape
-from ... import hfdi as hfdi_ns
+from ... import property_register as prop_reg
 from ... import lending as lending_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
@@ -801,15 +801,15 @@ class TrinoWarehouse(WarehouseGateway):
 
     # --- identity (dim_customer only → guaranteed one row) ---------------
     def get_customer(self, cust_id: str) -> dict[str, Any] | None:
-        # An HFDI id resolves against the property register instead of the bank's
+        # An the property register id resolves against the property register instead of the bank's
         # customer master. Routing it here rather than in the view means the customer
         # page, the scope check and the staff sieve all work on these records
         # unchanged - and every OTHER gateway method still parses the id through
         # _cid(), which rejects it, so no bank figure can ever be attached to a
         # client who has no bank relationship.
-        hfdi_client = hfdi_ns.parse_id(cust_id)
-        if hfdi_client is not None:
-            return self.get_property_client(hfdi_client)
+        client_id_int = prop_reg.parse_id(cust_id)
+        if client_id_int is not None:
+            return self.get_property_client(client_id_int)
         cid = self._cid(cust_id)
         if cid is None:
             return None
@@ -2007,19 +2007,19 @@ class TrinoWarehouse(WarehouseGateway):
         }
 
     def get_properties(self, cust_id):
-        """HFDI properties for a bank customer. Bridged by national ID
+        """the property register properties for a bank customer. Bridged by national ID
         (dim_customer.customer_id_no = hfdi client_idno), sourced from the pre-built
         rpt_c360_customer_property table. That table is event-sourced and repeats
         each unit many times, so we DEDUPE by unit_id (GROUP BY) before summing —
         rpt_c360_property_value's own totals are inflated by that duplication and are
-        NOT trusted. Returns None when the customer owns no HFDI unit."""
-        # An HFDI client owns their units directly - no national-ID bridge needed,
+        NOT trusted. Returns None when the customer owns no the property register unit."""
+        # An the property register client owns their units directly - no national-ID bridge needed,
         # and none available for the 78% who are not bank customers. The property
         # table keys on client_id, so this is the exact path rather than the
         # best-effort one the bank side has to use.
-        hfdi_client = hfdi_ns.parse_id(cust_id)
-        if hfdi_client is not None:
-            return self._properties_for_units(self._property_units_by_client(hfdi_client))
+        client_id_int = prop_reg.parse_id(cust_id)
+        if client_id_int is not None:
+            return self._properties_for_units(self._property_units_by_client(client_id_int))
         cid = self._cid(cust_id)
         if cid is None:
             return None
@@ -2045,7 +2045,7 @@ class TrinoWarehouse(WarehouseGateway):
         return self._properties_for_units(units)
 
     def _property_units_by_client(self, client_id: int) -> list[dict[str, Any]]:
-        """HFDI units owned by one property-register client, deduped by unit_id.
+        """the property register units owned by one property-register client, deduped by unit_id.
 
         rpt_c360_customer_property repeats each unit many times (it is event-sourced),
         so this GROUPs before anything sums - the same reason the bank-side query
@@ -2083,9 +2083,9 @@ class TrinoWarehouse(WarehouseGateway):
         properties.sort(key=lambda p: p['value'], reverse=True)
         return {'properties': properties}
 
-    # --- HFDI property clients (their own universe, see c360/hfdi.py) --------
+    # --- the property register property clients (their own universe, see c360/property_register.py) --------
 
-    _HFDI_SELECT = (
+    _REGISTER_SELECT = (
         "SELECT client_id, TRIM(client_name) client_name, TRIM(client_idno) client_idno, "
         "TRIM(client_phone) client_phone, TRIM(client_email) client_email, "
         "TRIM(client_pin) client_pin FROM delta.gold_db.hfdi_client_data "
@@ -2116,7 +2116,7 @@ class TrinoWarehouse(WarehouseGateway):
         return out
 
     def _hfdi_bank_matches(self, idnos: list[str]) -> dict[str, dict[str, Any]]:
-        """Which of these HFDI national IDs belong to a bank customer too.
+        """Which of these the property register national IDs belong to a bank customer too.
 
         Matched on the normalised id (punctuation stripped, upper-cased) because the
         two systems punctuate registration numbers differently. That normalisation is
@@ -2133,7 +2133,7 @@ class TrinoWarehouse(WarehouseGateway):
             f"FROM delta.gold_db.dim_customer WHERE TRIM(customer_id_no) IN ({quoted})")
         out: dict[str, dict[str, Any]] = {}
         for r in rows:
-            key = hfdi_ns.normalise_idno(r.get('idno'))
+            key = prop_reg.normalise_idno(r.get('idno'))
             if not key or key in out:
                 continue
             out[key] = {
@@ -2154,13 +2154,13 @@ class TrinoWarehouse(WarehouseGateway):
         out = []
         for r in rows:
             cid = int(float(r['client_id']))
-            key = hfdi_ns.normalise_idno(r.get('client_idno'))
-            out.append(hfdi_ns.shape_client(r, units=units.get(cid), bank=banked.get(key)))
+            key = prop_reg.normalise_idno(r.get('client_idno'))
+            out.append(prop_reg.shape_client(r, units=units.get(cid), bank=banked.get(key)))
         return out
 
     def search_property_clients(self, query: str, *, limit: int = 50,
                                 unbanked_only: bool = False) -> list[dict[str, Any]]:
-        """Search the HFDI register by name, national ID or client number.
+        """Search the the property register register by name, national ID or client number.
 
         `unbanked_only` narrows to the clients with no bank record - the acquisition
         list, and the reason this universe was opened up at all. It is applied AFTER
@@ -2168,13 +2168,13 @@ class TrinoWarehouse(WarehouseGateway):
         """
         raw = (query or '').strip()
         like = f'%{raw.lower()}%'
-        id_norm = hfdi_ns.normalise_idno(raw)
+        id_norm = prop_reg.normalise_idno(raw)
         id_guard = id_norm if len(id_norm) >= 5 else ''
         # Over-fetch when a filter runs after the query, so the page still fills.
         fetch = min(int(limit) * 4, 400) if unbanked_only else int(limit)
         if raw:
             rows = self._t.execute(
-                self._HFDI_SELECT +
+                self._REGISTER_SELECT +
                 "WHERE client_name IS NOT NULL AND ("
                 "  lower(TRIM(client_name)) LIKE ? "
                 "  OR CAST(CAST(client_id AS BIGINT) AS varchar) = ? "
@@ -2182,23 +2182,23 @@ class TrinoWarehouse(WarehouseGateway):
                 "LIMIT ?", (like, raw, id_guard, f'%{id_norm}%', fetch))
         else:
             rows = self._t.execute(
-                self._HFDI_SELECT + "WHERE client_name IS NOT NULL LIMIT ?", (fetch,))
+                self._REGISTER_SELECT + "WHERE client_name IS NOT NULL LIMIT ?", (fetch,))
         out = self._hfdi_decorate(rows)
         if unbanked_only:
-            out = [c for c in out if not c['hfdi']['bank_cust_id']]
+            out = [c for c in out if not c['property_client']['bank_cust_id']]
         # Biggest holdings first: this is a sales list, not a directory.
-        out.sort(key=lambda c: (-(c['hfdi']['units_value'] or 0), c['name'] or ''))
+        out.sort(key=lambda c: (-(c['property_client']['units_value'] or 0), c['name'] or ''))
         return out[:int(limit)]
 
     def get_property_client(self, client_id: int) -> dict[str, Any] | None:
-        rows = self._t.execute(self._HFDI_SELECT + "WHERE client_id = ? LIMIT 1",
+        rows = self._t.execute(self._REGISTER_SELECT + "WHERE client_id = ? LIMIT 1",
                                (float(client_id),))
         if not rows:
             return None
         return self._hfdi_decorate(rows)[0]
 
     def property_client_coverage(self) -> dict[str, Any] | None:
-        """How much of the HFDI register the bank actually holds a relationship with.
+        """How much of the the property register register the bank actually holds a relationship with.
 
         This is the number that justifies the page existing, so it is measured, not
         asserted - and it is measured over the register itself rather than over the
@@ -2245,7 +2245,7 @@ class TrinoWarehouse(WarehouseGateway):
             'unbanked': max(total - banked, 0),
             'owners': int(r.get('owners') or 0),
             'units': int(r.get('units') or 0),
-            'note': hfdi_ns.coverage_note(total, banked),
+            'note': prop_reg.coverage_note(total, banked),
         }
         cache.set('c360:hfdi:coverage', out, 3600)
         return out
@@ -2295,7 +2295,7 @@ class TrinoWarehouse(WarehouseGateway):
         return {'policies': policies}
 
     def get_property_leads(self, cust_id):
-        """Property-sales CRM (HFDI leads + follow-ups) for a bank customer, matched by
+        """Property-sales CRM (the property register leads + follow-ups) for a bank customer, matched by
         PHONE — the lead export carries no customer/national id, so this is the only
         bridge and it is fuzzy (the caller tags it 'matched by phone'). Only resolves for
         the ~5.8k leads whose phone is also a bank customer's. Returns None when the

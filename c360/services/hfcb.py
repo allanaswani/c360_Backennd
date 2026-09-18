@@ -24,7 +24,7 @@ from ..warehouse.provenance import Provenance, Series, derived, live, to_source
 
 # In mock, per-customer series are a simulated must-build derivation → PREVIEW.
 # In live, they are real (EOM day-grouped balances / rpt_c360 summaries) → LIVE.
-_SERIES_NOTE = 'Per-customer series — preview, derived from the movement tables until the long-format view is built.'
+_SERIES_NOTE = 'Per-customer series, shown as preview. Derived from the movement tables until the long-format view is built.'
 
 
 def _series(key: str, name: str, points: list[dict], status=Provenance.PREVIEW, note=_SERIES_NOTE) -> dict:
@@ -121,7 +121,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
                 'question': 'How do they prefer to interact with us?',
                 'type': 'donut',
                 'status': series_status.value,
-                'note': series_note or 'Channel mix — customer-facing transactions by channel this period.',
+                'note': series_note or 'Channel mix: customer-facing transactions by channel this period.',
                 'slices': [{'channel': c['channel'], 'share': c['share']} for c in channels],
             },
         },
@@ -145,9 +145,9 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
 def _aum_metric(prof: dict | None) -> dict[str, Any]:
     if prof and prof.get('aum') is not None:
         return live(round(prof['aum']), unit='KES',
-                    note=('Assets under management from the portfolio allocation base — a '
-                          'periodic management snapshot, so it can differ from the live '
-                          'deposit/loan balances above.')).to_dict()
+                    note=('Assets under management from the portfolio allocation base, a '
+                          'periodic management snapshot. It can differ from the live '
+                          'deposit and loan balances above.')).to_dict()
     return to_source(unit='KES', note='AUM pending the allocation feed.').to_dict()
 
 
@@ -173,7 +173,7 @@ def _npl_metric(prof: dict | None, loans: float) -> dict[str, Any]:
         if npl:
             return derived('No active loan', note=(
                 'No loan facility in the live book. The allocation snapshot still flags this '
-                'customer non-performing — most likely a loan that has since been cleared or '
+                'customer non-performing, most likely a loan that has since been cleared or '
                 'written off. Re-check once the snapshot is refreshed.')).to_dict()
         return derived('No active loan',
                        note='No loan facility in the live book.').to_dict()
@@ -194,9 +194,9 @@ def _leverage_metric(deposits: float, loans: float) -> dict[str, Any]:
                        note=f'Loan-to-deposit = loans ÷ deposits. {band}.').to_dict()
     if loans and loans > 0:
         return derived(None, unit='ratio', label='Borrowing only',
-                       note='Loans with no deposit balance to offset — leverage not meaningful.').to_dict()
+                       note='Loans with no deposit balance to offset, so leverage is not meaningful.').to_dict()
     return derived(None, unit='ratio', label='No lending',
-                   note='No loan facilities — leverage not applicable.').to_dict()
+                   note='No loan facilities, so leverage does not apply.').to_dict()
 
 
 def _product_holdings_bars(deposit_accts: list[dict], loan_accts: list[dict]) -> list[dict]:

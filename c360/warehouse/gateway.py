@@ -123,7 +123,7 @@ class WarehouseGateway(abc.ABC):
         """Average number of products held by customers in this segment."""
 
     # --- non-core domains (preview until pipelines land) ----------------
-    # Verified source systems exist (Kocela MySQL, HFDI CRM, insurance_policies)
+    # Verified source systems exist (Kocela MySQL, the property register CRM, insurance_policies)
     # but aren't yet piped into the warehouse, so the mock returns preview data
     # and the live gateway raises until the pipeline is built. Each returns None
     # when the customer has no holding in that domain (→ honest empty state).
@@ -150,7 +150,7 @@ class WarehouseGateway(abc.ABC):
         return None
 
     # --- subsidiary CRM (property sales leads / insurance CRM) ----------------
-    # Default: nothing. Live gateways override these. Property leads (HFDI) are matched
+    # Default: nothing. Live gateways override these. Property leads (the property register) are matched
     # by PHONE (the only bridge the lead export carries) — fuzzy, and only for the
     # minority of leads whose phone is a bank customer's. Insurance CRM (HFBI) is the
     # customer record, bridged cleanly by national ID (the HFBI *leads* table is empty).
@@ -200,12 +200,12 @@ class WarehouseGateway(abc.ABC):
     def get_related_parties(self, cust_id: str) -> dict[str, Any] | None:
         return None
 
-    # --- HFDI property clients (optional capability) --------------------------
+    # --- the property register property clients (optional capability) --------------------------
     # The group's property arm keeps its own client register, and most of its buyers
     # never opened a bank account - so they are absent from dim_customer and, until
     # now, from Customer 360 entirely. These three read that register directly. A
     # gateway without it simply has no property-client universe: the list is empty,
-    # no client resolves, and the page says so. See c360/hfdi.py.
+    # no client resolves, and the page says so. See c360/property_register.py.
     def search_property_clients(self, query: str, *, limit: int = 50,
                                 unbanked_only: bool = False) -> list[dict[str, Any]]:
         return []

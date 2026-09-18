@@ -36,17 +36,17 @@ def classify_retention(first_bal: float, last_bal: float) -> dict[str, Any] | No
     # raw % would read as a nonsensical ">100% drop", so we state it plainly instead.
     if last <= 0:
         return {'flag': 'at_risk', 'trend_pct': -1.0,
-                'note': 'Deposits drawn down to nil over the trailing quarter — retention risk.'}
+                'note': 'Deposits drawn down to nil over the trailing quarter. This is a retention risk.'}
 
     change = (last - base) / base
     drop = -change
     if drop >= AT_RISK_DROP:
         return {'flag': 'at_risk', 'trend_pct': round(change, 3),
-                'note': f'Deposits down {round(drop * 100)}% over the trailing quarter — '
-                        'retention risk (balance leaving while the account stays open).'}
+                'note': f'Deposits down {round(drop * 100)}% over the trailing quarter. '
+                        'Balance is leaving while the account stays open.'}
     if drop >= WATCH_DROP:
         return {'flag': 'watch', 'trend_pct': round(change, 3),
-                'note': f'Deposits down {round(drop * 100)}% over the trailing quarter — worth watching.'}
+                'note': f'Deposits down {round(drop * 100)}% over the trailing quarter, worth watching.'}
     if change >= 1.0:
         return {'flag': 'stable', 'trend_pct': round(change, 3),
                 'note': 'Deposits more than doubled over the trailing quarter.'}

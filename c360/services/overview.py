@@ -81,7 +81,7 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
     trend_live = data_mode() == 'live'
     trend_status = LIVE if trend_live else PREVIEW
     trend_note = (None if trend_live else
-                  'Per-customer trend — preview, derived from the balance movement series until history is materialised.')
+                  'Per-customer trend, shown as preview. Derived from the balance movement series until history is materialised.')
 
     return {
         'cust_id': cust_id,
@@ -89,7 +89,7 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
         'relationship_value': live(rel_value, unit='KES').to_dict(),
         'value_by_domain': {
             'question': "Where does this customer's relationship value actually sit?",
-            'note': 'Non-core domains are preview — cross-domain roll-up not yet reconciled to a golden record.',
+            'note': 'Non-core domains are preview. The cross-domain roll-up is not yet reconciled to a golden record.',
             'slices': slices,
         },
         'relationship_trend': {

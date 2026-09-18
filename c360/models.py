@@ -105,7 +105,7 @@ class RecommendationFeedback(models.Model):
     OUTCOME_DECLINED = 'declined'
     OUTCOME_NOT_RELEVANT = 'not_relevant'
     OUTCOME_CHOICES = [
-        (OUTCOME_PITCHED, 'Pitched — awaiting decision'),
+        (OUTCOME_PITCHED, 'Pitched, awaiting decision'),
         (OUTCOME_ACCEPTED, 'Accepted / taken up'),
         (OUTCOME_DECLINED, 'Declined by customer'),
         (OUTCOME_NOT_RELEVANT, 'Not relevant (model was off)'),

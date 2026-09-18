@@ -1,7 +1,7 @@
-"""HFDI property clients — the part of the group's customer base that never banked.
+"""the property register property clients — the part of the group's customer base that never banked.
 
 Customer 360's customer universe has always been ``dim_customer``: the core-banking
-master. HFDI (the property development arm) keeps its own client register, and most
+master. the property register (the property development arm) keeps its own client register, and most
 of its buyers are not core-banking customers at all. Measured against the live
 warehouse on 2026-09-17. Two universes, both measured, because they answer slightly
 different questions and the numbers must never appear to contradict each other:
@@ -21,15 +21,15 @@ upper-case — moves the match from 753 to 755. Two clients. The unmatched IDs a
 well-formed (2,061 of eight digits, 410 of seven); they simply have no bank record.
 
 The bridge is weak because the field that would make it exact is empty:
-``hfdi_client_data.client_hf_number`` is blank on all 4,843 rows. Until HFDI
+``hfdi_client_data.client_hf_number`` is blank on all 4,843 rows. Until the property register
 populates it, the national ID is the only link available, and it can only ever find
 the clients who are *also* customers.
 
 So these clients get their own namespace rather than being forced into the bank's.
-An HFDI id is ``HFDI-<client_id>``. That prefix is deliberate: every bank-only
+A property-client id is ``PROP-<client_id>``. The prefix is deliberate: every bank-only
 gateway method parses a customer id through ``TrinoWarehouse._cid`` (an ``int()``
 cast), which returns ``None`` here — so deposits, loans, bureau and CRM lookups all
-decline to answer for an HFDI client instead of silently returning a bank
+decline to answer for an the property register client instead of silently returning a bank
 customer's figures. The namespace is the safety mechanism, not just a label.
 
 ``hfdi_client_data`` itself is clean, despite carrying event-sourcing columns:
@@ -43,10 +43,14 @@ from __future__ import annotations
 import re
 
 from . import brand
-#: Prefix marking an id as HFDI's rather than core banking's.
-PREFIX = 'HFDI-'
+#: Prefix marking an id as the property register's rather than core banking's.
+#:
+#: Deliberately NOT a brand name. It says what the record is, not which company sold
+#: the property, so a rebrand never reaches it. The previous spelling was the entity
+#: name, which put a retired brand in every URL and every row of the list.
+PREFIX = 'PROP-'
 
-_ID_RE = re.compile(r'^HFDI-(\d+)$', re.IGNORECASE)
+_ID_RE = re.compile(r'^PROP-(\d+)$', re.IGNORECASE)
 
 #: What we call these people on screen. They are customers of the group, so the word
 #: "client" alone would be a distinction without a difference to an RM — the segment
@@ -55,15 +59,15 @@ SEGMENT_LABEL = brand.PROPERTY_CLIENT_SEGMENT
 
 
 def format_id(client_id) -> str:
-    """``415`` -> ``'HFDI-415'``."""
+    """``415`` -> ``'PROP-415'``."""
     return f'{PREFIX}{int(float(client_id))}'
 
 
 def parse_id(cust_id) -> int | None:
-    """``'HFDI-415'`` -> ``415``; anything else -> ``None``.
+    """``'PROP-415'`` -> ``415``; anything else -> ``None``.
 
-    Every caller uses this to decide whether an id belongs to the HFDI universe, so
-    a bank id and an HFDI id can share one route without either being guessed at.
+    Every caller uses this to decide whether an id belongs to the the property register universe, so
+    a bank id and an the property register id can share one route without either being guessed at.
     """
     m = _ID_RE.match(str(cust_id or '').strip())
     return int(m.group(1)) if m else None
@@ -76,7 +80,7 @@ def is_hfdi_id(cust_id) -> bool:
 def normalise_idno(value) -> str:
     """Strip punctuation and case from an identity document number.
 
-    Used only to compare an HFDI client's national ID against the bank's, never to
+    Used only to compare an the property register client's national ID against the bank's, never to
     display one. Measured gain over an exact trimmed match: two clients out of
     3,429 — which is the evidence that the 78% gap is real and not cosmetic.
     """
@@ -84,7 +88,7 @@ def normalise_idno(value) -> str:
 
 
 def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = None) -> dict:
-    """One HFDI client, in the same shape ``get_customer`` returns for a bank customer.
+    """One the property register client, in the same shape ``get_customer`` returns for a bank customer.
 
     Keeping the contract identical is what lets the existing customer page, scope
     checks and staff sieve run over these records unchanged. The ``hfdi`` key is the
@@ -96,7 +100,7 @@ def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = No
     real profile instead of this thinner one, and ``is_staff``, so an HF employee who
     bought a property stays behind the same sieve here as everywhere else. When the
     client does not bridge we cannot evaluate the staff rule at all — there is no
-    employer, segment or employee id in HFDI's register — and the record says so
+    employer, segment or employee id in the property register's register — and the record says so
     rather than asserting ``False``.
     """
     u = units or {}
@@ -127,7 +131,7 @@ def shape_client(row: dict, *, units: dict | None = None, bank: dict | None = No
         'crb_status': None,
         'kyc_status': None,
         'relationship_since': None,
-        'hfdi': {
+        'property_client': {
             'client_id': cid,
             'bank_cust_id': b.get('cust_id'),
             'units': int(u.get('units') or 0),

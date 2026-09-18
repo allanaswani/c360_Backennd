@@ -1,4 +1,4 @@
-"""Pure shaping for the subsidiary CRM panels — property sales leads (HFDI) and the
+"""Pure shaping for the subsidiary CRM panels — property sales leads (the property register) and the
 insurance CRM profile (HFBI). No warehouse access, so the same logic runs for live and
 mock and is unit-testable.
 

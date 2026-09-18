@@ -60,7 +60,7 @@ def _flag_env(name: str, default: bool = False) -> bool:
 # colleague's 360 to non-admins, so err toward the broader token.
 STAFF_EMPLOYER_PATTERNS = _csv_env(
     'C360_STAFF_EMPLOYER_PATTERNS',
-    'HOUSING FINANCE,HF GROUP,HFC,HF BANK,HFDI,HF FOUNDATION,HF CUSTODY,HF INSURANCE',
+    'HOUSING FINANCE,HF GROUP,HFC,HF BANK,the property register,HF FOUNDATION,HF CUSTODY,HF INSURANCE',
 )
 # customer_segment / scheme values that denote a staff scheme (exact match).
 STAFF_SEGMENTS = _csv_env('C360_STAFF_SEGMENTS', 'STAFF,STAFF SCHEME,EMPLOYEE,EMPLOYEES')

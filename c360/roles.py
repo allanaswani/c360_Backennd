@@ -12,6 +12,8 @@ consistent with the rest of the estate. Change the mapping only in this file.
 """
 from __future__ import annotations
 
+from . import brand
+
 # --- legacy roles: exact auth_group.name values from the old project ---------
 LEGACY_ROLES = (
     'ceo', 'exco', 'portfolio_mgt', 'tl_portfolio', 'branch_portfolio',
@@ -19,16 +21,16 @@ LEGACY_ROLES = (
 )
 
 LEGACY_ROLE_DESCRIPTIONS = {
-    'ceo': 'Group CEO — full read access across all segments and branches.',
-    'exco': 'Executive committee — full read access across all segments.',
-    'portfolio_mgt': 'Portfolio management — manages the portfolio reallocation book.',
-    'tl_portfolio': 'Team leader, portfolio — segment-level portfolio oversight.',
-    'branch_portfolio': 'Branch portfolio — branch-level relationship managers.',
-    'collection_mgt': 'Collections management — manages the collections book.',
-    'tl_collection': 'Team leader, collections — segment-level collections oversight.',
-    'rights_issue': 'Rights issue — front-line rights issue users.',
-    'TLrights_issue': 'Team leader, rights issue — rights issue oversight.',
-    'hfdi_admin': 'HFDI administrator — HFDI module administration.',
+    'ceo': 'Group CEO. Full read access across all segments and branches.',
+    'exco': 'Executive committee. Full read access across all segments.',
+    'portfolio_mgt': 'Portfolio management. Manages the portfolio reallocation book.',
+    'tl_portfolio': 'Team leader, portfolio. Segment-level portfolio oversight.',
+    'branch_portfolio': 'Branch portfolio. Branch-level relationship managers.',
+    'collection_mgt': 'Collections management. Manages the collections book.',
+    'tl_collection': 'Team leader, collections. Segment-level collections oversight.',
+    'rights_issue': 'Rights issue. Front-line rights issue users.',
+    'TLrights_issue': 'Team leader, rights issue. Rights issue oversight.',
+    'hfdi_admin': f'{brand.PROPERTY} administrator. Administers the property module.',
 }
 
 # --- forward-looking role tiers ---------------------------------------------
@@ -46,8 +48,8 @@ _TIER_RANK = {ROLE_CUSTOMER: 0, ROLE_OFFICER: 1, ROLE_MANAGER: 2, ROLE_ADMIN: 3}
 # alongside the legacy names so an operator can provision C360 access explicitly.
 C360_ROLES = ('c360_management', 'c360_rm')
 C360_ROLE_DESCRIPTIONS = {
-    'c360_management': 'Customer 360 — management / analytics (whole-book Level 1).',
-    'c360_rm': 'Customer 360 — relationship manager (own book).',
+    'c360_management': 'Customer 360 management and analytics (whole book, Level 1).',
+    'c360_rm': 'Customer 360 relationship manager (own book).',
 }
 
 ALL_ROLES = LEGACY_ROLES + C360_ROLES

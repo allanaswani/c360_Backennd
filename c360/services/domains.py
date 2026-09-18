@@ -62,7 +62,7 @@ def _unavailable(cust_id, domain, detail=None):
     return {'cust_id': cust_id, 'domain': domain, 'preview': True,
             'metrics': [], 'charts': [], 'tables': [], 'unavailable': True,
             'empty_reason': detail or (
-                f'{domain} data could not be loaded right now — its source may be '
+                f'{domain} data could not be loaded right now. Its source may be '
                 'temporarily unavailable. This is a data-source issue, not a gap in '
                 'this customer’s record.')}
 

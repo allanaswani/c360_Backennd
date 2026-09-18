@@ -143,7 +143,7 @@ def table(columns: list[dict], rows: list[dict], limit: int = 12,
     more = ''
     if len(rows) > limit:
         more = (f'<div style="font-size:11.5px;color:{MUTED};padding:8px 2px;">'
-                f'+ {len(rows) - limit:,} more — see the attached file.</div>')
+                f'+ {len(rows) - limit:,} more. See the attached file.</div>')
     return (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
             f'style="border:1px solid {HAIRLINE};border-radius:8px;border-collapse:separate;'
             f'border-spacing:0;overflow:hidden;margin-bottom:6px;">'

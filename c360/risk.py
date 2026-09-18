@@ -164,13 +164,13 @@ def derive_risk(
     if loans >= 1_000_000:
         ratio = loans / (deposits + 1.0)
         if ratio >= 8:
-            factors.append(f'High leverage — loans {ratio:.0f}× deposits')
+            factors.append(f'Loans are {ratio:.0f}× deposits, which is high leverage')
             base = min(base + 1, 2)
         elif ratio >= 3:
-            factors.append(f'Elevated leverage — loans {ratio:.1f}× deposits')
+            factors.append(f'Loans are {ratio:.1f}× deposits, which is elevated leverage')
 
     if kyc_status != 'Verified':
-        factors.append(f'KYC {kyc_status.lower()} — verification gap')
+        factors.append(f'KYC is {kyc_status.lower()}, leaving a verification gap')
         if base == 0:
             base = 1  # never rate an under-verified customer as Low
 
@@ -179,8 +179,8 @@ def derive_risk(
         'class': cls,
         'score': round(base / 2, 3),
         'factors': factors,
-        'note': 'Derived from loan performance, leverage and KYC completeness — '
-                'operational risk, not an external credit-bureau rating.',
+        'note': 'Derived from loan performance, leverage and KYC completeness. '
+                'This is operational risk, not an external credit-bureau rating.',
     }
 
 

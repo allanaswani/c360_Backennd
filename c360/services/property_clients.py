@@ -1,4 +1,4 @@
-"""HFDI property clients — the service layer, and who is allowed to see them.
+"""the property register property clients — the service layer, and who is allowed to see them.
 
 The register is a customer list the bank does not own. Most of the people on it
 (3,830 of 4,843 at the last measurement) have no bank record at all, which means
@@ -8,7 +8,7 @@ three things follow that the bank-side services never have to think about:
   check fails for every RM — correctly, but with the wrong explanation. "Outside
   your book" implies someone else holds it. These clients are unallocated, and the
   message says so.
-* **The staff sieve can only run on the bridged ones.** HFDI's register carries no
+* **The staff sieve can only run on the bridged ones.** the property register's register carries no
   employer, segment or employee id, so for a client with no bank record the staff
   rule has nothing to evaluate. Those rows carry ``staff_evaluated: False`` and the
   list says how many could not be checked, rather than implying all were.
@@ -67,7 +67,7 @@ def build_list(gateway: WarehouseGateway, scope: Scope, *, query: str = '',
         'results': [_public(c) for c in visible],
         'coverage': coverage,
         # Never a silent omission: say how many rows the staff rule could not be run
-        # against, because HFDI's register carries none of the fields it needs.
+        # against, because the property register's register carries none of the fields it needs.
         'staff_unverified': unchecked,
         'basis': f'{brand.PROPERTY} client register',
     }

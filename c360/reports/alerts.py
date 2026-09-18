@@ -52,7 +52,7 @@ def _check_warehouse(health: dict) -> list[dict]:
     if health.get('unavailable'):
         return [_finding('warehouse_conn', 'critical', 'Warehouse health check failed',
                          health['unavailable'],
-                         'The check itself could not run — treat the warehouse as unverified.')]
+                         'The check itself could not run, so treat the warehouse as unverified.')]
     conn = next((c for c in health.get('checks') or [] if c.get('key') == 'warehouse_conn'), None)
     if conn and conn.get('status') == 'error':
         return [_finding('warehouse_conn', 'critical', 'Warehouse unreachable',
@@ -72,7 +72,7 @@ def _check_freshness(health: dict) -> list[dict]:
                          freshness.get('detail') or 'the as-of date could not be read')]
     if isinstance(days, int) and days > limit:
         return [_finding('data_stale', 'warning', f'Warehouse data is {days} days behind',
-                         f"as-of {freshness.get('as_of')} — threshold is {limit} day(s)",
+                         f"as-of {freshness.get('as_of')}, threshold is {limit} day(s)",
                          'Every figure in the app is showing this date, not today.')]
     return []
 
@@ -251,10 +251,10 @@ def _render_alert(new: list[dict], ongoing: list[dict], resolved: list[dict]) ->
     firing = new + ongoing
     if firing:
         headline = firing[0]['title'] if len(firing) == 1 else f'{len(firing)} issues detected'
-        subject = f"[C360] {'ALERT' if worst == 'critical' else 'Warning'} — {headline}"
+        subject = f"[C360] {'ALERT' if worst == 'critical' else 'Warning'}: {headline}"
     else:
-        subject = (f"[C360] Resolved — {resolved[0]['title']}" if len(resolved) == 1
-                   else f'[C360] Resolved — {len(resolved)} issues cleared')
+        subject = (f"[C360] Resolved: {resolved[0]['title']}" if len(resolved) == 1
+                   else f'[C360] Resolved: {len(resolved)} issues cleared')
 
     blocks: list[str] = []
     lines: list[str] = []
@@ -265,7 +265,7 @@ def _render_alert(new: list[dict], ongoing: list[dict], resolved: list[dict]) ->
         blocks.append(render.heading(label))
         for finding in group:
             tone_used = 'bad' if finding['severity'] == 'critical' else 'warn'
-            body = f"{finding['title']} — {finding['detail']}"
+            body = f"{finding['title']}: {finding['detail']}"
             if finding.get('hint'):
                 body += f" · {finding['hint']}"
             if finding.get('since'):
@@ -278,7 +278,7 @@ def _render_alert(new: list[dict], ongoing: list[dict], resolved: list[dict]) ->
         for finding in resolved:
             body = finding['title']
             if finding.get('duration'):
-                body += f" — was open for {finding['duration']}"
+                body += f", open for {finding['duration']}"
             blocks.append(render.callout(body, tone='good'))
             lines.append(f"[RESOLVED] {finding['title']}")
 
@@ -288,7 +288,7 @@ def _render_alert(new: list[dict], ongoing: list[dict], resolved: list[dict]) ->
         preheader=subject.replace('[C360] ', ''),
         blocks=blocks,
         app_url=getattr(settings, 'C360_APP_URL', ''),
-        footer_note='One email per incident — you will not be re-sent this while it stays open.',
+        footer_note='One email per incident. You will not be sent this again while it stays open.',
     )
     return subject, html, render.to_text(subject, lines)
 

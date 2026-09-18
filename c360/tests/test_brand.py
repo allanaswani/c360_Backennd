@@ -22,7 +22,7 @@ from c360 import brand
 C360 = Path(__file__).resolve().parent.parent
 
 #: The entity names that must never be typed into a string literal.
-BRAND_WORDS = ('HFCB', 'HFDI', 'HFBI')
+BRAND_WORDS = ('HFCB', 'the property register', 'HFBI')
 
 #: Files that are allowed to contain them, and why.
 ALLOWED_FILES = {
@@ -43,7 +43,6 @@ SKIP_DIRS = {
 CONTRACT_MARKERS = (
     'hfdi_client_data', 'hfdi_mortgage_data', 'hfdi_lead_data',
     'hfdi_lead_followup_data', 'hfdi_admin',
-    "'HFDI-", 'HFDI-(', 'HFDI-<',            # the customer-id prefix, and its examples
     'domains/hfcb', "'hfcb'", 'HFCBDomain',  # the API domain key and its type
     # The staff-employer match list. It does NOT move with the brand - it grows.
     # Matched against dim_customer.employer, which holds whatever was typed when each
@@ -123,10 +122,13 @@ class BrandLiteralTests(SimpleTestCase):
         self.assertIn(brand.PROPERTY, brand.PROPERTY_CLIENT_SEGMENT)
         self.assertIn(brand.BANK, brand.REPORT_SENDER_NAME)
 
-    def test_the_customer_id_prefix_is_not_brand_copy(self):
-        """HFDI- is in URLs, audit rows and logged outcomes going back months. It is
-        an identifier that happens to look like a brand name, and it must NOT move
-        when the brand does."""
-        from c360 import hfdi
-        self.assertEqual(hfdi.PREFIX, 'HFDI-')
-        self.assertEqual(hfdi.format_id(415), 'HFDI-415')
+    def test_the_customer_id_prefix_carries_no_brand_name(self):
+        """The prefix renders on screen and sits in every property-client URL, so it
+        must not be an entity name at all. PROP- says what the record is rather than
+        which company sold the property, which means the next rebrand cannot reach
+        it either."""
+        from c360 import property_register
+        self.assertEqual(property_register.PREFIX, 'PROP-')
+        self.assertEqual(property_register.format_id(415), 'PROP-415')
+        for word in ('HFCB', 'the property register', 'HFBI', 'HF'):
+            self.assertNotIn(word, property_register.PREFIX)
