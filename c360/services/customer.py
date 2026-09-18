@@ -62,6 +62,30 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     # An property client has no bank relationship for this sentence to describe.
     # The generic template produces 'property client customer.' - true of nobody
     # and useful to no one - so these get a sentence about what they DO hold.
+    ins = header.get('insurance_client')
+    if ins:
+        if ins.get('bank_cust_id'):
+            lead = 'On the insurance register, and a bank customer in their own right.'
+        elif ins.get('receipts_only'):
+            # No client record at all - only the premiums they have paid.
+            n = ins.get('receipts') or 0
+            return (f'Known only from {n} premium '
+                    f'{"receipt" if n == 1 else "receipts"} in the insurance system. '
+                    f'No client record on the register and no account with the bank.')
+        else:
+            lead = 'On the insurance register only, with no account here.'
+        total = ins.get('policies') or 0
+        if total:
+            active = ins.get('active_policies') or 0
+            state = f'{active} active' if active else 'none currently active'
+            return (f'{lead} Holds {total} {"policy" if total == 1 else "policies"} '
+                    f'({state}).')
+        n = ins.get('receipts') or 0
+        if n:
+            return (f'{lead} No policy on file, but {n} premium '
+                    f'{"receipt" if n == 1 else "receipts"} are recorded.')
+        return f'{lead} No policy on file.'
+
     h = header.get('property_client')
     if h:
         if h.get('bank_cust_id'):
@@ -249,6 +273,9 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
         # an accurate one. Carries the bank id when the client also banks with us, so
         # the thin profile can hand over to the real one.
         **({'property_client': c['property_client']} if c.get('property_client') else {}),
+        # Present ONLY for an insurance-register client, for the same reason: a page
+        # of zeroes and 'not sourced' badges reads as broken unless it says why.
+        **({'insurance_client': c['insurance']} if c.get('insurance') else {}),
         'retention': ({**retention, 'status': Provenance.DERIVED.value} if retention else None),
         'identity': {
             'name': live(c['name']).to_dict(),

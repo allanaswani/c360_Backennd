@@ -227,6 +227,21 @@ class WarehouseGateway(abc.ABC):
     def property_client_coverage(self) -> dict[str, Any] | None:
         return None
 
+    # --- insurance clients (optional capability) ------------------------------
+    # The insurance arm's own client register, plus the clients who appear only in
+    # its premium receipts. Same argument as the property register: the group has a
+    # relationship with these people and the bank's customer master does not know
+    # them. See c360/insurance_register.py.
+    def search_insurance_clients(self, query: str, *, limit: int = 50,
+                                 unbanked_only: bool = False) -> list[dict[str, Any]]:
+        return []
+
+    def get_insurance_client(self, key: str) -> dict[str, Any] | None:
+        return None
+
+    def insurance_client_coverage(self) -> dict[str, Any] | None:
+        return None
+
     # --- current RM allocation (optional capability) --------------------------
     # Default: none known (callers keep the account-opening officer). The live gateway
     # overrides this to read the CURRENT customer→RM allocation from the curated

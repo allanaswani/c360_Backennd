@@ -39,6 +39,7 @@ from ... import lending as lending_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
 from .. import rm_balances as rm_bal
+from ... import insurance_register as ins_reg
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
 from ..connector import TrinoConnector
@@ -1142,6 +1143,11 @@ class TrinoWarehouse(WarehouseGateway):
         client_id_int = prop_reg.parse_id(cust_id)
         if client_id_int is not None:
             return self.get_property_client(client_id_int)
+        # Same argument for the insurance register: its own namespace, so no bank
+        # query can resolve one of its ids and attach somebody else's balances.
+        ins_key = ins_reg.parse_id(cust_id)
+        if ins_key is not None:
+            return self.get_insurance_client(ins_key)
         cid = self._cid(cust_id)
         if cid is None:
             return None
@@ -2756,6 +2762,253 @@ class TrinoWarehouse(WarehouseGateway):
             'amounts_available': False,
             'dates_available': False,
         }
+
+    # --- the insurance-client universe (see c360/insurance_register.py) -----
+
+    _INS_SELECT = (
+        "SELECT TRIM(client_no) client_no, TRIM(name) name, TRIM(idno) idno, "
+        "TRIM(phone) phone, TRIM(email) email, TRIM(pin) pin, TRIM(branch) branch, "
+        "TRIM(occupation) occupation, TRIM(risk_manager) risk_manager, "
+        "TRIM(sales_person) sales_person, TRIM(gender) gender, TRIM(address) address "
+        "FROM delta.gold_db.hfbi_customer_data "
+    )
+
+    def _ins_policy_totals(self, client_nos: list[str]) -> dict[str, dict[str, Any]]:
+        """Policy count, active count and money per insurance client.
+
+        Deduped on the natural key rather than the policy number, for the same reason
+        get_bancassurance is: policy_policy_no is blank on 98% of rows.
+        """
+        if not client_nos:
+            return {}
+        marks = ','.join(['?'] * len(client_nos))
+        rows = self._t.execute(
+            "SELECT client_no, count(*) total, "
+            "count(CASE WHEN status = 'active' THEN 1 END) active, "
+            "SUM(premium) premium, SUM(insured) insured FROM ("
+            "  SELECT TRIM(s.policy_client_no) client_no, TRIM(s.product) product, "
+            "         TRIM(s.policy_start_date) sd, TRIM(s.policy_end_date) ed, "
+            "         COALESCE(s.policy_sum_insured, 0) insured, "
+            "         MAX(LOWER(TRIM(s.status))) status, "
+            "         MAX(s.policy_total_premium) premium "
+            "    FROM delta.gold_db.rpt_c360_customer_policies_summary s "
+            f"   WHERE TRIM(s.policy_client_no) IN ({marks}) "
+            "   GROUP BY 1,2,3,4,5) p GROUP BY client_no", tuple(client_nos))
+        return {self._clean(r['client_no']): {
+            'total': int(r.get('total') or 0), 'active': int(r.get('active') or 0),
+            'premium': float(r.get('premium') or 0), 'sum_insured': float(r.get('insured') or 0),
+        } for r in rows if self._clean(r.get('client_no'))}
+
+    def _ins_receipt_counts(self, names: list[str]) -> dict[str, int]:
+        """Premium receipts per client, keyed by normalised name."""
+        keys = [k for k in {self._name_key(n) for n in names if n} if k]
+        if not keys:
+            return {}
+        marks = ','.join(['?'] * len(keys))
+        norm = self._sql_name_key('receipt_client')
+        rows = self._t.execute(
+            f"SELECT {norm} k, count(*) n FROM delta.gold_db.hfbi_receipt_data "
+            f"WHERE {norm} IN ({marks}) GROUP BY 1", tuple(keys))
+        return {str(r['k']): int(r.get('n') or 0) for r in rows if r.get('k')}
+
+    def _ins_bank_matches(self, rows: list[dict]) -> dict[str, dict[str, Any]]:
+        """Which of these insurance clients also bank with us, by ID or phone.
+
+        The name bridge is NOT used here. On a single customer page it is a last
+        resort with a uniqueness guard; run across a whole list it would be a
+        thousand guesses, and a wrong one attaches a stranger's bank record to a row.
+        """
+        idnos = [r.get('idno') for r in rows if (r.get('idno') or '').strip()]
+        phones = [self._phone_key(r.get('phone')) for r in rows]
+        phones = [p for p in phones if p]
+        if not idnos and not phones:
+            return {}
+        clauses, params = [], []
+        if idnos:
+            clauses.append(f"TRIM(customer_id_no) IN ({','.join(['?'] * len(idnos))})")
+            params.extend(idnos)
+        if phones:
+            clauses.append(f"{self._sql_phone_key('primary_mobile_no')} IN "
+                           f"({','.join(['?'] * len(phones))})")
+            params.extend(phones)
+        drows = self._t.execute(
+            "SELECT CAST(customer_id AS BIGINT) id, TRIM(customer_id_no) idno, "
+            f"{self._sql_phone_key('primary_mobile_no')} phone_key, "
+            "customer_segment, employer, fk_bankemployeeid "
+            f"FROM delta.gold_db.dim_customer WHERE {' OR '.join(clauses)}",
+            tuple(params))
+        by_id: dict[str, dict[str, Any]] = {}
+        by_phone: dict[str, dict[str, Any]] = {}
+        for r in drows:
+            entry = {
+                'cust_id': str(r['id']),
+                'is_staff': is_staff_from_fields(
+                    employer=r.get('employer'), segment=r.get('customer_segment'),
+                    bank_employee_id=r.get('fk_bankemployeeid')),
+            }
+            idno = self._clean(r.get('idno'))
+            if idno:
+                by_id.setdefault(idno, entry)
+            pk = self._clean(r.get('phone_key'))
+            if pk:
+                by_phone.setdefault(pk, entry)
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            key = self._clean(r.get('client_no')) or ''
+            idno = (r.get('idno') or '').strip()
+            match = by_id.get(idno) if idno else None
+            if match is None:
+                match = by_phone.get(self._phone_key(r.get('phone')))
+            if match:
+                out[key] = match
+        return out
+
+    def _ins_decorate(self, rows: list[dict]) -> list[dict[str, Any]]:
+        if not rows:
+            return []
+        client_nos = [self._clean(r.get('client_no')) for r in rows]
+        client_nos = [c for c in client_nos if c]
+        policies = self._ins_policy_totals(client_nos)
+        receipts = self._ins_receipt_counts([r.get('name') for r in rows])
+        banked = self._ins_bank_matches(rows)
+        out = []
+        for r in rows:
+            cn = self._clean(r.get('client_no')) or ''
+            out.append(ins_reg.shape_client(
+                r, policies=policies.get(cn), bank=banked.get(cn),
+                receipts={'receipts': receipts.get(self._name_key(r.get('name')), 0)},
+                name_key=self._name_key(r.get('name'))))
+        return out
+
+    def _receipt_only_clients(self, query: str, limit: int) -> list[dict[str, Any]]:
+        """Clients who appear ONLY in the premium receipts.
+
+        About 454 of the 6,392 names in the receipts have no row on the register.
+        Michael Njau Kimani is one of them, with 29 receipts and no client record, and
+        he has now come back 'missing' twice. Excluding this group would make that
+        three times.
+        """
+        raw = (query or '').strip()
+        if not raw:
+            return []
+        norm = self._sql_name_key('receipt_client')
+        reg = self._sql_name_key('name')
+        rows = self._t.execute(
+            f"SELECT MAX(TRIM(r.receipt_client)) name, {norm} k, count(*) n "
+            "FROM delta.gold_db.hfbi_receipt_data r "
+            f"WHERE LOWER(TRIM(r.receipt_client)) LIKE ? AND {norm} NOT IN "
+            f"(SELECT {reg} FROM delta.gold_db.hfbi_customer_data) "
+            f"GROUP BY {norm} LIMIT ?", (f'%{raw.lower()}%', int(limit)))
+        out = []
+        for r in rows:
+            out.append(ins_reg.shape_client(
+                {'name': self._clean(r.get('name'))},
+                receipts={'receipts': int(r.get('n') or 0)},
+                name_key=str(r.get('k') or '')))
+        return out
+
+    def search_insurance_clients(self, query: str, *, limit: int = 50,
+                                 unbanked_only: bool = False) -> list[dict[str, Any]]:
+        raw = (query or '').strip()
+        fetch = min(int(limit) * 4, 400) if unbanked_only else int(limit)
+        if raw:
+            rows = self._t.execute(
+                self._INS_SELECT +
+                "WHERE name IS NOT NULL AND (lower(TRIM(name)) LIKE ? "
+                "OR UPPER(TRIM(client_no)) = ? "
+                "OR TRIM(COALESCE(idno,'')) = ?) LIMIT ?",
+                (f'%{raw.lower()}%', raw.upper(), raw, fetch))
+        else:
+            rows = self._t.execute(self._INS_SELECT + "WHERE name IS NOT NULL LIMIT ?",
+                                   (fetch,))
+        out = self._ins_decorate(rows)
+        if raw:
+            # Only searched, never listed wholesale: without a client_no there is no
+            # stable way to page them.
+            out.extend(self._receipt_only_clients(raw, max(10, int(limit) // 4)))
+        if unbanked_only:
+            out = [c for c in out if not c['insurance']['bank_cust_id']]
+        out.sort(key=lambda c: (-(c['insurance']['premium'] or 0),
+                                -(c['insurance']['receipts'] or 0), c['name'] or ''))
+        return out[:int(limit)]
+
+    def get_insurance_client(self, key: str) -> dict[str, Any] | None:
+        """One insurance client by client_no, or by normalised name when the register
+        never got them."""
+        rows = self._t.execute(self._INS_SELECT + "WHERE UPPER(TRIM(client_no)) = ? LIMIT 1",
+                               (str(key).upper(),))
+        if rows:
+            return self._ins_decorate(rows)[0]
+        norm = self._sql_name_key('receipt_client')
+        rrows = self._t.execute(
+            f"SELECT MAX(TRIM(receipt_client)) name, count(*) n "
+            f"FROM delta.gold_db.hfbi_receipt_data WHERE {norm} = ?", (str(key).upper(),))
+        if not rrows or not int(rrows[0].get('n') or 0):
+            return None
+        return ins_reg.shape_client(
+            {'name': self._clean(rrows[0].get('name'))},
+            receipts={'receipts': int(rrows[0].get('n') or 0)},
+            name_key=str(key).upper())
+
+    def insurance_client_coverage(self) -> dict[str, Any] | None:
+        from django.core.cache import cache
+
+        cached = cache.get('c360:ins:coverage')
+        if cached is not None:
+            return cached
+        try:
+            reg = self._sql_name_key('name')
+            rec = self._sql_name_key('receipt_client')
+            rows = self._t.execute(
+                "SELECT (SELECT count(DISTINCT TRIM(client_no)) "
+                "          FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL) total, "
+                "       (SELECT count(*) FROM ("
+                f"          SELECT DISTINCT {rec} k FROM delta.gold_db.hfbi_receipt_data "
+                "           WHERE TRIM(COALESCE(receipt_client,'')) <> '') x "
+                f"        WHERE x.k NOT IN (SELECT {reg} FROM delta.gold_db.hfbi_customer_data)"
+                "       ) receipts_only")
+        except Exception:
+            logger.warning('insurance coverage query failed', exc_info=True)
+            return None
+        if not rows:
+            return None
+        r = rows[0]
+        total = int(r.get('total') or 0)
+        receipts_only = int(r.get('receipts_only') or 0)
+        # Counted from a sample rather than a full cross-join: bridging every one of
+        # 16,952 clients against 1.1M bank customers is not a page-load query, and the
+        # ratio is what the sentence needs.
+        banked = self._ins_banked_estimate()
+        out = {
+            'total': total,
+            'banked': banked,
+            'unbanked': max(total - banked, 0) if banked is not None else None,
+            'receipts_only': receipts_only,
+            'note': (ins_reg.coverage_note(total, banked, receipts_only)
+                     if banked is not None else
+                     f'{total:,} insurance clients on the register; '
+                     f'{receipts_only:,} more appear only in the premium receipts.'),
+        }
+        cache.set('c360:ins:coverage', out, 3600)
+        return out
+
+    def _ins_banked_estimate(self) -> int | None:
+        """How many insurance clients bridge to a bank customer, by ID or phone."""
+        try:
+            rows = self._t.execute(
+                "WITH h AS (SELECT DISTINCT TRIM(idno) idno, "
+                f"       {self._sql_phone_key('phone')} pk "
+                "       FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL), "
+                "     d AS (SELECT DISTINCT TRIM(customer_id_no) idno, "
+                f"       {self._sql_phone_key('primary_mobile_no')} pk "
+                "       FROM delta.gold_db.dim_customer) "
+                "SELECT count(*) n FROM h WHERE EXISTS ("
+                "  SELECT 1 FROM d WHERE (h.idno <> '' AND d.idno = h.idno) "
+                "     OR (h.pk <> '' AND d.pk = h.pk))")
+        except Exception:
+            logger.warning('insurance banked estimate failed', exc_info=True)
+            return None
+        return int(rows[0].get('n') or 0) if rows else None
 
     def get_bancassurance(self, cust_id, period):
         """Insurance policies held by a bank customer.

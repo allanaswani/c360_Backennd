@@ -16,6 +16,7 @@ from typing import Any
 from ... import credit_bureau as bureau_shape
 from ... import crm as crm_shape
 from ... import property_register as prop_reg
+from ... import insurance_register as ins_reg
 from ... import lending as lending_shape
 from ... import relationships as rel_shape
 from ... import risk as risk_derive
@@ -23,6 +24,12 @@ from ...rbac.staff import is_staff_from_fields
 from ..gateway import WarehouseGateway
 from ..periods import ResolvedPeriod
 from . import seed
+
+
+def _name_key(value) -> str:
+    """Same reduction the live gateway uses to match a free-text name."""
+    import re as _re
+    return _re.sub(r'[^A-Za-z0-9]', '', str(value or '')).upper()
 
 # A stable synthetic "last closed business date" for preview mode.
 _AS_OF = date(2026, 7, 22)
@@ -61,6 +68,9 @@ class MockWarehouse(WarehouseGateway):
         client_id_int = prop_reg.parse_id(cust_id)
         if client_id_int is not None:
             return self.get_property_client(client_id_int)
+        ins_key = ins_reg.parse_id(cust_id)
+        if ins_key is not None:
+            return self.get_insurance_client(ins_key)
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if not c:
             return None
@@ -653,6 +663,73 @@ class MockWarehouse(WarehouseGateway):
             out = [c for c in out if not c['property_client']['bank_cust_id']]
         out.sort(key=lambda c: (-(c['property_client']['units_value'] or 0), c['name'] or ''))
         return out[:int(limit)]
+
+    # Insurance clients, mirroring the live universe's two tiers: register clients,
+    # and clients known only from their premium receipts.
+    # (client_no, name, idno, phone, policies, active, premium, receipts)
+    _INSURANCE_CLIENTS = [
+        # Bridges to HF-102010 by national id: their real profile is richer.
+        ('ZA118', 'Zawadi Enterprises Ltd', 'C.102844', '+254722000415', 3, 1, 240_000, 9),
+        ('VT001', 'Vtn Ventures Limited', None, '+254733000777', 0, 0, 0, 10),
+        ('SU356', 'Susan Wanjiku Kariuki', None, '+254792752646', 0, 0, 0, 7),
+        ('RA386', 'Rajaa Stones Limited', None, None, 5, 0, 300_000, 133),
+    ]
+    # No client_no at all: the register never got them. Searchable, never listed.
+    _INSURANCE_RECEIPT_ONLY = [('Michael Njau Kimani', 29)]
+
+    def _ins_shape(self, entry):
+        client_no, name, idno, phone, total, active, premium, receipts = entry
+        bank = None
+        key = ins_reg.__dict__  # noqa: F841  (kept explicit below for clarity)
+        for c in seed.CUSTOMER_INDEX.values():
+            if idno and (c.get('id_no') or '').upper() == idno.upper():
+                bio = self._bio(c)
+                bank = {'cust_id': c['cust_id'], 'is_staff': self._is_staff(c, bio)}
+                break
+        return ins_reg.shape_client(
+            {'client_no': client_no, 'name': name, 'idno': idno, 'phone': phone},
+            policies={'total': total, 'active': active, 'premium': premium,
+                      'sum_insured': premium * 20},
+            receipts={'receipts': receipts}, bank=bank,
+            name_key=_name_key(name))
+
+    def search_insurance_clients(self, query, *, limit=50, unbanked_only=False):
+        raw = (query or '').strip().lower()
+        out = [self._ins_shape(e) for e in self._INSURANCE_CLIENTS
+               if not raw or raw in e[1].lower() or raw == (e[0] or '').lower()]
+        if raw:
+            for name, n in self._INSURANCE_RECEIPT_ONLY:
+                if raw in name.lower():
+                    out.append(ins_reg.shape_client(
+                        {'name': name}, receipts={'receipts': n},
+                        name_key=_name_key(name)))
+        if unbanked_only:
+            out = [c for c in out if not c['insurance']['bank_cust_id']]
+        out.sort(key=lambda c: (-(c['insurance']['premium'] or 0),
+                                -(c['insurance']['receipts'] or 0), c['name'] or ''))
+        return out[:int(limit)]
+
+    def get_insurance_client(self, key):
+        k = str(key).upper()
+        for e in self._INSURANCE_CLIENTS:
+            if (e[0] or '').upper() == k:
+                return self._ins_shape(e)
+        for name, n in self._INSURANCE_RECEIPT_ONLY:
+            if _name_key(name) == k:
+                return ins_reg.shape_client({'name': name}, receipts={'receipts': n},
+                                            name_key=k)
+        return None
+
+    def insurance_client_coverage(self):
+        total = len(self._INSURANCE_CLIENTS)
+        banked = sum(1 for e in self._INSURANCE_CLIENTS
+                     if self._ins_shape(e)['insurance']['bank_cust_id'])
+        receipts_only = len(self._INSURANCE_RECEIPT_ONLY)
+        return {
+            'total': total, 'banked': banked, 'unbanked': total - banked,
+            'receipts_only': receipts_only,
+            'note': ins_reg.coverage_note(total, banked, receipts_only),
+        }
 
     def get_property_client(self, client_id):
         for entry in self._REGISTER_CLIENTS:

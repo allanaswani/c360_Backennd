@@ -27,6 +27,7 @@ urlpatterns = [
     path('auth/user-meta/', auth_views.UserMetaChoicesView.as_view(), name='admin-user-meta'),
     path('customers/', views.CustomerListView.as_view(), name='customer-list'),
     path('property-clients/', views.PropertyClientListView.as_view(), name='property-client-list'),
+    path('insurance-clients/', views.InsuranceClientListView.as_view(), name='insurance-client-list'),
     path('customers/<str:cust_id>/', views.CustomerDetailView.as_view(), name='customer-detail'),
     path('customers/<str:cust_id>/overview/', views.CustomerOverviewView.as_view(), name='customer-overview'),
     path('customers/<str:cust_id>/last-transaction/', views.CustomerLastTransactionView.as_view(), name='customer-last-transaction'),

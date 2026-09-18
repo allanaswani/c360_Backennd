@@ -23,7 +23,8 @@ from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
-from ..services import portfolio_cache, property_clients as pc_service
+from ..services import (portfolio_cache, property_clients as pc_service,
+                        insurance_clients as ic_service)
 from .. import property_register as prop_reg
 from .. import brand
 from ..warehouse.factory import data_mode, get_gateway
@@ -96,6 +97,32 @@ class CustomerListView(APIView):
         return Response({'count': len(rows), 'results': rows})
 
 
+class InsuranceClientListView(APIView):
+    """The insurance arm's client register, plus the clients who appear only in its
+    premium receipts.
+
+    Separate from /customers/ for the same reason /property-clients/ is: a different
+    universe, most of whom hold no bank record. See c360/insurance_register.py.
+    """
+
+    def get(self, request: Request):
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        if not ic_service.visible_to(scope):
+            return Response(
+                {'error': {'status': 403, 'detail': 'The insurance-client register is '
+                                                    'available to the management and '
+                                                    'insurance views.'}},
+                status=status.HTTP_403_FORBIDDEN)
+        unbanked = (request.query_params.get('unbanked') or '').strip().lower() in ('1', 'true', 'yes')
+        return Response(ic_service.build_list(
+            gateway, scope,
+            query=request.query_params.get('q', ''),
+            limit=min(int(request.query_params.get('limit', 50)), 200),
+            unbanked_only=unbanked,
+        ))
+
+
 class PropertyClientListView(APIView):
     """The property-client register - the group's property buyers.
 
@@ -134,9 +161,14 @@ class CustomerDetailView(APIView):
         if not customer_visible(scope, raw):
             # A property client is in NOBODY's book, so "outside your book" would be
             # a misleading reason to refuse it - it implies another RM holds it.
-            detail = (f'Not allocated to a book. Property clients are visible to the '
-                      f'management and {brand.PROPERTY} views.'
-                      ) if raw.get('property_client') else 'Outside your book.'
+            if raw.get('property_client'):
+                detail = (f'Not allocated to a book. Property clients are visible to '
+                          f'the management and {brand.PROPERTY} views.')
+            elif raw.get('insurance'):
+                detail = ('Not allocated to a book. Insurance clients are visible to '
+                          'the management and insurance views.')
+            else:
+                detail = 'Outside your book.'
             return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
         header = build_customer_header(gateway, cust_id)
