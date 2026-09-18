@@ -168,3 +168,119 @@ class InsuranceClientPageTests(TestCase):
 
     def test_bank_customers_are_unaffected(self):
         self.assertNotIn('insurance_client', self._header('HF-102010'))
+
+
+class CoverageDegradationTests(SimpleTestCase):
+    """Coverage is a sentence at the top of a list. It must never be the reason the
+    list does not render.
+
+    The first version asked one question that joined every insurance client to every
+    bank customer on a computed phone key. It outran the worker timeout, gunicorn
+    SIGABRTed the worker mid-query, and the page returned 500 with a traceback that
+    said nothing about the query.
+    """
+
+    class _PartlyBroken:
+        """The register count answers; the expensive halves do not."""
+
+        def __init__(self, fail_on=()):
+            self.fail_on = fail_on
+            self.queries = []
+
+        def execute(self, sql, params=None):
+            self.queries.append(sql)
+            s = sql.lower()
+            for token in self.fail_on:
+                if token in s:
+                    raise RuntimeError('query exceeded the maximum run time')
+            if 'hfbi_customer_data' in s and 'count(distinct' in s:
+                return [{'n': 16952}]
+            if 'not in' in s and 'hfbi_receipt_data' in s:
+                return [{'n': 454}]
+            if 'join d on d.idno' in s:
+                return [{'n': 4413}]
+            return []
+
+    def _coverage(self, **kw):
+        from c360.warehouse.trino.trino_gateway import TrinoWarehouse
+        from django.core.cache import cache
+        cache.delete('c360:ins:coverage')
+        wh = self._PartlyBroken(**kw)
+        return TrinoWarehouse(wh).insurance_client_coverage(), wh
+
+    def test_all_three_parts_when_everything_answers(self):
+        out, _ = self._coverage()
+        self.assertEqual(out['total'], 16952)
+        self.assertEqual(out['banked'], 4413)
+        self.assertEqual(out['receipts_only'], 454)
+        self.assertIn('Matched on national ID', out['note'])
+
+    def test_a_failing_banked_count_still_leaves_a_usable_panel(self):
+        out, _ = self._coverage(fail_on=('join d on d.idno',))
+        self.assertEqual(out['total'], 16952)
+        self.assertIsNone(out['banked'])
+        self.assertEqual(out['receipts_only'], 454)
+        self.assertIn('16,952', out['note'])
+        # And it must not claim a match rate it did not compute.
+        self.assertNotIn('Matched on national ID', out['note'])
+
+    def test_a_failing_receipts_count_still_leaves_a_usable_panel(self):
+        out, _ = self._coverage(fail_on=('not in',))
+        self.assertEqual(out['total'], 16952)
+        self.assertEqual(out['receipts_only'], 0)
+
+    def test_the_register_count_failing_means_no_panel_at_all(self):
+        out, _ = self._coverage(fail_on=('count(distinct',))
+        self.assertIsNone(out)
+
+    def test_the_banked_count_is_a_join_not_a_correlated_scan(self):
+        """The shape is what keeps it off the worker timeout."""
+        _, wh = self._coverage()
+        joined = [q for q in wh.queries if 'join d on d.idno' in q.lower()]
+        self.assertTrue(joined)
+        self.assertNotIn('exists', joined[0].lower())
+        # The phone half is deliberately absent from the whole-register count.
+        self.assertNotIn('primary_mobile_no', joined[0])
+
+
+class ListBridgeCostTests(SimpleTestCase):
+    """The list bridges on national ID only, because an IN-list on a computed phone
+    key cannot use statistics and scans the customer master once per render."""
+
+    def test_the_list_bridge_does_not_compute_a_phone_key(self):
+        from c360.warehouse.trino.trino_gateway import TrinoWarehouse
+
+        seen = []
+
+        class _Recorder:
+            def execute(self, sql, params=None):
+                seen.append(sql)
+                return []
+
+        TrinoWarehouse(_Recorder())._ins_bank_matches(
+            [{'client_no': 'RA386', 'idno': 'C.102844', 'phone': '+254722000415'}])
+        self.assertTrue(seen)
+        self.assertNotIn('primary_mobile_no', seen[0])
+        self.assertIn('customer_id_no', seen[0])
+
+    def test_no_query_at_all_when_nothing_carries_an_id(self):
+        from c360.warehouse.trino.trino_gateway import TrinoWarehouse
+
+        class _Boom:
+            def execute(self, sql, params=None):
+                raise AssertionError('should not query')
+
+        self.assertEqual(
+            TrinoWarehouse(_Boom())._ins_bank_matches([{'client_no': 'X', 'phone': '0712345678'}]),
+            {})
+
+
+class QueryCeilingTests(SimpleTestCase):
+    """A runaway query must fail, not hang until gunicorn kills the worker."""
+
+    def test_the_connector_caps_query_run_time_below_the_worker_timeout(self):
+        from django.conf import settings
+        cfg = settings.C360['trino_config']
+        # gunicorn runs with --timeout 120 (see Dockerfile).
+        self.assertLess(cfg['query_max_run_time_s'], 120)
+        self.assertLess(cfg['request_timeout_s'], 120)

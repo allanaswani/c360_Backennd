@@ -398,6 +398,12 @@ C360 = {
         # The internal Trino gateway (port 8443) uses a self-signed cert; disable
         # verification for LAN use. Never set false against a public endpoint.
         'verify': _env_bool('TRINO_VERIFY_SSL', False),
+        # Hard ceiling on a single query, in seconds. Must stay comfortably below
+        # gunicorn's --timeout (120s in the Dockerfile) so Trino cancels the query
+        # and we degrade the panel, rather than the worker being SIGABRTed mid-read
+        # and taking every other in-flight request with it.
+        'query_max_run_time_s': int(os.environ.get('TRINO_QUERY_MAX_RUN_TIME_S', '60') or '60'),
+        'request_timeout_s': int(os.environ.get('TRINO_REQUEST_TIMEOUT_S', '60') or '60'),
     },
 
     # The curated, report-ready customer/RM tables live in PostgreSQL, read by

@@ -2812,55 +2812,45 @@ class TrinoWarehouse(WarehouseGateway):
         return {str(r['k']): int(r.get('n') or 0) for r in rows if r.get('k')}
 
     def _ins_bank_matches(self, rows: list[dict]) -> dict[str, dict[str, Any]]:
-        """Which of these insurance clients also bank with us, by ID or phone.
+        """Which of these insurance clients also bank with us, by national ID.
 
-        The name bridge is NOT used here. On a single customer page it is a last
-        resort with a uniqueness guard; run across a whole list it would be a
-        thousand guesses, and a wrong one attaches a stranger's bank record to a row.
+        ID ONLY, deliberately. An IN-list on a phone key computed from
+        primary_mobile_no cannot use table statistics, so it scans the whole customer
+        master once per page render - which is what made this page time out and take
+        the gunicorn worker with it. On a list, the national ID answers the question
+        the column is asking; the single-customer page keeps the fuller ID-or-phone
+        bridge, where it is one lookup rather than fifty.
+
+        The name bridge is not used here either. On one page it is a last resort with
+        a uniqueness guard; across a list it would be a thousand guesses, and a wrong
+        one attaches a stranger's bank record to a row.
         """
-        idnos = [r.get('idno') for r in rows if (r.get('idno') or '').strip()]
-        phones = [self._phone_key(r.get('phone')) for r in rows]
-        phones = [p for p in phones if p]
-        if not idnos and not phones:
+        idnos = sorted({(r.get('idno') or '').strip() for r in rows
+                        if (r.get('idno') or '').strip()})
+        if not idnos:
             return {}
-        clauses, params = [], []
-        if idnos:
-            clauses.append(f"TRIM(customer_id_no) IN ({','.join(['?'] * len(idnos))})")
-            params.extend(idnos)
-        if phones:
-            clauses.append(f"{self._sql_phone_key('primary_mobile_no')} IN "
-                           f"({','.join(['?'] * len(phones))})")
-            params.extend(phones)
+        marks = ','.join(['?'] * len(idnos))
         drows = self._t.execute(
             "SELECT CAST(customer_id AS BIGINT) id, TRIM(customer_id_no) idno, "
-            f"{self._sql_phone_key('primary_mobile_no')} phone_key, "
             "customer_segment, employer, fk_bankemployeeid "
-            f"FROM delta.gold_db.dim_customer WHERE {' OR '.join(clauses)}",
-            tuple(params))
+            f"FROM delta.gold_db.dim_customer WHERE TRIM(customer_id_no) IN ({marks})",
+            tuple(idnos))
         by_id: dict[str, dict[str, Any]] = {}
-        by_phone: dict[str, dict[str, Any]] = {}
         for r in drows:
-            entry = {
+            idno = self._clean(r.get('idno'))
+            if not idno or idno in by_id:
+                continue
+            by_id[idno] = {
                 'cust_id': str(r['id']),
                 'is_staff': is_staff_from_fields(
                     employer=r.get('employer'), segment=r.get('customer_segment'),
                     bank_employee_id=r.get('fk_bankemployeeid')),
             }
-            idno = self._clean(r.get('idno'))
-            if idno:
-                by_id.setdefault(idno, entry)
-            pk = self._clean(r.get('phone_key'))
-            if pk:
-                by_phone.setdefault(pk, entry)
         out: dict[str, dict[str, Any]] = {}
         for r in rows:
-            key = self._clean(r.get('client_no')) or ''
-            idno = (r.get('idno') or '').strip()
-            match = by_id.get(idno) if idno else None
-            if match is None:
-                match = by_phone.get(self._phone_key(r.get('phone')))
+            match = by_id.get((r.get('idno') or '').strip())
             if match:
-                out[key] = match
+                out[self._clean(r.get('client_no')) or ''] = match
         return out
 
     def _ins_decorate(self, rows: list[dict]) -> list[dict[str, Any]]:
@@ -2951,62 +2941,89 @@ class TrinoWarehouse(WarehouseGateway):
             name_key=str(key).upper())
 
     def insurance_client_coverage(self) -> dict[str, Any] | None:
+        """Register size, how many also bank with us, and how many exist only as
+        receipts.
+
+        Each part is a separate bounded query and each is allowed to fail on its own.
+        An earlier version asked one question that joined every insurance client to
+        every bank customer on a computed phone key; it outran the worker timeout and
+        took the page down. Coverage is a sentence at the top of a list - it must
+        never be the reason the list does not render.
+        """
         from django.core.cache import cache
 
         cached = cache.get('c360:ins:coverage')
         if cached is not None:
             return cached
+
         try:
-            reg = self._sql_name_key('name')
-            rec = self._sql_name_key('receipt_client')
             rows = self._t.execute(
-                "SELECT (SELECT count(DISTINCT TRIM(client_no)) "
-                "          FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL) total, "
-                "       (SELECT count(*) FROM ("
-                f"          SELECT DISTINCT {rec} k FROM delta.gold_db.hfbi_receipt_data "
-                "           WHERE TRIM(COALESCE(receipt_client,'')) <> '') x "
-                f"        WHERE x.k NOT IN (SELECT {reg} FROM delta.gold_db.hfbi_customer_data)"
-                "       ) receipts_only")
+                "SELECT count(DISTINCT TRIM(client_no)) n "
+                "FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL")
+            total = int(rows[0].get('n') or 0) if rows else 0
         except Exception:
-            logger.warning('insurance coverage query failed', exc_info=True)
+            logger.warning('insurance coverage: register count failed', exc_info=True)
             return None
-        if not rows:
+        if not total:
             return None
-        r = rows[0]
-        total = int(r.get('total') or 0)
-        receipts_only = int(r.get('receipts_only') or 0)
-        # Counted from a sample rather than a full cross-join: bridging every one of
-        # 16,952 clients against 1.1M bank customers is not a page-load query, and the
-        # ratio is what the sentence needs.
-        banked = self._ins_banked_estimate()
+
+        receipts_only = self._ins_receipts_only_count()
+        banked = self._ins_banked_by_id()
+
+        if banked is None:
+            note = (f'{total:,} clients on the insurance register.'
+                    + (f' {receipts_only:,} more appear only in the premium receipts, '
+                       f'with no client record at all.' if receipts_only else ''))
+        else:
+            note = ins_reg.coverage_note(total, banked, receipts_only or 0)
+            # Say what the number means. It is the ID bridge alone, because the
+            # phone half cannot be run across the whole register on a page load.
+            note += ' Matched on national ID; a client sharing only a phone number is not counted.'
+
         out = {
             'total': total,
             'banked': banked,
-            'unbanked': max(total - banked, 0) if banked is not None else None,
-            'receipts_only': receipts_only,
-            'note': (ins_reg.coverage_note(total, banked, receipts_only)
-                     if banked is not None else
-                     f'{total:,} insurance clients on the register; '
-                     f'{receipts_only:,} more appear only in the premium receipts.'),
+            'unbanked': (max(total - banked, 0) if banked is not None else None),
+            'receipts_only': receipts_only or 0,
+            'note': note,
         }
         cache.set('c360:ins:coverage', out, 3600)
         return out
 
-    def _ins_banked_estimate(self) -> int | None:
-        """How many insurance clients bridge to a bank customer, by ID or phone."""
+    def _ins_receipts_only_count(self) -> int | None:
+        """Names in the premium receipts with no row on the register."""
+        try:
+            rec = self._sql_name_key('receipt_client')
+            reg = self._sql_name_key('name')
+            rows = self._t.execute(
+                "SELECT count(*) n FROM ("
+                f"  SELECT DISTINCT {rec} k FROM delta.gold_db.hfbi_receipt_data "
+                "   WHERE TRIM(COALESCE(receipt_client, '')) <> '') x "
+                f"WHERE x.k NOT IN (SELECT {reg} FROM delta.gold_db.hfbi_customer_data "
+                "                    WHERE name IS NOT NULL)")
+        except Exception:
+            logger.warning('insurance coverage: receipts-only count failed', exc_info=True)
+            return None
+        return int(rows[0].get('n') or 0) if rows else None
+
+    def _ins_banked_by_id(self) -> int | None:
+        """Insurance clients whose national ID is also a bank customer's.
+
+        An equality join between two DISTINCT id sets, which the engine can hash. The
+        phone half of the bridge is deliberately absent: computing a phone key on both
+        sides of 1.1 million rows is a scan, and it is what made this page time out.
+        """
         try:
             rows = self._t.execute(
-                "WITH h AS (SELECT DISTINCT TRIM(idno) idno, "
-                f"       {self._sql_phone_key('phone')} pk "
-                "       FROM delta.gold_db.hfbi_customer_data WHERE name IS NOT NULL), "
-                "     d AS (SELECT DISTINCT TRIM(customer_id_no) idno, "
-                f"       {self._sql_phone_key('primary_mobile_no')} pk "
-                "       FROM delta.gold_db.dim_customer) "
-                "SELECT count(*) n FROM h WHERE EXISTS ("
-                "  SELECT 1 FROM d WHERE (h.idno <> '' AND d.idno = h.idno) "
-                "     OR (h.pk <> '' AND d.pk = h.pk))")
+                "WITH h AS (SELECT DISTINCT TRIM(idno) idno "
+                "             FROM delta.gold_db.hfbi_customer_data "
+                "            WHERE name IS NOT NULL AND LENGTH(TRIM(COALESCE(idno, ''))) >= 5), "
+                "     d AS (SELECT DISTINCT TRIM(customer_id_no) idno "
+                "             FROM delta.gold_db.dim_customer "
+                "            WHERE LENGTH(TRIM(COALESCE(customer_id_no, ''))) >= 5) "
+                "SELECT count(*) n FROM h JOIN d ON d.idno = h.idno")
         except Exception:
-            logger.warning('insurance banked estimate failed', exc_info=True)
+            logger.warning('insurance coverage: banked count failed', exc_info=True)
             return None
         return int(rows[0].get('n') or 0) if rows else None
 

@@ -53,6 +53,13 @@ class TrinoDBAPIConnector:
             auth = None
             if cfg.get('password'):
                 auth = BasicAuthentication(cfg['user'], cfg['password'])
+            # A runaway query must fail, not hang. Without a cap, a slow one holds
+            # the request until gunicorn's --timeout (120s) SIGABRTs the worker: the
+            # page 500s, the log shows handle_abort rather than anything about the
+            # query, and every other request that worker was serving dies with it.
+            # Capped well below that, Trino cancels and raises, the caller's
+            # try/except degrades the panel, and the page still renders.
+            run_time = int(cfg.get('query_max_run_time_s') or 60)
             self._conn = trino.dbapi.connect(
                 host=cfg['host'],
                 port=cfg['port'],
@@ -62,6 +69,8 @@ class TrinoDBAPIConnector:
                 schema=cfg.get('schema'),
                 auth=auth,
                 verify=verify,
+                session_properties={'query_max_run_time': f'{run_time}s'},
+                request_timeout=float(cfg.get('request_timeout_s') or run_time),
             )
         return self._conn
 
