@@ -50,11 +50,14 @@ class _Warehouse:
                      'alt': None, 'full_name': self.bank_name}]
         if 'from delta.gold_db.hfbi_customer_data' in s and 'count(*) n' in s:
             self.name_lookups += 1
-            return [{'n': self.hfbi_name_count, 'client_no': RAJAA_CLIENT}]
+            # The register's own spelling comes back too: receipts are keyed by name,
+            # so without it a client resolved here has no way into them.
+            return [{'n': self.hfbi_name_count, 'client_no': RAJAA_CLIENT,
+                     'name': 'Rajaa Stones Limited'}]
         if 'from delta.gold_db.dim_customer where' in s and 'count(*) n' in s:
             return [{'n': self.bank_name_count}]
         if 'from delta.gold_db.hfbi_customer_data' in s:
-            return self.register
+            return [{**r, 'name': r.get('name', 'Rajaa Stones Limited')} for r in self.register]
         if 'rpt_c360_customer_policies_summary' in s and 'count(' in s:
             return [{'n': 1}]                      # the source is populated
         if 'rpt_c360_customer_policies_summary' in s:
@@ -183,3 +186,77 @@ class NameKeyTests(SimpleTestCase):
             self.assertTrue(TrinoWarehouse._name_key(variant).startswith('RAJAASTONES'))
         self.assertEqual(TrinoWarehouse._name_key('RAJAA STONES LIMITED'),
                          TrinoWarehouse._name_key('Rajaa Stones Limited'))
+
+
+class NameSynonymTests(SimpleTestCase):
+    """LTD and LIMITED are the same word.
+
+    Rajaa Stones is 'Rajaa Stones Limited' in the insurance register and 'RAJAA
+    STONES LTD' on its 133 receipts, so its own premium history was invisible to its
+    own policy panel. Systemic rather than one customer: receipts end in LTD 1,669
+    times and LIMITED 1,636; the register 210 and 640.
+    """
+
+    def test_ltd_and_limited_fold_together(self):
+        self.assertEqual(TrinoWarehouse._name_key('Rajaa Stones Limited'),
+                         TrinoWarehouse._name_key('RAJAA STONES LTD'))
+        self.assertEqual(TrinoWarehouse._name_key('Rajaa Stones Limited'), 'RAJAASTONESLTD')
+
+    def test_other_company_words_fold_too(self):
+        self.assertEqual(TrinoWarehouse._name_key('Acme Company'),
+                         TrinoWarehouse._name_key('ACME CO'))
+        self.assertEqual(TrinoWarehouse._name_key('A and B Ltd'),
+                         TrinoWarehouse._name_key('A & B LIMITED'))
+
+    def test_a_synonym_inside_a_word_is_not_folded(self):
+        """LIMITEDACCESS must not become LTDACCESS."""
+        self.assertEqual(TrinoWarehouse._name_key('Limitedaccess Holdings'),
+                         'LIMITEDACCESSHOLDINGS')
+
+    def test_the_sql_key_folds_the_same_way_without_capture_groups(self):
+        """Trino rejects ${1} and a stray backslash would silently stop every name
+        comparison matching, so the SQL side uses padded plain REPLACEs instead."""
+        sql = TrinoWarehouse._sql_name_key('name')
+        self.assertIn("REPLACE", sql)
+        self.assertNotIn('$1', sql)
+        self.assertNotIn('\1', sql)
+        self.assertIn("' LIMITED '", sql)
+
+
+class ReceiptEvidenceTests(SimpleTestCase):
+    """Premium receipts prove a relationship the policy table lost.
+
+    5,956 of 16,952 register clients have no policy row at all, while 31,975 receipts
+    exist. Telling an RM "no policies" about a customer with 133 receipts is wrong.
+    """
+
+    class _WithReceipts(_Warehouse):
+        def execute(self, sql, params=None):
+            if 'hfbi_receipt_data' in sql:
+                return [{'receipts': 133, 'risknotes': ['RN1', 'RN2', '']}]
+            if 'rpt_c360_customer_policies_summary' in sql and 'count(' not in sql.lower():
+                return []            # the policy extract lost them
+            return super().execute(sql, params)
+
+    def test_receipts_are_reported_when_no_policy_survived(self):
+        gw = TrinoWarehouse(self._WithReceipts(bank_nid='', bank_mobile=''))
+        out = gw.get_bancassurance(str(RAJAA_BANK), None)
+        self.assertIsNotNone(out)
+        self.assertEqual(out['policies'], [])
+        self.assertEqual(out['receipts']['receipts'], 133)
+        self.assertIn('premium receipts', out['match_note'])
+        self.assertIn('not from the relationship', out['match_note'])
+
+    def test_blank_risknotes_are_dropped(self):
+        gw = TrinoWarehouse(self._WithReceipts(bank_nid='', bank_mobile=''))
+        out = gw.get_bancassurance(str(RAJAA_BANK), None)
+        self.assertEqual(out['receipts']['risknotes'], ['RN1', 'RN2'])
+
+    def test_no_money_or_dates_are_claimed(self):
+        """receipt_date is NULL on all 31,975 rows and receipt_amount is negative on
+        24,693 with no documented sign convention. A count is the only honest figure."""
+        gw = TrinoWarehouse(self._WithReceipts(bank_nid='', bank_mobile=''))
+        rc = gw.get_bancassurance(str(RAJAA_BANK), None)['receipts']
+        self.assertNotIn('total_paid', rc)
+        self.assertFalse(rc['amounts_available'])
+        self.assertFalse(rc['dates_available'])

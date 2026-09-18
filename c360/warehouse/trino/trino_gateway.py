@@ -177,6 +177,9 @@ class TrinoWarehouse(WarehouseGateway):
         # once from the curated Postgres and memoised. None = not yet probed; the
         # sentinel _ALLOC_NONE = probed and unavailable (cached on a TTL so a down PG
         # is retried, not hammered). See _alloc_schema / get_current_rm.
+        # client_no -> insurance-register name, filled as clients resolve. Receipts
+        # are keyed by name rather than client number, so this is the hop between them.
+        self._client_names = {}
         self._alloc_meta: dict[str, str] | None = None
         self._alloc_meta_at: float = 0.0
         self._as_of: date | None = None
@@ -2497,6 +2500,23 @@ class TrinoWarehouse(WarehouseGateway):
         digits = _re.sub(r'[^0-9]', '', str(value or ''))
         return digits[-cls._PHONE_KEY_DIGITS:] if len(digits) >= cls._PHONE_KEY_DIGITS else ''
 
+    @classmethod
+    def _sql_name_key(cls, column: str) -> str:
+        """``_name_key`` in Trino, so both sides of a join reduce identically.
+
+        No capture groups: every run of non-alphanumerics becomes one space and the
+        ends are padded, which makes a plain REPLACE of ' LIMITED ' with ' LTD ' a
+        word-boundary fold. LIMITEDACCESS keeps its spelling because there is no space
+        inside it. This mirrors the Python side, which splits on non-alphanumerics and
+        maps whole words, so the two cannot drift apart.
+        """
+        expr = (f"CONCAT(' ', REGEXP_REPLACE(UPPER(COALESCE({column}, '')), "
+                f"'[^A-Z0-9]+', ' '), ' ')")
+        for word, repl in cls._NAME_SYNONYMS.items():
+            replacement = f" {repl} " if repl else ' '
+            expr = f"REPLACE({expr}, ' {word} ', '{replacement}')"
+        return f"REGEXP_REPLACE({expr}, '[^A-Z0-9]', '')"
+
     @staticmethod
     def _sql_phone_key(column: str) -> str:
         """The same reduction, in Trino, so both sides of a join agree."""
@@ -2520,7 +2540,8 @@ class TrinoWarehouse(WarehouseGateway):
         if not clauses:
             return {}
         rows = self._t.execute(
-            "SELECT DISTINCT TRIM(h.client_no) client_no, TRIM(h.idno) idno, h.phone "
+            "SELECT DISTINCT TRIM(h.client_no) client_no, TRIM(h.idno) idno, h.phone, "
+            "TRIM(h.name) name "
             "FROM delta.gold_db.hfbi_customer_data h "
             f"WHERE TRIM(COALESCE(h.client_no, '')) <> '' AND ({' OR '.join(clauses)})",
             tuple(params))
@@ -2533,18 +2554,43 @@ class TrinoWarehouse(WarehouseGateway):
             # An ID match outranks a phone match for the same client.
             if by_id or client_no not in out:
                 out[client_no] = 'national ID' if by_id else 'phone'
+            name = self._clean(r.get('name'))
+            if name:
+                self._client_names[client_no] = name
         return out
 
     #: A normalised name shorter than this is not distinctive enough to bridge on,
     #: however unique it happens to be in today's data.
     _NAME_BRIDGE_MIN_CHARS = 6
 
-    @staticmethod
-    def _name_key(value) -> str:
-        """Upper-case, letters and digits only. 'Rajaa Stones Limited' ->
-        'RAJAASTONESLIMITED', which is how the same company survives being typed
-        differently in two systems."""
-        return _re.sub(r'[^A-Za-z0-9]', '', str(value or '')).upper()
+    #: client_no -> the insurance register's spelling of that client's name, filled in
+    #: as clients are resolved. Receipts are keyed by name, not by client number, so
+    #: this is how a client resolved by ID or phone can then be found in the receipts.
+    _client_names: dict[str, str]
+
+    #: Words that mean the same thing in a company name. Folded BEFORE the key is
+    #: built, and applied to both sides of every comparison, so 'Rajaa Stones Limited'
+    #: and 'RAJAA STONES LTD' reduce to one key. Systemic rather than cosmetic:
+    #: receipts end in LTD 1,669 times and LIMITED 1,636.
+    _NAME_SYNONYMS = {
+        'LIMITED': 'LTD',
+        'COMPANY': 'CO',
+        'INCORPORATED': 'INC',
+        'CORPORATION': 'CORP',
+        'AND': '',
+    }
+
+    @classmethod
+    def _name_key(cls, value) -> str:
+        """A comparable key for a party name.
+
+        'Rajaa Stones Limited' and 'RAJAA STONES LTD' both become 'RAJAASTONESLTD'.
+        Word-level folding first, then punctuation and case are dropped, so a synonym
+        is only replaced when it IS a word rather than part of one.
+        """
+        words = _re.split(r'[^A-Za-z0-9]+', str(value or '').upper())
+        folded = [cls._NAME_SYNONYMS.get(w, w) for w in words if w]
+        return ''.join(folded)
 
     def _insurance_client_by_name(self, full_name: str) -> str | None:
         """The insurance client whose name matches this customer's, when that name
@@ -2558,16 +2604,21 @@ class TrinoWarehouse(WarehouseGateway):
         key = self._name_key(full_name)
         if len(key) < self._NAME_BRIDGE_MIN_CHARS:
             return None
-        norm_h = "UPPER(REGEXP_REPLACE(COALESCE(name, ''), '[^A-Za-z0-9]', ''))"
+        norm_h = self._sql_name_key('name')
         hrows = self._t.execute(
-            f"SELECT count(*) n, MIN(TRIM(client_no)) client_no "
+            f"SELECT count(*) n, MIN(TRIM(client_no)) client_no, MIN(TRIM(name)) name "
             f"FROM delta.gold_db.hfbi_customer_data WHERE {norm_h} = ?", (key,))
         if not hrows or int(hrows[0].get('n') or 0) != 1:
             return None
         client_no = self._clean(hrows[0].get('client_no'))
         if not client_no:
             return None
-        norm_d = "UPPER(REGEXP_REPLACE(COALESCE(full_name, ''), '[^A-Za-z0-9]', ''))"
+        # Remember the register's spelling: receipts are keyed by name, not by client
+        # number, so without this a client resolved here has no way into them.
+        name = self._clean(hrows[0].get('name'))
+        if name:
+            self._client_names[client_no] = name
+        norm_d = self._sql_name_key('full_name')
         drows = self._t.execute(
             f"SELECT count(*) n FROM delta.gold_db.dim_customer WHERE {norm_d} = ?", (key,))
         if not drows or int(drows[0].get('n') or 0) != 1:
@@ -2575,6 +2626,43 @@ class TrinoWarehouse(WarehouseGateway):
             # one. SUSAN WANJIKU KARIUKI (five records) lands here.
             return None
         return client_no
+
+    def _insurance_receipts(self, names: list[str]) -> dict[str, Any] | None:
+        """Premium receipts for these client names, and the risknotes they paid against.
+
+        receipt_client is a free-text NAME, so this matches on the normalised form.
+        That is the same trade the rest of the insurance bridging makes, and it is
+        made here on a name we already resolved through a stronger bridge rather than
+        on the customer's own name, so it does not widen the blast radius.
+        """
+        keys = [k for k in {self._name_key(n) for n in names if n}
+                if len(k) >= self._NAME_BRIDGE_MIN_CHARS]
+        if not keys:
+            return None
+        placeholders = ','.join(['?'] * len(keys))
+        norm = self._sql_name_key('receipt_client')
+        # Count and risknotes only. receipt_date is NULL on all 31,975 rows, and
+        # receipt_amount is negative on 24,693 of them with no event_type and no
+        # documented sign convention - Rajaa Stones alone nets to -3,020,025 across
+        # 136 receipts. A count proves the relationship; a negative "premiums paid"
+        # would misinform, and an absolute value would assert a convention nobody has
+        # confirmed. Both questions are with the insurance team.
+        rows = self._t.execute(
+            f"SELECT count(*) receipts, "
+            f"ARRAY_AGG(DISTINCT TRIM(COALESCE(receipt_risknote_no, ''))) risknotes "
+            f"FROM delta.gold_db.hfbi_receipt_data WHERE {norm} IN ({placeholders})",
+            tuple(keys))
+        if not rows or not int(rows[0].get('receipts') or 0):
+            return None
+        r = rows[0]
+        risknotes = sorted({n for n in (r.get('risknotes') or []) if n})
+        return {
+            'receipts': int(r.get('receipts') or 0),
+            'risknotes': risknotes,
+            # Stated so the panel never implies it is withholding a figure it has.
+            'amounts_available': False,
+            'dates_available': False,
+        }
 
     def get_bancassurance(self, cust_id, period):
         """Insurance policies held by a bank customer.
@@ -2649,6 +2737,28 @@ class TrinoWarehouse(WarehouseGateway):
         # blank on 98% of rows (57,188 of 58,504), so filtering or grouping by it
         # discards almost the whole book - which is precisely why a customer with four
         # annual renewals on file was shown nothing at all.
+        # Premium receipts for the clients we resolved. This is the most complete
+        # record of an insurance relationship the warehouse holds: 5,956 register
+        # clients have no policy row at all, and 31,975 receipts do.
+        receipts = None
+        try:
+            names = [self._client_names.get(c) for c in clients]
+            receipts = self._insurance_receipts([n for n in names if n])
+        except Exception:
+            logger.warning('bancassurance: receipt lookup failed for %s', cust_id, exc_info=True)
+
+        # Every receipt carries a risknote, and the policy table is keyed by the same
+        # risknote - which reaches policies policy_client_no cannot. Bounded, because
+        # a long-standing client can have dozens.
+        risknotes = (receipts or {}).get('risknotes') or []
+        if risknotes:
+            marks = ','.join(['?'] * len(risknotes[:60]))
+            clauses.append(
+                "TRIM(s.policy_client_no) IN (SELECT DISTINCT TRIM(pd.policy_client_no) "
+                "FROM delta.gold_db.hfbi_policy_data pd "
+                f"WHERE TRIM(pd.policy_risknote_no) IN ({marks}))")
+            params.extend(risknotes[:60])
+
         rows = self._t.execute(
             "SELECT TRIM(s.policy_client_no) client_no, TRIM(s.product) product, "
             "TRIM(s.policy_start_date) start_dt, TRIM(s.policy_end_date) end_dt, "
@@ -2662,6 +2772,23 @@ class TrinoWarehouse(WarehouseGateway):
             "TRIM(s.policy_start_date), TRIM(s.policy_end_date), "
             "COALESCE(s.policy_sum_insured, 0)", tuple(params))
         if not rows:
+            # No policy survived the extract - but premium receipts prove the
+            # relationship exists, and telling an RM "no policies" while the customer
+            # has paid 29 premiums is worse than saying what we actually know.
+            if receipts:
+                return {
+                    'policies': [],
+                    'active': 0,
+                    'expired': 0,
+                    'unnumbered': 0,
+                    'phone_matched': 0,
+                    'name_matched': 0,
+                    'receipts': receipts,
+                    'match_note': (
+                        'No policy record survives in the warehouse for this customer, but '
+                        f"{receipts['receipts']} premium receipts do. The policy detail is "
+                        'missing from the insurance extract, not from the relationship.'),
+                }
             # Distinguish a genuinely policy-free customer from an empty or
             # unreachable source (see get_properties).
             if not self._source_has_rows('delta.gold_db.rpt_c360_customer_policies_summary'):
@@ -2713,6 +2840,9 @@ class TrinoWarehouse(WarehouseGateway):
             # the panel says so and says how many.
             'phone_matched': phone_only,
             'name_matched': name_only,
+            # Premiums actually paid, which is a harder fact than a policy record and
+            # often the only one that survived.
+            'receipts': receipts,
             'match_note': _match_note(phone_only, name_only),
         }
 
