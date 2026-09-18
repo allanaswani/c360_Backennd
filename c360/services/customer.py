@@ -407,6 +407,19 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     # generic 'pending the property register CRM integration' placeholder would report a known,
     # exact figure as unsourced - and leave the page reading as if we hold nothing
     # on someone with six units. Their number comes straight off the register.
+    # Insurance value: the annual premium across the policies this customer holds.
+    # The row used to be a flat 'not sourced' for everyone, so a customer with 28
+    # policies and a real premium still read as nothing on the overview. That is the
+    # zero people have been reporting. None (not 0) when they genuinely hold no
+    # policy, which keeps the honest 'not sourced' state for that case.
+    insurance_value = None
+    try:
+        banc = gateway.get_bancassurance(cust_id, None)
+    except Exception:
+        banc = None
+    if banc and banc.get('policies'):
+        insurance_value = round(sum(p.get('premium') or 0 for p in banc['policies']))
+
     hfdi_value = None
     client_id_int = prop_reg.parse_id(cust_id)
     if client_id_int is not None:
@@ -438,7 +451,12 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
              if hfdi_value is not None else
              {'domain': brand.DOMAIN_LABELS['property'], 'value': None, 'status': Provenance.TO_SOURCE.value,
               'note': f'Properties value pending the {brand.PROPERTY} CRM feed.'}),
-            {'domain': brand.DOMAIN_LABELS['insurance'], 'value': None, 'status': Provenance.TO_SOURCE.value,
-             'note': 'Customer-level bancassurance value is a known gap (§7A.5).'},
+            ({'domain': brand.DOMAIN_LABELS['insurance'], 'value': insurance_value,
+              'status': Provenance.LIVE.value,
+              'note': 'Annual premium across the policies held.'}
+             if insurance_value is not None else
+             {'domain': brand.DOMAIN_LABELS['insurance'], 'value': None,
+              'status': Provenance.TO_SOURCE.value,
+              'note': 'No insurance policy linked to this customer.'}),
         ],
     }

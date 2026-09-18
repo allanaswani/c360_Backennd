@@ -291,8 +291,52 @@ class TrinoWarehouse(WarehouseGateway):
         ('customers_whizz', 'Whizz (digital)', 'Domains', 'delta.gold_db.customers_whizz', 'count'),
         ('rpt_property', 'Properties source', 'Domains', 'delta.gold_db.rpt_c360_customer_property', 'count'),
         ('hfdi_mortgage', 'Mortgage flags', 'Domains', 'delta.gold_db.hfdi_mortgage_data', 'count'),
-        ('rpt_policies', 'Bancassurance source', 'Domains', 'delta.gold_db.rpt_c360_customer_policies_summary', 'count'),
+        ('rpt_policies', 'Policy summary', 'Insurance', 'delta.gold_db.rpt_c360_customer_policies_summary', 'count'),
+        # Added after the insurance work: the app now depends on all of these, and a
+        # health page that lists eight tables while the app reads eighteen tells ops
+        # the warehouse is fine when half of what a page needs has gone.
+        ('hfbi_customers', 'Insurance client register', 'Insurance', 'delta.gold_db.hfbi_customer_data', 'count'),
+        ('hfbi_receipts', 'Premium receipts', 'Insurance', 'delta.gold_db.hfbi_receipt_data', 'count'),
+        ('hfbi_policies', 'Policy master', 'Insurance', 'delta.gold_db.hfbi_policy_data', 'count'),
+        ('hfbi_claims', 'Insurance claims', 'Insurance', 'delta.gold_db.hfbi_claim_data', 'count'),
+        ('hfdi_clients', 'Property client register', 'Domains', 'delta.gold_db.hfdi_client_data', 'count'),
+        ('npl_accounts', 'NPL classifications', 'Credit', 'delta.gold_db.npl_accounts', 'count'),
+        ('pre_npl_accounts', 'Watch list', 'Credit', 'delta.gold_db.pre_npl_accounts', 'count'),
     ]
+
+    # The curated reporting Postgres, checked separately because a failure there is a
+    # different outage from a warehouse failure: the book page loses its allocation
+    # and its balances while every Trino-backed page carries on working.
+    _PG_HEALTH_CHECKS = [
+        ('allocation_base', 'Allocation upload', 'Reporting Postgres', 'customer_allocation_base'),
+        ('retail_allocation', 'RM allocation', 'Reporting Postgres', 'retail_allocated_portfolio'),
+        ('dep_movement', 'Deposit balances', 'Reporting Postgres', 'daily_balance_movement'),
+        ('loan_movement', 'Loan balances', 'Reporting Postgres', 'loan_daily_balance_movement'),
+        ('relationship', 'Related-party register', 'Reporting Postgres', 'public.relationship'),
+    ]
+
+    def _run_pg_health_check(self, key, label, group, table):
+        """Row count for one reporting-Postgres table.
+
+        Reported as its own group rather than mixed in with the warehouse, because
+        'Postgres is down' and 'the warehouse is down' break different pages and an
+        ops person needs to tell them apart at a glance.
+        """
+        base = {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1]}
+        if self._pg is None:
+            return {**base, 'status': 'error', 'value': None, 'latency_ms': 0,
+                    'detail': 'reporting Postgres is not configured'}
+        t0 = time.monotonic()
+        try:
+            rows = self._pg.execute(f'SELECT COUNT(*) AS n FROM {table}')
+            n = int(rows[0]['n']) if rows else 0
+            return {**base, 'status': 'ok' if n > 0 else 'empty', 'value': n,
+                    'latency_ms': round((time.monotonic() - t0) * 1000),
+                    'detail': f'{n:,} rows' if n > 0 else 'table is empty - source data not loaded'}
+        except Exception as e:
+            return {**base, 'status': 'error', 'value': None,
+                    'latency_ms': round((time.monotonic() - t0) * 1000),
+                    'detail': f'{type(e).__name__}: {str(e)[:140]}'}
 
     def _run_health_check(self, key, label, group, table, mode):
         base = {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1]}
@@ -409,12 +453,16 @@ class TrinoWarehouse(WarehouseGateway):
         if conn['status'] == 'error':
             # Can't reach/authenticate the warehouse — running the 8 table checks would
             # just repeat this error, so mark them not-checked and point at the real cause.
-            checks = system + [self._skipped_check(*spec) for spec in self._HEALTH_CHECKS]
+            # Postgres is a separate estate: the warehouse being unreachable says
+            # nothing about it, so those checks still run and still report.
+            checks = (system + [self._skipped_check(*spec) for spec in self._HEALTH_CHECKS]
+                      + [self._run_pg_health_check(*spec) for spec in self._PG_HEALTH_CHECKS])
             freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
                          'detail': 'warehouse unreachable — see System · Warehouse connection'}
             return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
 
-        checks = system + [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
+        checks = (system + [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
+                  + [self._run_pg_health_check(*spec) for spec in self._PG_HEALTH_CHECKS])
         try:
             asof = self.as_of_date()
             days = (date.today() - asof).days
@@ -3027,6 +3075,57 @@ class TrinoWarehouse(WarehouseGateway):
             return None
         return int(rows[0].get('n') or 0) if rows else None
 
+    def _safe_claims(self, risknotes: list[str]) -> dict[str, Any] | None:
+        """Claims, or nothing. A rare-event probe must never take the panel down."""
+        try:
+            return self._insurance_claims(risknotes)
+        except Exception:
+            logger.warning('insurance claims lookup failed', exc_info=True)
+            return None
+
+    def _insurance_claims(self, risknotes: list[str]) -> dict[str, Any] | None:
+        """Claims registered against this client's risknotes.
+
+        Claims are rare - 223 across the whole book - and that is the point. A
+        customer who has claimed is in a different conversation from one who has not,
+        and the worst version of this page is one that lets an RM walk into a renewal
+        without knowing there is an open claim.
+
+        No money total: 181 of the 223 carry no estimated loss, so a sum would
+        describe a fifth of them and be read as all of them.
+        """
+        notes = [n for n in dict.fromkeys(risknotes) if n][:60]
+        if not notes:
+            return None
+        marks = ','.join(['?'] * len(notes))
+        rows = self._t.execute(
+            "SELECT TRIM(claim_status) status, count(*) n, "
+            "MAX(TRIM(claim_incident_date)) latest_incident "
+            "FROM delta.gold_db.hfbi_claim_data "
+            f"WHERE TRIM(claim_risknote_no) IN ({marks}) GROUP BY 1", tuple(notes))
+        if not rows:
+            return None
+        by_status = {}
+        total = 0
+        latest = None
+        for r in rows:
+            label = (self._clean(r.get('status')) or 'Unknown').title()
+            n = int(r.get('n') or 0)
+            by_status[label] = by_status.get(label, 0) + n
+            total += n
+            inc = self._safe_date(r.get('latest_incident'))
+            if inc and (latest is None or str(inc) > str(latest)):
+                latest = inc
+        if not total:
+            return None
+        return {
+            'total': total,
+            'by_status': by_status,
+            'latest_incident': latest,
+            # Stated so the panel never implies it is withholding a figure it has.
+            'amounts_available': False,
+        }
+
     def get_bancassurance(self, cust_id, period):
         """Insurance policies held by a bank customer.
 
@@ -3147,6 +3246,7 @@ class TrinoWarehouse(WarehouseGateway):
                     'phone_matched': 0,
                     'name_matched': 0,
                     'receipts': receipts,
+                    'claims': self._safe_claims(receipts.get('risknotes') or []),
                     'match_note': (
                         'No policy record survives in the warehouse for this customer, but '
                         f"{receipts['receipts']} premium receipts do. The policy detail is "
@@ -3206,6 +3306,8 @@ class TrinoWarehouse(WarehouseGateway):
             # Premiums actually paid, which is a harder fact than a policy record and
             # often the only one that survived.
             'receipts': receipts,
+            # Rare and high-salience: an open claim changes the conversation.
+            'claims': self._safe_claims((receipts or {}).get('risknotes') or []),
             'match_note': _match_note(phone_only, name_only),
         }
 

@@ -22,6 +22,8 @@ from ..warehouse.periods import ResolvedPeriod
 
 PREVIEW = 'preview'
 LIVE = 'live'
+#: A figure the source genuinely does not state, as opposed to one that is zero.
+TO_SOURCE = 'to_source'
 
 
 def _metric(label, value, unit, *, lead=False, tone=None, status=PREVIEW, meta=None, spark=None):
@@ -209,29 +211,68 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
         if not p.get('policy'):
             p['policy'] = 'No policy number on file'
 
+    claims = data.get('claims')
     total_premium = sum(p['premium'] for p in policies)
     total_insured = sum(p['sum_insured'] for p in policies)
     total_monthly = sum(p['monthly'] for p in policies)
     n_active = sum(1 for p in policies if str(p.get('status', '')).lower() == 'active')
 
-    # Premium by product (dedup-safe: policies are already one row per policy_no).
+    # Premium by product, kept ONLY when the feed names more than one. product is
+    # blank on all 58,504 rows today, so this is empty and the chart is omitted
+    # rather than drawn as a single slice labelled "Insurance policy". If the
+    # insurance team populates the column, the chart returns on its own.
     by_product: dict[str, int] = {}
     for p in policies:
         by_product[p['product']] = by_product.get(p['product'], 0) + p['premium']
+    named_products = {k: v for k, v in by_product.items() if k and k != 'Insurance policy'}
+
+    # These are annual renewals, so the year is the axis the data supports. It turns
+    # 28 identical bars into a handful of meaningful ones and answers the question an
+    # RM actually has: is this relationship growing or shrinking?
+    by_year: dict[str, int] = {}
+    for p in policies:
+        term = p.get('end') or p.get('start')
+        year = str(term)[:4] if term else None
+        if year and year.isdigit():
+            by_year[year] = by_year.get(year, 0) + p['premium']
+    year_rows = [{'label': y, 'value': v, 'colorRole': 1}
+                 for y, v in sorted(by_year.items())]
+
+    # Sum insured is zero on 21% of the book, so the total is only meaningful when
+    # something carries a figure. A bare KES 0 reads as "no cover", which is a
+    # different claim from "the feed does not say".
+    insured_known = sum(1 for p in policies if p['sum_insured'])
 
     return {
         'cust_id': cust_id, 'domain': 'Bancassurance', 'preview': not live, 'period': period.to_dict(),
         'metrics': [
             _metric('Annual premium', total_premium, 'KES', lead=True, status=st),
             _metric('Monthly payments', total_monthly, 'KES', status=st),
-            _metric('Sum insured', total_insured, 'KES', status=st),
+            (_metric('Sum insured', total_insured, 'KES', status=st,
+                     meta=(None if insured_known == len(policies)
+                           else f'{len(policies) - insured_known} of {len(policies)} '
+                                f'policies carry no sum insured'))
+             if insured_known else
+             _metric('Sum insured', None, 'KES', status=TO_SOURCE,
+                     meta='not stated on any of these policies')),
             _metric('Policies', len(policies), 'count', status=st,
                     meta=(f'{n_active} active' if n_active
                           else 'none currently active')),
-        ],
+        ] + ([
+            # Only when there IS a claim. 223 exist across 11,105 clients, so this
+            # tile is absent almost always - and when it appears it is the most
+            # important thing on the panel. Walking into a renewal without knowing
+            # there is an open claim is the failure this prevents.
+            _metric('Claims', claims['total'], 'count', status=st,
+                    meta=', '.join(f'{n} {label.lower()}'
+                                   for label, n in sorted(claims['by_status'].items())))
+        ] if claims else []),
         # How these policies were linked to this customer, when it was by something
         # weaker than a national ID. Null when every one matched on ID.
         'match_note': data.get('match_note'),
+        # Claims are rare (223 across the whole book) and that is why they are on the
+        # page rather than in a report. None when this customer has never claimed.
+        'claims': data.get('claims'),
         'coverage': {
             'active': n_active,
             'expired': len(policies) - n_active,
@@ -242,17 +283,19 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
             'matched_by_name': data.get('name_matched', 0),
         },
         'charts': [
-            {'kind': 'bars', 'id': 'monthly', 'title': 'Monthly payment per policy',
-             'question': 'What does this customer pay each month, per policy?', 'status': st, 'fmt': 'kes',
-             'data': [{'label': p['product'], 'value': p['monthly'], 'colorRole': 1} for p in policies]},
-            {'kind': 'donut', 'id': 'mix', 'title': 'Premium by product',
-             'question': "What's insured, and where is the premium concentrated?", 'status': st, 'fmt': 'kes',
-             'data': [{'label': prod, 'value': val} for prod, val in
-                      sorted(by_product.items(), key=lambda kv: kv[1], reverse=True)]},
-            {'kind': 'bars', 'id': 'insured', 'title': 'Sum insured per policy',
-             'question': 'How much cover does each policy carry?', 'status': st, 'fmt': 'kes',
-             'data': [{'label': p['product'], 'value': p['sum_insured'], 'colorRole': 4}
-                      for p in policies]},
+            c for c in [
+                ({'kind': 'bars', 'id': 'by_year', 'title': 'Premium by year',
+                  'question': 'Is this insurance relationship growing or shrinking?',
+                  'status': st, 'fmt': 'kes', 'data': year_rows}
+                 if len(year_rows) > 1 else None),
+                # Only when the feed actually names products. Today it never does.
+                ({'kind': 'donut', 'id': 'mix', 'title': 'Premium by product',
+                  'question': "What's insured, and where is the premium concentrated?",
+                  'status': st, 'fmt': 'kes',
+                  'data': [{'label': prod, 'value': val} for prod, val in
+                           sorted(named_products.items(), key=lambda kv: kv[1], reverse=True)]}
+                 if len(named_products) > 1 else None),
+            ] if c
         ],
         'tables': [
             {'id': 'policies', 'title': 'Policies held', 'status': st,
