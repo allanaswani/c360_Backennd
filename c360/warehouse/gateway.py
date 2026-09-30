@@ -262,6 +262,36 @@ class WarehouseGateway(abc.ABC):
     def get_book_summary(self, sales_code: str | None) -> dict[str, Any] | None:
         return None
 
+    # --- customer insights (optional capabilities; live gateway overrides) ----
+    # Each returns None when the source is not available to this gateway, which the
+    # insights service reports as "not available" - never as an empty holding.
+    def get_product_mix(self, cust_id) -> dict[str, Any] | None:
+        """Accounts held grouped by the official product tree (c360/products.py)."""
+        return None
+
+    def get_facilities(self, cust_id) -> dict[str, Any] | None:
+        """Sanctioned facilities vs outstanding + mobile-loan history (c360/facilities.py)."""
+        return None
+
+    def get_activity(self, cust_id) -> dict[str, Any] | None:
+        """90-day transaction activity by purpose (c360/activity.py)."""
+        return None
+
+    def get_customer_profile(self, cust_id) -> dict[str, Any] | None:
+        """AML risk, income band, profession … + cards (c360/customer_profile.py)."""
+        return None
+
+    def has_active_card(self, cust_id) -> bool | None:
+        return None
+
+    def get_revenue(self, cust_id) -> dict[str, Any] | None:
+        """Monthly revenue earned from the customer this year."""
+        return None
+
+    def activity_prospects(self, limit_per_rule: int = 40) -> dict[str, Any] | None:
+        """Whole-book activity cross-sell call list, or None when unavailable."""
+        return None
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

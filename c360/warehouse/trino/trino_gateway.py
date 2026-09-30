@@ -31,7 +31,11 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
+from ... import activity as activity_shape
 from ... import credit_bureau as bureau_shape
+from ... import customer_profile as profile_shape
+from ... import facilities as facilities_shape
+from ... import products as products_shape
 from ... import brand
 from ... import crm as crm_shape
 from ... import property_register as prop_reg
@@ -3539,3 +3543,315 @@ class TrinoWarehouse(WarehouseGateway):
         if not delinquency and not collateral:
             return None
         return {'delinquency': delinquency, 'collateral': collateral}
+
+    # --- product mix (the bank's official product tree) -----------------------
+    def get_product_mix(self, cust_id):
+        """Accounts held at the latest close, grouped by the core-banking product tree
+        (``w_dim_product``) into current / savings / fixed deposit / … and loan types.
+        See c360/products.py for why the tree, not keywords, and for the three places
+        the tree needs correcting. None for a non-bank id."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        d, pp = self._as_of_lit(), self._asof_part()
+        dep = self._t.execute(
+            f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, "
+            f"TRIM(e.account_no) account_no, e.book_balance balance, e.entry_status "
+            f"FROM delta.gold_db.eom_deposits e "
+            f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
+            f"WHERE e.eom_date = {d} {pp.replace('partition_', 'e.partition_')} "
+            f"AND e.cust_id = ? AND e.book_balance <> 0", (cid,))
+        loan = self._t.execute(
+            f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, "
+            f"TRIM(e.account_no) account_no, e.gross_total balance, "
+            f"TRIM(e.loan_status_ind_name) status, CAST(e.acc_open_dt AS varchar) opened "
+            f"FROM delta.gold_db.eom_loans e "
+            f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
+            f"WHERE e.eom_date = {d} {pp.replace('partition_', 'e.partition_')} "
+            f"AND e.cust_id = ? AND e.gross_total <> 0", (cid,))
+        dep_rows = [{'level2': r.get('l2'), 'product': r.get('product'),
+                     'balance': float(r.get('balance') or 0)} for r in dep]
+        loan_rows = [{'level2': r.get('l2'), 'product': r.get('product'),
+                      'balance': float(r.get('balance') or 0)} for r in loan]
+        mix = products_shape.summarise(dep_rows, loan_rows)
+        accounts = []
+        for r in dep:
+            cat = products_shape.deposit_category(r.get('l2'), r.get('product'))
+            if not cat:
+                continue
+            es = str(r.get('entry_status')).split('.')[0] if r.get('entry_status') is not None else ''
+            accounts.append({'category': cat[1], 'product': self._clean(r.get('product')),
+                             'account_no': self._clean(r.get('account_no')),
+                             'balance': round(float(r.get('balance') or 0)),
+                             'status': _ENTRY_STATUS.get(es, 'Active'), 'side': 'deposit'})
+        for r in loan:
+            cat = products_shape.loan_category(r.get('l2'))
+            if not cat:
+                continue
+            accounts.append({'category': cat[1], 'product': self._clean(r.get('product')),
+                             'account_no': self._clean(r.get('account_no')),
+                             'balance': round(float(r.get('balance') or 0)),
+                             'status': self._clean(r.get('status')) or 'Active', 'side': 'loan',
+                             'opened': self._safe_date(r.get('opened'))})
+        mix['accounts'] = accounts
+        mix['liquid_balance'] = sum(g['balance'] for g in mix['deposits']
+                                    if g['key'] in ('current', 'current_fcy', 'savings', 'notice'))
+        mix['as_of'] = self.as_of_date().isoformat()
+        return mix
+
+    # --- credit facilities + mobile-loan history (eom_agreement) ---------------
+    _AGR_TTL_SECONDS = 1800
+
+    def _agreement_as_of(self) -> date | None:
+        """Newest ``eom_agreement`` snapshot on or before the app's as-of date. The table
+        is not partitioned, so the probe is bounded to a 10-day window and memoised."""
+        now = time.monotonic()
+        cached = getattr(self, '_agr_asof', None)
+        if cached is not None and (now - getattr(self, '_agr_asof_at', 0.0)) < self._AGR_TTL_SECONDS:
+            return cached
+        asof = self.as_of_date()
+        rows = self._t.execute(
+            f"SELECT max(eom_date) d FROM delta.gold_db.eom_agreement "
+            f"WHERE eom_date <= {self._date_lit(asof)} "
+            f"AND eom_date >= {self._date_lit(asof - timedelta(days=10))}")
+        d = rows[0]['d'] if rows and rows[0].get('d') else None
+        if d is not None:
+            self._agr_asof, self._agr_asof_at = d, now
+        return d
+
+    def get_facilities(self, cust_id):
+        """Sanctioned facilities vs outstanding, and the mobile-loan history. See
+        c360/facilities.py for why a mobile loan's agreement amount is NOT a limit."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        agr_date = self._agreement_as_of()
+        if agr_date is None:
+            raise LiveDataNotReady('eom_agreement has no recent snapshot')
+        agr = self._t.execute(
+            f"SELECT TRIM(a.account_number) agr, TRIM(p.description) typ, a.agr_limit lim, "
+            f"CAST(a.agr_issue_dt AS varchar) issued "
+            f"FROM delta.gold_db.eom_agreement a "
+            f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = a.fk_agreement_tyfk "
+            f"WHERE a.eom_date = {self._date_lit(agr_date)} AND a.cust_id = ?", (cid,))
+        if not agr:
+            return None
+        outs = self._t.execute(
+            f"SELECT TRIM(CAST(agreement_number AS varchar)) agr, SUM(gross_total) o "
+            f"FROM delta.gold_db.eom_loans "
+            f"WHERE eom_date = {self._as_of_lit()} {self._asof_part()} AND cust_id = ? "
+            f"GROUP BY 1", (cid,))
+        by_agr = {r.get('agr'): float(r.get('o') or 0) for r in outs}
+        rows = [{'agreement': r.get('agr'), 'type': r.get('typ'),
+                 'limit': float(r.get('lim') or 0), 'issued': self._safe_date(r.get('issued')),
+                 'outstanding': by_agr.get(r.get('agr'), 0.0)} for r in agr]
+        out = facilities_shape.summarise(rows)
+        if not out['facilities'] and not out['mobile']:
+            return None
+        out['as_of'] = agr_date.isoformat()
+        return out
+
+    # --- 90-day transaction activity (the activity cross-sell input) -----------
+    def get_activity(self, cust_id):
+        """{category: {count, value}} over the last 90 days to the as-of date, classified
+        by transaction purpose (c360/activity.py). Customer-facing channels only."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        hi = self.as_of_date()
+        lo = hi - timedelta(days=activity_shape.WINDOW_DAYS - 1)
+        rows = self._t.execute(
+            f"SELECT cat, COUNT(*) n, SUM(amt) v FROM ("
+            f" SELECT amt, {activity_shape.CATEGORY_SQL} cat FROM ("
+            f"  SELECT i_amount amt, UPPER(TRIM(justific_descrption)) j "
+            f"  FROM delta.gold_db.fact_dep_trx_recording "
+            f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
+            f"  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
+            f"  AND i_amount <> 0 "
+            f"  AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}))) "
+            f"WHERE cat IS NOT NULL GROUP BY cat", (cid,))
+        return {'from': lo.isoformat(), 'to': hi.isoformat(),
+                'profile': activity_shape.profile_from_rows(rows)}
+
+    # --- category register (AML risk, income band, …) + cards -----------------
+    def get_customer_profile(self, cust_id):
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        cats = self._t.execute(
+            "SELECT TRIM(c.fk_categorycategor) cat, TRIM(g.description) val "
+            "FROM delta.gold_db.customer_category c "
+            "LEFT JOIN delta.gold_db.generic_detail g "
+            "  ON g.fk_generic_headpar = c.fk_generic_detafk AND g.serial_num = c.fk_generic_detaser "
+            "WHERE c.fk_customercust_id = ?", (cid,))
+        prof = profile_shape.from_categories(cats)
+        cards = self._t.execute(
+            "SELECT TRIM(entry_status_description) st, COUNT(*) n "
+            "FROM delta.gold_db.cust_card_info WHERE fk_customercust_id = ? GROUP BY 1", (cid,))
+        by = {str(r.get('st') or ''): int(r.get('n') or 0) for r in cards}
+        prof['cards'] = {'active': by.get('Active', 0), 'blocked': by.get('Blocked', 0)}
+        prof['aml_tone'] = profile_shape.aml_tone(prof.get('aml_risk'))
+        return prof
+
+    def has_active_card(self, cust_id) -> bool | None:
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        rows = self._t.execute(
+            "SELECT COUNT(*) n FROM delta.gold_db.cust_card_info "
+            "WHERE fk_customercust_id = ? AND TRIM(entry_status_description) = 'Active'", (cid,))
+        return bool(rows and int(rows[0].get('n') or 0) > 0)
+
+    # --- revenue earned from the customer (rpt_ceo_all_revenue_trend) ---------
+    def get_revenue(self, cust_id):
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        rows = self._t.execute(
+            "SELECT month_no m, YEAR(MAX(month_name)) y, TRIM(income_category) c, SUM(revenue) v "
+            "FROM delta.gold_db.rpt_ceo_all_revenue_trend WHERE cust_cif = ? "
+            "GROUP BY month_no, TRIM(income_category)", (cid,))
+        if not rows:
+            return None
+        years = {int(r['y']) for r in rows if r.get('y') is not None}
+        year = max(years) if years else self.as_of_date().year
+        return profile_shape.revenue(
+            [{'month': r.get('m'), 'category': r.get('c'), 'value': r.get('v')}
+             for r in rows if r.get('y') is None or int(r['y']) == year], year=year)
+
+    # --- whole-book activity prospects (management worklist) ------------------
+    def activity_prospects(self, limit_per_rule: int = 40) -> dict[str, Any]:
+        """Customers across the whole book whose last 90 days of transactions trigger an
+        activity rule (c360/activity.py), with the evidence. One scan of 90 days of the
+        transaction ledger + one as-of holdings scan; the caller caches it."""
+        hi = self.as_of_date()
+        lo = hi - timedelta(days=activity_shape.WINDOW_DAYS - 1)
+        d, pp = self._as_of_lit(), self._asof_part()
+        ep = pp.replace('partition_', 'e.partition_')
+        agr_date = self._agreement_as_of()
+        if agr_date is None:
+            raise LiveDataNotReady('eom_agreement has no recent snapshot')
+        cat_sql = activity_shape.CATEGORY_SQL
+        cols = ', '.join(
+            f"SUM(CASE WHEN cat = '{c}' THEN 1 ELSE 0 END) n_{c}, "
+            f"SUM(CASE WHEN cat = '{c}' THEN amt ELSE 0 END) v_{c}"
+            for c in activity_shape.CATEGORIES)
+        rows = self._t.execute(f"""
+            WITH t AS (
+              SELECT customer_id cid, amt, {cat_sql} cat FROM (
+                SELECT customer_id, i_amount amt, UPPER(TRIM(justific_descrption)) j
+                FROM delta.gold_db.fact_dep_trx_recording
+                WHERE 1=1 {self._range_part(lo, hi)}
+                  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)}
+                  AND i_amount <> 0
+                  AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}))),
+            a AS (SELECT cid, {cols} FROM t WHERE cat IS NOT NULL GROUP BY cid),
+            h AS (
+              SELECT e.cust_id cid,
+                SUM(CASE WHEN TRIM(p.tree_level_2) IN ('CURRENT ACCOUNT','SAVINGS ACCOUNT','NOTICE ACCOUNT','OVERDRAFT')
+                          AND UPPER(TRIM(e.product_desc)) <> 'VIRTUAL ACCOUNT MOBILE' THEN e.book_balance ELSE 0 END) liquid,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'TERM DEPOSIT ACCOUNT' THEN 1 ELSE 0 END) h_term_deposit,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'CALL ACCOUNT' THEN 1 ELSE 0 END) h_call_deposit,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'SAVINGS ACCOUNT' THEN 1 ELSE 0 END) h_savings,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'NOTICE ACCOUNT' THEN 1 ELSE 0 END) h_notice
+              FROM delta.gold_db.eom_deposits e
+              JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
+              WHERE e.eom_date = {d} {ep} AND e.book_balance <> 0 GROUP BY 1),
+            l AS (
+              SELECT e.cust_id cid,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'CONSUMER LOANS' THEN 1 ELSE 0 END) h_consumer,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'VUNA HELA' THEN 1 ELSE 0 END) h_vuna_hela,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'MOBILE LOANS' THEN 1 ELSE 0 END) h_mobile_loan,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'HIDDEN ACCOUNT' THEN 1 ELSE 0 END) h_overdraft,
+                MAX(CASE WHEN TRIM(p.tree_level_2) = 'WORKING CAPITAL' THEN 1 ELSE 0 END) h_working_capital
+              FROM delta.gold_db.eom_loans e
+              JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
+              WHERE e.eom_date = {d} {ep} AND e.gross_total <> 0 GROUP BY 1),
+            k AS (SELECT DISTINCT fk_customercust_id cid FROM delta.gold_db.cust_card_info
+                  WHERE TRIM(entry_status_description) = 'Active'),
+            m AS (SELECT DISTINCT ag.cust_id cid FROM delta.gold_db.eom_agreement ag
+                  JOIN delta.gold_db.w_dim_product pa ON pa.product_code = ag.fk_agreement_tyfk
+                  WHERE ag.eom_date = {self._date_lit(agr_date)}
+                    AND (UPPER(pa.description) LIKE '%MOBILE LOAN%' OR UPPER(TRIM(pa.description)) LIKE 'WHIZZ%')
+                    AND ag.agr_issue_dt >= {self._date_lit(hi - timedelta(days=activity_shape.MOBILE_RECENT_DAYS))})
+            SELECT CAST(a.cid AS BIGINT) customer_number, dc.full_name, dc.customer_segment, dc.account_branch_name,
+                   dc.employer, dc.fk_bankemployeeid, dc.cust_type, a.*,
+                   COALESCE(h.liquid, 0) liquid,
+                   COALESCE(h.h_term_deposit, 0) h_term_deposit, COALESCE(h.h_call_deposit, 0) h_call_deposit,
+                   COALESCE(h.h_savings, 0) h_savings, COALESCE(h.h_notice, 0) h_notice,
+                   COALESCE(l.h_consumer, 0) h_consumer, COALESCE(l.h_vuna_hela, 0) h_vuna_hela,
+                   COALESCE(l.h_mobile_loan, 0) h_mobile_loan, COALESCE(l.h_overdraft, 0) h_overdraft,
+                   COALESCE(l.h_working_capital, 0) h_working_capital,
+                   CASE WHEN k.cid IS NULL THEN 0 ELSE 1 END has_card,
+                   CASE WHEN m.cid IS NULL THEN 0 ELSE 1 END recent_mobile
+            FROM a
+            JOIN delta.gold_db.dim_customer dc ON dc.customer_id = a.cid
+            LEFT JOIN h ON h.cid = a.cid
+            LEFT JOIN l ON l.cid = a.cid
+            LEFT JOIN k ON k.cid = a.cid
+            LEFT JOIN m ON m.cid = a.cid
+            WHERE dc.customer_segment <> 'INTERNAL ACCOUNTS'
+              AND (a.n_salary >= {activity_shape.SALARY_MIN}
+                   OR COALESCE(h.liquid, 0) >= {activity_shape.IDLE_LIQUID_MIN}
+                   OR a.n_payments_out + a.n_cheque_in >= {activity_shape.BUSINESS_PAYMENTS_MIN}
+                   OR a.n_mpesa_out >= {activity_shape.MPESA_OUT_MIN}
+                   OR a.n_cash_in + a.n_cash_out >= {activity_shape.CASH_MIN}
+                   OR a.n_cash_out >= {activity_shape.CASH_OUT_NO_CARD_MIN})
+        """)
+        held_cols = ('term_deposit', 'call_deposit', 'savings', 'notice', 'consumer',
+                     'vuna_hela', 'mobile_loan', 'overdraft', 'working_capital')
+        by_rule: dict[str, list[dict]] = {}
+        for r in rows:
+            if is_staff_from_fields(employer=r.get('employer'), segment=r.get('customer_segment'),
+                                    bank_employee_id=r.get('fk_bankemployeeid')):
+                continue   # HF staff are admin-only; never on a management call list
+            prof = activity_shape.empty_profile()
+            for c in activity_shape.CATEGORIES:
+                prof[c] = {'count': int(r.get(f'n_{c}') or 0), 'value': round(float(r.get(f'v_{c}') or 0))}
+            held = {k for k in held_cols if int(r.get(f'h_{k}') or 0)}
+            if int(r.get('recent_mobile') or 0):
+                held.add('mobile_loan')
+            liquid = float(r.get('liquid') or 0)
+            ctype = r.get('cust_type')
+            for opp in activity_shape.opportunities(
+                    prof, held=held, liquid_balance=liquid, has_active_card=bool(r.get('has_card')),
+                    individual=(None if ctype is None else self._is_individual(ctype)),
+                    segment=self._clean(r.get('customer_segment'))):
+                by_rule.setdefault(opp['rule_id'], []).append({
+                    'cust_id': str(r['customer_number']), 'name': self._clean(r.get('full_name')),
+                    'segment': self._seg_label(r.get('customer_segment')),
+                    'branch': self._clean(r.get('account_branch_name')),
+                    'liquid_balance': round(liquid), 'strength': self._opp_strength(opp['rule_id'], prof, liquid),
+                    **{k: opp[k] for k in ('rule_id', 'product', 'product_name', 'domain',
+                                           'reason', 'reason_short', 'evidence')},
+                })
+        rules = []
+        keep: list[dict] = []
+        for rule_id in sorted(by_rule):
+            items = sorted(by_rule[rule_id], key=lambda x: x['strength'], reverse=True)
+            rules.append({'rule_id': rule_id, 'product_name': items[0]['product_name'],
+                          'reason_short': items[0]['reason_short'], 'customers': len(items)})
+            keep.extend(items[:limit_per_rule])
+        alloc = self.get_current_rm([x['cust_id'] for x in keep])
+        for x in keep:
+            cur = alloc.get(x['cust_id']) if alloc else None
+            x['rm_name'] = (cur or {}).get('name')
+        return {'from': lo.isoformat(), 'to': hi.isoformat(), 'rules': rules, 'results': keep}
+
+    @staticmethod
+    def _opp_strength(rule_id: str, prof: dict, liquid: float) -> float:
+        """How strongly a customer shows the behaviour behind a rule, for ordering the
+        call list within that rule (bigger salary, bigger idle balance, …)."""
+        if rule_id in ('T1', 'T2'):
+            return prof['salary']['value']
+        if rule_id == 'T3':
+            return liquid
+        if rule_id == 'T4':
+            return prof['payments_out']['value'] + prof['cheque_in']['value']
+        if rule_id == 'T5':
+            return prof['mpesa_out']['value']
+        if rule_id == 'T6':
+            return prof['cash_in']['count'] + prof['cash_out']['count']
+        if rule_id == 'T7':
+            return prof['cash_out']['value']
+        return 0.0

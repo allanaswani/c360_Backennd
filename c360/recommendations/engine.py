@@ -117,7 +117,33 @@ def _to_item(c: Candidate, *, eligible: bool | None) -> dict[str, Any]:
         'rule_id': c.rule_id,
         'score': round(float(c.base_score), 4) if is_ml else None,
         'eligible': eligible,
+        'evidence': list(c.evidence),
+        'basis': 'activity' if str(c.rule_id).startswith('T') else ('model' if is_ml else 'holdings'),
     }
+
+
+def _activity_candidates(gateway: WarehouseGateway, cust_id: str, customer: dict) -> list[Candidate]:
+    """Opportunities read from the customer's last 90 days of transactions (see
+    c360/activity.py). [] when the activity or holdings could not be read."""
+    try:
+        from ..services.insights import activity_candidates
+        opps = activity_candidates(gateway, cust_id, customer)
+    except Exception:
+        return []
+    return [Candidate(product=o['product'], product_name=o['product_name'], domain=o['domain'],
+                      reason=o['reason'], reason_short=o.get('reason_short', ''),
+                      rule_id=o['rule_id'], base_score=o['base_score'],
+                      evidence=tuple(o.get('evidence') or ())) for o in opps]
+
+
+def _merge_activity(activity: list[Candidate], others: list[Candidate], limit: int) -> list[Candidate]:
+    """Activity opportunities lead - they carry evidence from what the customer does -
+    but never take every slot while the model or holdings rules have something, so
+    both views of the customer stay visible. De-duplicated by product."""
+    rest = [c for c in others if c.product not in {a.product for a in activity}]
+    cap = limit - 1 if rest and limit > 1 else limit
+    picked = activity[:cap]
+    return (picked + rest)[:limit]
 
 
 def _ml_candidates(gateway: WarehouseGateway, cust_id: str, *, limit: int) -> list[Candidate] | None:
@@ -177,13 +203,15 @@ def recommend_for_customer(
     # OR when it yields no *confident* pick for this customer (an empty list). The rules
     # are specific and auditable, so a weak ML guess never crowds out an honest rule —
     # and if the rules are silent too, the panel shows nothing rather than a generic pick.
+    activity = _activity_candidates(gateway, cust_id, customer)
     ml = _ml_candidates(gateway, cust_id, limit=limit)
     if ml:
         try:
             profile = gateway.get_risk_profile(cust_id)
         except Exception:
             profile = None
-        return _result_from(ml[:limit], profile, engine='ml.lgbm-v1')
+        return _result_from(_merge_activity(activity, ml, limit), profile,
+                            engine='ml.lgbm-v1+activity' if activity else 'ml.lgbm-v1')
 
     holdings = gateway.get_product_holdings(cust_id)
     value = gateway.get_relationship_value(cust_id)
@@ -212,12 +240,13 @@ def recommend_for_customer(
     for rule in rules.ALL_RULES:
         candidates.extend(rule(**facts))
 
-    ranked = _dedupe_rank(candidates, value)[:limit]
+    ranked = _merge_activity(activity, _dedupe_rank(candidates, value), limit)
     try:
         profile = gateway.get_risk_profile(cust_id)
     except Exception:
         profile = None
-    return _result_from(ranked, profile)
+    return _result_from(ranked, profile,
+                        engine=f'{ENGINE_VERSION}+activity' if activity else ENGINE_VERSION)
 
 
 def _insurance_acquisition_result(ins: dict) -> RecommendationResult:

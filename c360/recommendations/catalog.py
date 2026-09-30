@@ -18,6 +18,8 @@ CATALOG = {
         'mobile': 'Mobile Banking', 'mortgage': 'Mortgage', 'asset_finance': 'Asset Finance',
         'overdraft': 'Overdraft', 'ipf': 'Insurance Premium Finance', 'cash_cover': 'Cash Cover',
         'trade': 'Trade Finance', 'unsecured': 'Unsecured Loan',
+        # Offered only by the activity rules (c360/activity.py); not model targets.
+        'term_deposit': 'Fixed Deposit', 'debit_card': 'Debit Card',
     },
     brand.DOMAIN_LABELS['insurance']: {'home_cover': 'Home Insurance', 'asset_cover': 'Asset Insurance',
                       'life_cover': 'Credit Life Cover'},

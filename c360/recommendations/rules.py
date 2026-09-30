@@ -25,6 +25,9 @@ class Candidate:
     # so they use the sentence itself; the model's reasons all open with the same
     # boilerplate and need the drivers pulled out (see ml/model.py::_explain).
     reason_short: str = ''
+    # The facts behind an activity-rule candidate (c360/activity.py), shown under the
+    # reason so an RM can check them before calling. Empty for every other producer.
+    evidence: tuple = ()
 
 
 def _held_keys(holdings: dict) -> set[str]:

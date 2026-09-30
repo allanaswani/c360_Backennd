@@ -289,6 +289,25 @@ class DomainView(APIView):
         return Response(payload)
 
 
+class CustomerInsightsView(APIView):
+    """What the customer holds (by the official product tree), owes against sanctioned
+    limits, earns the bank, and does - plus the opportunities their transactions point
+    to. Each block carries its own status (live / none / unavailable) so one slow or
+    empty source never blanks the others. See services/insights.py."""
+
+    def get(self, request: Request, cust_id: str):
+        from ..services.insights import build_customer_insights
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        return Response(build_customer_insights(gateway, cust_id, raw))
+
+
 class RecommendationsView(APIView):
     """Next Best Product — Level 2 per-customer panel."""
 
@@ -349,6 +368,31 @@ class WorklistView(APIView):
                 include_staff=scope.is_superuser),
         )[0]
         return Response({'count': len(rows), 'results': rows})
+
+
+class ActivityProspectsView(APIView):
+    """Level 1 activity cross-sell call list - customers across the whole book whose
+    last 90 days of transactions point to a product they do not hold, with the evidence.
+    Whole-book, so management only (an RM sees the same opportunities per customer on
+    the customer page). Cached for six hours: it scans 90 days of the ledger."""
+
+    def get(self, request: Request):
+        scope = resolve_scope(request)
+        if not scope.can_view_portfolio():
+            return Response({'error': {'status': 403, 'detail': 'The activity call list requires management access.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        gateway = get_gateway()
+        key = f'activity-prospects:{data_mode()}:{gateway.as_of_date().isoformat()}'
+        try:
+            # A failed scan raises out of get_or_build before anything is stored, so the
+            # next request retries rather than serving a cached failure for six hours.
+            payload, cache_meta = portfolio_cache.get_or_build(
+                key, lambda: gateway.activity_prospects() or {'rules': [], 'results': [], 'unavailable': True},
+                ttl=6 * 3600)
+        except Exception:                                   # noqa: BLE001
+            return Response({'rules': [], 'results': [], 'unavailable': True,
+                             'detail': 'The transaction ledger could not be read just now. Try again shortly.'})
+        return Response({**payload, 'cache': cache_meta})
 
 
 def _acting_sales_code(request) -> str | None:

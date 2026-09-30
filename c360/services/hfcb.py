@@ -74,6 +74,12 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
         prof = gateway.get_profitability(cust_id)
     except Exception:
         prof = None
+    # Revenue earned from the customer this year (rpt_ceo_all_revenue_trend). The
+    # tile used to read value['revenue'], a hard-coded 0 badged live.
+    try:
+        rev = gateway.get_revenue(cust_id)
+    except Exception:
+        rev = None
 
     return {
         'cust_id': cust_id,
@@ -84,7 +90,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             'total_loans': live(loans, unit='KES').to_dict(),
             'net_position': live(net_position, unit='KES').to_dict(),
             'products_held': live(products_held, unit='count').to_dict(),
-            'revenue': live(value['revenue'], unit='KES').to_dict(),
+            'revenue': _revenue_metric(rev),
             # Derived ratio reads (from the live snapshot) — leverage + channel reach.
             'loan_to_deposit': _leverage_metric(deposits, loans),
             'active_channels': live(len(channels), unit='count').to_dict(),
@@ -148,6 +154,22 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             },
         },
     }
+
+
+_MONTHS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+
+def _revenue_metric(rev: dict | None) -> dict[str, Any]:
+    """Net revenue from the customer this year: interest and fee income less interest
+    paid to them. Never a bare 0 when the figure is simply not on record."""
+    if rev and rev.get('totals'):
+        span = f"{_MONTHS[rev['first_month'] - 1]} to {_MONTHS[rev['last_month'] - 1]} {rev['year']}"
+        t = rev['totals']
+        return live(t['net'], unit='KES', note=(
+            f'Net revenue, {span}: interest income KES {t["interest_income"]:,} plus fees and '
+            f'commissions KES {t["nfi"]:,}, less interest paid to the customer KES '
+            f'{t["interest_expense"]:,}. Before operating costs.')).to_dict()
+    return to_source(unit='KES', note='No revenue on record for this customer this year.').to_dict()
 
 
 def _aum_metric(prof: dict | None) -> dict[str, Any]:

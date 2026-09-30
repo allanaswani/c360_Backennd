@@ -56,6 +56,9 @@ CONTRACT_MARKERS = (
     # The stored column default. Existing rows are a record of what was pitched under
     # the name in force at the time; new rows get the current brand (feedback_views).
     "default='HFCB'",
+    # A core-banking transaction-purpose value (fact_dep_trx_recording.justific_descrption)
+    # matched by c360/activity.py. It is the warehouse's text, not ours to rebrand.
+    'HFCB MPESA TO ACCOUNT(B2C)',
 )
 
 _STRING_RE = re.compile(r"""('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")""")

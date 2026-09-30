@@ -268,6 +268,11 @@ docker exec c360-backend python manage.py send_ops_report --period daily --to yo
 
 # Weekly rollup, Monday 07:15.
 15 7 * * 1   docker exec c360-backend python manage.py send_ops_report --period weekly >/dev/null 2>&1
+
+# Usage to the portfolio tool's Usage Analytics > Customer 360, hourly. Re-sends
+# yesterday and today; the portfolio replaces a day it already has, so this is safe
+# to repeat. Needs C360_PORTFOLIO_INGEST_URL / _TOKEN (see .env.example).
+20 * * * *   docker exec c360-backend python manage.py push_usage >/dev/null 2>&1
 ```
 
 Cron runs in UTC unless the host says otherwise — check with `timedatectl`, and

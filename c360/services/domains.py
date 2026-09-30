@@ -69,18 +69,68 @@ def _unavailable(cust_id, domain, detail=None):
                 'this customer’s record.')}
 
 
+def _mobile_loans(gateway: WarehouseGateway, cust_id: str) -> dict | None:
+    """The customer's mobile-loan history from the loan agreements, or None. A failure
+    here only drops this section; it never takes the Whizz tab down with it."""
+    try:
+        fac = gateway.get_facilities(cust_id)
+    except Exception:
+        return None
+    return (fac or {}).get('mobile')
+
+
+_MOBILE_NOTE = ('Each mobile loan is approved separately, so these are the amounts approved '
+                'per loan, not a standing limit. The Whizz eligibility limit is held in the '
+                'Whizz system and is not in the warehouse.')
+
+
+def _mobile_sections(mob: dict, st: str) -> tuple[list, list, list]:
+    metrics = [
+        _metric('Mobile loans taken', mob['loans_taken'], 'count', status=st,
+                meta=(f"Since {mob['first_issued'][:4]}" if mob.get('first_issued') else None)),
+        _metric('Latest approved', mob['latest_amount'], 'KES', status=st,
+                meta=(f"On {mob['latest_issued']}" if mob.get('latest_issued') else None)),
+        _metric('Highest approved', mob['highest_amount'], 'KES', status=st),
+        _metric('Mobile loan outstanding', mob['outstanding'], 'KES', status=st),
+    ]
+    charts = []
+    if len(mob['history']) >= 2:
+        charts.append({'kind': 'lines', 'id': 'mobile_loans', 'title': 'Mobile loan approved per loan',
+                       'question': 'Is the amount they are approved for growing?', 'status': st,
+                       'fmt': 'kes', 'note': _MOBILE_NOTE,
+                       'series': [{'name': 'Approved', 'dataKey': 'amount', 'colorRole': 1}],
+                       'data': mob['history']})
+    rows = [{'date': h['period'], 'description': 'Mobile loan approved', 'amount': h['amount'],
+             'balance': h['outstanding']} for h in reversed(mob['history'][-24:])]
+    tables = [{'id': 'mobile_loans', 'title': 'Mobile loans (latest first)', 'status': st,
+               'note': _MOBILE_NOTE, 'columns': ['date', 'description', 'amount', 'balance'],
+               'rows': rows}]
+    return metrics, charts, tables
+
+
 def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
     if gateway.get_customer(cust_id) is None:
         return None
+    live = data_mode() == 'live'
+    st = LIVE if live else PREVIEW
+    mob = _mobile_loans(gateway, cust_id)
     try:
         data = gateway.get_whizz(cust_id, period)
     except Exception:
+        if mob:
+            m, c, t = _mobile_sections(mob, st)
+            return {'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
+                    'metrics': m, 'charts': c, 'tables': t,
+                    'note': 'Whizz transactions could not be loaded right now; mobile loans are shown.'}
         return _unavailable(cust_id, 'Whizz')
     if data is None:
+        if mob:
+            m, c, t = _mobile_sections(mob, st)
+            return {'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
+                    'metrics': m, 'charts': c, 'tables': t,
+                    'note': 'No Whizz / M-Pesa transactions in the selected period.'}
         return _empty(cust_id, 'Whizz', 'No Whizz / M-Pesa activity for this customer in the selected period.')
 
-    live = data_mode() == 'live'
-    st = LIVE if live else PREVIEW
     avg = round(data['txn_value'] / data['txn_count']) if data.get('txn_count') else 0
     # Daily trends for the tile sparklines (transactions and value moved over the period).
     spark_count = [p['count'] for p in data['activity']]
@@ -88,7 +138,7 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
     since = data.get('registered_since')
     profile_note = (f"Whizz customer since {since[:4]} · {data.get('status', '')}".strip(' ·')
                     if since else (f"Whizz status: {data.get('status')}" if data.get('status') else None))
-    return {
+    payload = {
         'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
         'metrics': [
             _metric('Transactions', data['txn_count'], 'count', lead=True, status=st, spark=spark_count),
@@ -118,6 +168,12 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
              'columns': ['date', 'description', 'amount'], 'rows': data['recent']},
         ],
     }
+    if mob:
+        m, c, t = _mobile_sections(mob, st)
+        payload['metrics'] += m
+        payload['charts'] += c
+        payload['tables'] += t
+    return payload
 
 
 def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
