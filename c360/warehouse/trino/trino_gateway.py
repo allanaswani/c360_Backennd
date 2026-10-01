@@ -2453,11 +2453,24 @@ class TrinoWarehouse(WarehouseGateway):
         end = self._txn_end(period.end)
         lo, hi = self._date_lit(period.start), self._date_lit(end)
         rp = self._range_part(period.start, end)
+        # Real money movements only. o_final_acc_amount is 0 exactly on non-movements;
+        # without this, 'OVERDUE LOAN ACCOUNT(S) SNIFFING' checks (i_amount set, nothing
+        # moved) were counted as Whizz transactions and listed as a service.
+        # Each Whizz transaction is posted twice; the mirror leg sits on internal bank
+        # accounts (verified 2026-10-01: no customer holds both legs of a pair), so a
+        # customer's rows are their own side only and nothing is double counted.
         where = (f"FROM delta.gold_db.fact_dep_trx_recording WHERE customer_id=? {rp} "
                  f"AND transaction_date BETWEEN {lo} AND {hi} AND {_KOCELA_SQL} "
-                 f"AND i_amount <> 0 AND UPPER(justific_descrption) NOT LIKE '%JOURNAL%'")
+                 f"AND i_amount <> 0 AND {_MOVEMENT_SQL} "
+                 f"AND UPPER(justific_descrption) NOT LIKE '%JOURNAL%'")
+        # Signed amount: credit +, debit -, and a debit includes the charge, so on the
+        # money-out side (debited amount - payment value) is what the customer paid in
+        # charges. Linda (1218821): 9 sends of KES 470,000 debited KES 470,684.
         cats = self._t.execute(
-            f"SELECT TRIM(justific_descrption) j, COUNT(*) n, SUM(i_amount) v {where} "
+            f"SELECT TRIM(justific_descrption) j, COUNT(*) n, SUM(i_amount) v, "
+            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) vin, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) vout, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN i_amount ELSE 0 END) vout_principal {where} "
             f"GROUP BY TRIM(justific_descrption) ORDER BY v DESC", (cid,))
         txn_count = sum(int(r['n'] or 0) for r in cats)
 
@@ -2474,18 +2487,38 @@ class TrinoWarehouse(WarehouseGateway):
             "LIMIT 1", (cid,))
         has_profile = bool(prof)
 
-        categories = [{'label': self._whizz_cat(r['j']), 'count': int(r['n'] or 0),
-                       'value': round(float(r['v'] or 0))} for r in cats]
+        # Two descriptions can map to one label (e.g. both M-Pesa deposit spellings), so
+        # merge by label rather than listing the same service twice.
+        merged: dict[str, dict[str, Any]] = {}
+        for r in cats:
+            label = self._whizz_cat(r['j'])
+            m = merged.setdefault(label, {'label': label, 'count': 0, 'value': 0.0})
+            m['count'] += int(r['n'] or 0)
+            m['value'] += float(r['v'] or 0)
+        categories = sorted(({**m, 'value': round(m['value'])} for m in merged.values()),
+                            key=lambda c: c['value'], reverse=True)
         txn_value = sum(c['value'] for c in categories)
+        money_in = round(sum(float(r['vin'] or 0) for r in cats))
+        money_out = round(sum(float(r['vout'] or 0) for r in cats))
+        # A row that IS a fee ('Processing Fee', posted beside an RTGS) is a charge in
+        # full; on every other debit the charge is what was taken above the payment.
+        charges = round(sum(
+            float(r['vout'] or 0) if _re.search(r'FEE|CHARGE', str(r['j'] or '').upper())
+            else float(r['vout'] or 0) - float(r['vout_principal'] or 0) for r in cats))
         activity = self._t.execute(
-            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n, SUM(i_amount) v {where} "
+            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n, SUM(i_amount) v, "
+            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) vin, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) vout {where} "
             f"GROUP BY CAST(transaction_date AS varchar) ORDER BY 1", (cid,))
         activity_pts = [{'period': self._safe_date(r['d']), 'count': int(r['n'] or 0),
-                         'value': round(float(r['v'] or 0))}
+                         'value': round(float(r['v'] or 0)),
+                         'in': round(float(r['vin'] or 0)), 'out': round(float(r['vout'] or 0))}
                         for r in activity if self._safe_date(r['d'])]
+        # Signed, so the table reads money in and out like the statement does.
         recent = self._t.execute(
-            f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, i_amount amt {where} "
-            f"ORDER BY transaction_date DESC LIMIT 8", (cid,))
+            f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
+            f"o_final_acc_amount amt {where} "
+            f"ORDER BY transaction_date DESC, tun_internal_sn DESC LIMIT 50", (cid,))
         recent_rows = [{'date': self._safe_date(r['d']), 'description': self._whizz_cat(r['j']),
                         'amount': round(float(r['amt'] or 0)), 'currency': 'KES'} for r in recent]
 
@@ -2499,6 +2532,10 @@ class TrinoWarehouse(WarehouseGateway):
             'registered_since': since,
             'txn_count': txn_count,
             'txn_value': txn_value,
+            'money_in': money_in,
+            'money_out': money_out,
+            'charges': max(charges, 0),
+            'from': period.start.isoformat(), 'to': end.isoformat(),
             'services_used': len(categories),
             'activity': activity_pts,
             'categories': categories,
@@ -2568,19 +2605,117 @@ class TrinoWarehouse(WarehouseGateway):
             mrows = self._t.execute(
                 f"SELECT DISTINCT unit_id FROM delta.gold_db.hfdi_mortgage_data WHERE unit_id IN ({inlist})")
             mortgaged = {int(r['unit_id']) for r in mrows if r['unit_id'] is not None}
+        try:
+            pay = self._property_payments(unit_ids)
+        except Exception:
+            logger.warning('property payments lookup failed', exc_info=True)
+            pay = None
         properties = []
         for u in units:
             uid = int(u['unit_id'])
-            paid = float(u['paid'] or 0)
-            properties.append({
+            value = round(float(u['value'] or 0))
+            row = {
+                'unit_id': uid,
                 'unit': self._clean(u['unit']) or f'Unit {uid}',
                 'project': self._clean(u['project']) or 'Property',
-                'value': round(float(u['value'] or 0)),
-                'paid_pct': round(min(max(paid, 0.0), 1.0), 3),
+                'value': value,
                 'mortgage': uid in mortgaged,
-            })
+            }
+            got = (pay or {}).get('by_unit', {}).get(uid)
+            if got and got['count']:
+                row['paid'] = got['paid']
+                row['outstanding'] = max(value - got['paid'], 0)
+                row['paid_pct'] = round(min(max(got['paid'] / value, 0.0), 1.0), 3) if value > 0 else None
+                row['last_payment'] = got['last']
+                row['payments'] = got['count']
+            else:
+                # rpt_c360_customer_property.perc_paid is 0 on 9,686 of 9,708 units
+                # (checked 2026-10-01), so it is never used: with no payment on record
+                # the honest answer is "not known", not "0% paid".
+                row['paid_pct'] = None
+            properties.append(row)
         properties.sort(key=lambda p: p['value'], reverse=True)
-        return {'properties': properties}
+        return {'properties': properties,
+                'payments': (pay or {}).get('payments', []),
+                'payments_available': pay is not None,
+                'payments_from': (pay or {}).get('first')}
+
+    def _property_payments(self, unit_ids: list[int]) -> dict[str, Any]:
+        """What has actually been paid on these units, from the property payment register.
+
+        Two generations of rows, both validated 2026-10-01:
+        * the original register (event_type NULL): dates are text, day first, as
+          'dd-mm-yyyy' or 'd/m/yy' (read month-first, 530 would fall in the future;
+          day-first, none). A move of money between two holdings of the same unit is a
+          debit and a credit on one receipt, so a unit's total is credits MINUS debits:
+          counted that way 29 of 2,634 units exceed 105% of their value; counting
+          credits alone, 353 did.
+        * the new system (event_type 'CREATE', pay_state 'COMPLETED', from 7 Sep 2026):
+          no payment_date, so the date is the epoch `timestamp`. No receipt overlaps the
+          old register; reversed and archived rows are excluded.
+        """
+        from zoneinfo import ZoneInfo
+        from datetime import datetime as _dt
+
+        ids = sorted({int(u) for u in unit_ids if u})
+        if not ids:
+            return {'by_unit': {}, 'payments': [], 'first': None}
+        inlist = ','.join(str(i) for i in ids)
+        old = self._t.execute(
+            "SELECT DISTINCT receipt_no, CAST(unit_id AS bigint) u, holding_id, "
+            "credited_amount c, debited_amount d, TRIM(payment_date) pd, TRIM(payment_mode) m "
+            "FROM delta.gold_db.hfdi_payment_data "
+            f"WHERE event_type IS NULL AND receipt_no IS NOT NULL AND unit_id IN ({inlist})")
+        new = self._t.execute(
+            "SELECT DISTINCT receipt_no, CAST(unit_id AS bigint) u, credited_amount c, "
+            "TRIM(timestamp) ts, TRIM(payment_mode) m "
+            "FROM delta.gold_db.hfdi_payment_data "
+            f"WHERE event_type = 'CREATE' AND pay_state = 'COMPLETED' AND unit_id IN ({inlist})")
+
+        def old_date(s: Any) -> str | None:
+            for fmt in ('%d-%m-%Y', '%d/%m/%y'):
+                try:
+                    return _dt.strptime(str(s).strip(), fmt).date().isoformat()
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        nairobi = ZoneInfo('Africa/Nairobi')
+        # One line per receipt and unit, netted, so a holding transfer (debit + credit
+        # on one receipt) nets to nothing instead of reading as a payment.
+        lines: dict[tuple[str, int], dict[str, Any]] = {}
+        for r in old:
+            key = (str(r['receipt_no']), int(r['u']))
+            ln = lines.setdefault(key, {'unit_id': key[1], 'amount': 0.0, 'date': None, 'mode': None})
+            ln['amount'] += float(r['c'] or 0) - float(r['d'] or 0)
+            ln['date'] = ln['date'] or old_date(r['pd'])
+            ln['mode'] = ln['mode'] or self._clean(r['m'])
+        for r in new:
+            key = ('new:' + str(r['receipt_no']), int(r['u']))
+            try:
+                when = _dt.fromtimestamp(int(str(r['ts'])), tz=nairobi).date().isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                when = None
+            ln = lines.setdefault(key, {'unit_id': key[1], 'amount': 0.0, 'date': when, 'mode': self._clean(r['m'])})
+            ln['amount'] += float(r['c'] or 0)
+
+        by_unit: dict[int, dict[str, Any]] = {}
+        payments = []
+        for ln in lines.values():
+            amt = round(ln['amount'])
+            u = by_unit.setdefault(ln['unit_id'], {'paid': 0, 'count': 0, 'last': None})
+            u['paid'] += amt
+            if amt == 0:
+                continue
+            u['count'] += 1
+            if ln['date'] and (u['last'] is None or ln['date'] > u['last']):
+                u['last'] = ln['date']
+            payments.append({'unit_id': ln['unit_id'], 'date': ln['date'], 'amount': amt,
+                             'mode': (ln['mode'] or 'Not stated').replace('_', ' ').title()
+                             .replace('Mpesa', 'M-Pesa').replace('Eft', 'EFT').replace('Rtgs', 'RTGS')})
+        payments.sort(key=lambda p: p['date'] or '', reverse=True)
+        dated = [p['date'] for p in payments if p['date']]
+        return {'by_unit': by_unit, 'payments': payments, 'first': min(dated) if dated else None}
 
     # --- the property register property clients (their own universe, see c360/property_register.py) --------
 
@@ -3280,11 +3415,13 @@ class TrinoWarehouse(WarehouseGateway):
             return None
 
         policies = []
-        for r in rows:
+        for r, cv in self._with_cover(rows):
             status = (self._clean(r.get('status')) or 'unknown').title()
             policies.append({
                 'policy': self._clean(r.get('pol')),
-                'product': self._clean(r.get('product')) or 'Insurance policy',
+                'product': self._clean(r.get('product')) or cv.get('cover') or 'Insurance policy',
+                'cover_class': cv.get('cover_class'),
+                'insurer': cv.get('insurer'),
                 'premium': round(float(r.get('premium') or 0)),
                 'sum_insured': round(float(r.get('insured') or 0)),
                 'status': status,
@@ -3306,6 +3443,80 @@ class TrinoWarehouse(WarehouseGateway):
             'claims': self._safe_claims((receipts or {}).get('risknotes') or []),
             'match_note': None,
         }
+
+    def _policy_cover(self, rows: list[dict[str, Any]]) -> dict[tuple, dict[str, Any]]:
+        """Insurance class, sub-class and insurer for policy-summary rows.
+
+        The summary's `product` is blank on every row, but hfbi_policy_data names the
+        class on all of its well-formed rows (checked 2026-10-01: 58,485 of 58,500 have
+        a real start date; the other 15 carry spilled document JSON and are skipped).
+        A summary row is the policy-data row with the same client, start, end and sum
+        insured: on that key 53,480 groups have one class and 108 have two or three,
+        which are shown together rather than guessed between. Falls back to client +
+        start + end when the sum insured differs. Best effort: {} on any failure.
+        """
+        clients = sorted({self._clean(r.get('client_no')) for r in rows if self._clean(r.get('client_no'))})
+        if not clients:
+            return {}
+        marks = ','.join(['?'] * len(clients))
+        data = self._t.execute(
+            "SELECT TRIM(policy_client_no) c, TRIM(policy_start_date) s, TRIM(policy_end_date) e, "
+            "COALESCE(policy_sum_insured, 0) si, TRIM(policy_class) cls, "
+            "TRIM(policy_sub_class) sub, TRIM(policy_insurer) ins "
+            "FROM delta.gold_db.hfbi_policy_data "
+            "WHERE regexp_like(TRIM(policy_start_date), '^[0-9]{4}-[0-9]{2}-[0-9]{2}') "
+            f"AND TRIM(policy_client_no) IN ({marks})", tuple(clients))
+        full: dict[tuple, dict[str, set]] = {}
+        loose: dict[tuple, dict[str, set]] = {}
+        for d in data:
+            k3 = (d['c'], d['s'], d['e'])
+            k4 = k3 + (round(float(d['si'] or 0), 2),)
+            for bucket, k in ((full, k4), (loose, k3)):
+                b = bucket.setdefault(k, {'cls': set(), 'sub': set(), 'ins': set()})
+                if self._clean(d['cls']):
+                    b['cls'].add(d['cls'].strip())
+                # Sub-class carries stray numbers ('0', '1350000', 'Commercial 0'), so
+                # only a plain wording is kept.
+                sub = self._clean(d['sub'])
+                if sub and _re.fullmatch(r"[A-Za-z][A-Za-z &/()'-]*", sub):
+                    b['sub'].add(sub)
+                if self._clean(d['ins']):
+                    b['ins'].add(d['ins'].strip())
+
+        def label(b: dict[str, set]) -> dict[str, Any] | None:
+            if not b['cls']:
+                return None
+            classes = sorted(b['cls'])
+            cover = ' + '.join(classes)
+            if len(classes) == 1 and len(b['sub']) == 1:
+                cover = f"{classes[0]} · {next(iter(b['sub']))}"
+            ins = sorted(b['ins'])
+            insurer = ins[0] if len(ins) == 1 else (' / '.join(ins) if ins else None)
+            if insurer and insurer.isupper():
+                insurer = insurer.capitalize()
+            return {'cover': cover, 'cover_class': classes[0] if len(classes) == 1 else 'Several classes',
+                    'insurer': insurer}
+
+        out: dict[tuple, dict[str, Any]] = {}
+        for r in rows:
+            k3 = (self._clean(r.get('client_no')), self._clean(r.get('start_dt')), self._clean(r.get('end_dt')))
+            k4 = k3 + (round(float(r.get('insured') or 0), 2),)
+            got = label(full[k4]) if k4 in full else (label(loose[k3]) if k3 in loose else None)
+            if got:
+                out[k4] = got
+        return out
+
+    def _with_cover(self, rows: list[dict[str, Any]]):
+        """(row, cover) pairs; cover is {} when the class could not be read."""
+        try:
+            cover = self._policy_cover(rows)
+        except Exception:
+            logger.warning('policy class lookup failed', exc_info=True)
+            cover = {}
+        for r in rows:
+            k = (self._clean(r.get('client_no')), self._clean(r.get('start_dt')), self._clean(r.get('end_dt')),
+                 round(float(r.get('insured') or 0), 2))
+            yield r, cover.get(k, {})
 
     def _insurance_claims(self, risknotes: list[str]) -> dict[str, Any] | None:
         """Claims registered against this client's risknotes.
@@ -3493,7 +3704,7 @@ class TrinoWarehouse(WarehouseGateway):
             return None
 
         policies = []
-        for r in rows:
+        for r, cv in self._with_cover(rows):
             client_no = self._clean(r.get('client_no'))
             # The summary's own id is the strongest claim; otherwise credit whichever
             # bridge found the client.
@@ -3507,9 +3718,11 @@ class TrinoWarehouse(WarehouseGateway):
                 # otherwise, so the panel can say the number is missing rather than
                 # print a placeholder that looks like a reference.
                 'policy': self._clean(r.get('pol')),
-                # product is null on this customer's rows and many others, so the
-                # fallback has to be a description, not a guess at cover type.
-                'product': self._clean(r.get('product')) or 'Insurance policy',
+                # product is blank on every summary row; the class comes from the
+                # policy feed (_policy_cover), and only failing that a description.
+                'product': self._clean(r.get('product')) or cv.get('cover') or 'Insurance policy',
+                'cover_class': cv.get('cover_class'),
+                'insurer': cv.get('insurer'),
                 'premium': round(float(r.get('premium') or 0)),
                 'sum_insured': round(float(r.get('insured') or 0)),
                 'status': status,

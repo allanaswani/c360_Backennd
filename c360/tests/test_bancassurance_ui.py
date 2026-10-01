@@ -91,26 +91,29 @@ class ChartShapeTests(SimpleTestCase):
 
 class SumInsuredTests(SimpleTestCase):
     """Zero on 21% of the book, so a bare KES 0 would read as 'no cover' when the
-    truth is 'the feed does not say'."""
+    truth is 'the feed does not say'. Measured on the policies in force (2026-10-01):
+    the book repeats a policy at each renewal, so summing expired rows overstated cover."""
 
     def test_partial_coverage_is_counted_not_hidden(self):
         payload = dict(MANY)
-        payload['policies'] = [_policy(2024, insured=0), _policy(2025, insured=5_000_000)]
-        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured'][0]
+        payload['policies'] = [_policy(2024, insured=0, status='active'),
+                               _policy(2025, insured=5_000_000, status='active')]
+        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured in force'][0]
         self.assertEqual(metric['value'], 5_000_000)
         self.assertIn('1 of 2', metric['meta'])
 
     def test_no_sum_insured_anywhere_is_not_sourced_rather_than_zero(self):
         payload = dict(MANY)
-        payload['policies'] = [_policy(2024, insured=0), _policy(2025, insured=0)]
-        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured'][0]
+        payload['policies'] = [_policy(2024, insured=0, status='active'),
+                               _policy(2025, insured=0, status='active')]
+        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured in force'][0]
         self.assertIsNone(metric['value'])
         self.assertEqual(metric['status'], 'to_source')
 
     def test_full_coverage_carries_no_caveat(self):
         payload = dict(MANY)
-        payload['policies'] = [_policy(2024), _policy(2025)]
-        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured'][0]
+        payload['policies'] = [_policy(2024, status='active'), _policy(2025, status='active')]
+        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured in force'][0]
         self.assertIsNone(metric.get('meta'))
 
 
@@ -140,3 +143,11 @@ class ClaimsTests(SimpleTestCase):
         # No money total: 181 of the 223 carry no estimated loss, so a sum would
         # describe a fifth of them and be read as all of them.
         self.assertFalse(out['claims']['amounts_available'])
+
+
+class SumInsuredInForceTests(SimpleTestCase):
+    def test_expired_renewals_are_not_counted_as_cover_in_force(self):
+        payload = dict(MANY)
+        payload['policies'] = [_policy(2024, insured=9_000_000), _policy(2025, insured=5_000_000, status='active')]
+        metric = [m for m in _build(payload)['metrics'] if m['label'] == 'Sum insured in force'][0]
+        self.assertEqual(metric['value'], 5_000_000)
