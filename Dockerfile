@@ -16,11 +16,17 @@
 
 FROM python:3.12-slim
 
+# The commit this image is built from, shown on the health page and in /api/meta/.
+# .git is not copied into the image, so it is passed in:
+#   docker build --build-arg C360_BUILD=$(git rev-parse --short HEAD) -t c360-backend:latest .
+ARG C360_BUILD=unknown
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     DJANGO_SETTINGS_MODULE=config.settings \
-    PORT=9001
+    PORT=9001 \
+    C360_BUILD=${C360_BUILD}
 
 WORKDIR /app
 

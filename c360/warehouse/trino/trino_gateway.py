@@ -386,7 +386,28 @@ class TrinoWarehouse(WarehouseGateway):
         ('hfdi_clients', 'Property client register', 'Domains', 'delta.gold_db.hfdi_client_data', 'count'),
         ('npl_accounts', 'NPL classifications', 'Credit', 'delta.gold_db.npl_accounts', 'count'),
         ('pre_npl_accounts', 'Watch list', 'Credit', 'delta.gold_db.pre_npl_accounts', 'count'),
+        # Added 2026-10-01: every table the app reads is checked (the list had drifted
+        # to 15 of 30). Unknown-size and large tables get the cheap presence probe.
+        ('bank_parameters', 'Business date', 'Core banking', 'delta.gold_db.bank_parameters', 'presence'),
+        ('w_dim_product', 'Product tree (account types)', 'Core banking', 'delta.gold_db.w_dim_product', 'presence'),
+        ('eom_agreement', 'Loan agreements (facilities, mobile loans)', 'Core banking', 'delta.gold_db.eom_agreement', 'presence'),
+        ('loan_account', 'Loan account history', 'Core banking', 'delta.gold_db.loan_account', 'presence'),
+        ('deposit_account', 'Deposit account history', 'Core banking', 'delta.gold_db.deposit_account', 'presence'),
+        ('customer_category', 'Customer categories (AML risk)', 'Customer profile', 'delta.gold_db.customer_category', 'presence'),
+        ('generic_detail', 'Category labels', 'Customer profile', 'delta.gold_db.generic_detail', 'presence'),
+        ('cust_card_info', 'Cards', 'Customer profile', 'delta.gold_db.cust_card_info', 'presence'),
+        ('revenue_trend', 'Revenue per customer', 'Customer profile', 'delta.gold_db.rpt_ceo_all_revenue_trend', 'presence'),
+        ('hfdi_payments', 'Property payment register', 'Domains', 'delta.gold_db.hfdi_payment_data', 'count'),
+        ('hfdi_leads', 'Property sales leads', 'Domains', 'delta.gold_db.hfdi_lead_data', 'presence'),
+        ('hfdi_followups', 'Property lead follow-ups', 'Domains', 'delta.gold_db.hfdi_lead_followup_data', 'presence'),
+        ('collateral', 'Collateral', 'Credit', 'delta.gold_db.collateral', 'presence'),
+        ('crb_summary', 'Credit bureau summary', 'Credit', 'delta.gold_db.score_card_review_tu_accounts_summary', 'presence'),
     ]
+
+    # How far behind each source may fall before it is called stale. The core feeds
+    # load every business day; the shared limit (C360_ALERT_DATA_STALE_DAYS) applies.
+    # Property payments arrive with sales, not on a schedule, so they get a week.
+    _PAYMENTS_STALE_DAYS = 7
 
     # The curated reporting Postgres, checked separately because a failure there is a
     # different outage from a warehouse failure: the book page loses its allocation
@@ -528,6 +549,62 @@ class TrinoWarehouse(WarehouseGateway):
         return {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1],
                 'status': 'unknown', 'value': None, 'detail': 'not checked — warehouse connection is down'}
 
+    def _check_source_dates(self, limit: int) -> list[dict]:
+        """The date each source is current to - one row per feed, so a feed that
+        stops loading is named rather than hidden behind one as-of date. The ledger
+        loads ahead of the balance snapshots (2026-10-01: transactions to 1 Oct,
+        deposits to 29 Sep), so they are separate rows."""
+        today = date.today()
+
+        def row(key, label, table, when, stale_after):
+            base = {'key': key, 'label': label, 'group': 'Freshness', 'table': table}
+            if when is None:
+                return {**base, 'status': 'unknown', 'value': None, 'as_of': None, 'age_days': None,
+                        'detail': 'could not read the latest date'}
+            days = (today - when).days
+            status = 'ok' if days <= stale_after else 'stale'
+            plural = '' if days == 1 else 's'
+            detail = f'current to {when.isoformat()} ({days} day{plural} behind)'
+            if status != 'ok':
+                detail += f', over the {stale_after}-day limit'
+            return {**base, 'status': status, 'value': days, 'as_of': when.isoformat(),
+                    'age_days': days, 'detail': detail}
+
+        def safe(fn):
+            try:
+                return fn()
+            except Exception:                                       # noqa: BLE001
+                return None
+
+        def payments_latest():
+            r = self._t.execute(
+                "SELECT max(CAST(timestamp AS bigint)) ts FROM delta.gold_db.hfdi_payment_data "
+                "WHERE event_type = 'CREATE' AND pay_state = 'COMPLETED'")
+            ts = r[0].get('ts') if r else None
+            if ts is None:
+                return None
+            from datetime import datetime as _dt
+            from zoneinfo import ZoneInfo
+            return _dt.fromtimestamp(int(ts), tz=ZoneInfo('Africa/Nairobi')).date()
+
+        def revenue_latest():
+            r = self._t.execute(
+                "SELECT CAST(max(month_name) AS varchar) d FROM delta.gold_db.rpt_ceo_all_revenue_trend")
+            d = self._safe_date(r[0].get('d')) if r else None
+            return date.fromisoformat(d) if d else None
+
+        sd = getattr(self, '_source_dates', None) or {}
+        return [
+            row('fresh_business', 'Business date', 'bank_parameters', sd.get('business'), limit),
+            row('fresh_deposits', 'Deposit balances', 'eom_deposits', safe(self.as_of_date), limit),
+            row('fresh_loans', 'Loan balances', 'eom_loans', safe(self.loan_as_of), limit),
+            row('fresh_ledger', 'Transactions', 'fact_dep_trx_recording', safe(self.ledger_as_of), limit),
+            row('fresh_payments', 'Property payments (latest)', 'hfdi_payment_data',
+                safe(payments_latest), self._PAYMENTS_STALE_DAYS),
+            row('fresh_revenue', 'Revenue per customer (latest day)', 'rpt_ceo_all_revenue_trend',
+                safe(revenue_latest), limit),
+        ]
+
     def health_report(self):
         # System group first: connection/auth, model, RM-allocation source. The model
         # check needs no warehouse, so it reports even during an outage.
@@ -562,6 +639,8 @@ class TrinoWarehouse(WarehouseGateway):
         except Exception as e:
             freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
                          'detail': f'{type(e).__name__}: {str(e)[:140]}'}
+        from django.conf import settings as _settings
+        checks += self._check_source_dates(int(getattr(_settings, 'C360_ALERT_DATA_STALE_DAYS', 3)))
         return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
 
     @staticmethod

@@ -72,10 +72,14 @@ class MetaView(APIView):
             freshness = fresh() if fresh else None
         except Exception:
             freshness = None
+        from .. import deployment
         return Response({
             'data_mode': data_mode(),
             'as_of': gateway.as_of_date().isoformat(),
             'freshness': freshness,
+            # Which code is answering: lets the portfolio's service probe (and anyone
+            # with curl) see that a server is still running an old backend.
+            'build': deployment.build_info(),
             'period_presets': list(PRESETS),
             'scope': {
                 'role': scope.role,
@@ -555,6 +559,10 @@ def _annotate_drops(report: dict, prior: dict) -> None:
     """Compare each check's value to the previous snapshot; attach a delta and downgrade
     a healthy source to 'warn' when its row count has dropped sharply (a partial load)."""
     for c in report.get('checks') or []:
+        # Only row counts can "drop". A Freshness value is days behind (falling is
+        # good news) and a Deployment value is a yes/no flag.
+        if c.get('group') in ('Freshness', 'Deployment'):
+            continue
         prev, cur = prior.get(c.get('key')), c.get('value')
         if not isinstance(prev, (int, float)) or not isinstance(cur, (int, float)) or prev <= 0:
             continue
@@ -593,6 +601,10 @@ class DataHealthView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Data health is admin-only.'}},
                             status=status.HTTP_403_FORBIDDEN)
         report = get_gateway().health_report()
+        # Deployment checks need no warehouse, so they report even in an outage.
+        from .. import deployment
+        report['checks'] = deployment.checks() + list(report.get('checks') or [])
+        report['build'] = deployment.build_info()
         report['data_mode'] = data_mode()
         report['generated_at'] = timezone.now().isoformat()
         # Read the previous snapshot's values BEFORE capturing this one, so the drop
