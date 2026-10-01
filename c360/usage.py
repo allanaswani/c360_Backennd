@@ -31,6 +31,8 @@ SEARCH_ROUTE = '/api/customers/'
 # unmatched (auth, meta, telemetry) is plumbing, not a feature, and is not counted.
 FEATURES: tuple[tuple[str, str], ...] = (
     ('/api/customers/<str:cust_id>/insights/', 'insights'),
+    ('/api/customers/<str:cust_id>/relationship/', 'relationship'),
+    ('/api/customers/<str:cust_id>/statement/', 'statement'),
     ('/api/customers/<str:cust_id>/recommendations/', 'recommendations'),
     ('/api/customers/<str:cust_id>/domains/hfcb/', 'core_banking'),
     ('/api/customers/<str:cust_id>/domains/', 'domains'),
@@ -39,6 +41,7 @@ FEATURES: tuple[tuple[str, str], ...] = (
     (CUSTOMER_ROUTE, 'customer_profile'),
     (SEARCH_ROUTE, 'search'),
     ('/api/portfolio/activity-prospects/', 'activity_call_list'),
+    ('/api/portfolio/maturities/', 'maturities'),
     ('/api/portfolio/worklist/', 'worklist'),
     ('/api/portfolio/overview/', 'portfolio'),
     ('/api/book/', 'my_book'),

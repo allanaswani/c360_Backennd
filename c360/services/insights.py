@@ -8,7 +8,9 @@ must never read as "has none". Every block therefore carries a status:
 * ``none``        - the source answered, and this customer has nothing in it.
 * ``unavailable`` - the source could not be read (error / not wired in this mode).
 
-Blocks: products (current / savings / fixed deposit … and loan types), facilities
+Blocks: products (current / savings / fixed deposit … and loan types), cashflow
+(money in and out by month and source), loans (instalments, arrears, maturity and
+the standing order that pays each), facilities
 (sanctioned limit vs outstanding, plus the mobile-loan history), activity (90 days of
 transactions by purpose and the opportunities they point to), profile (AML risk,
 income band, … and cards) and revenue (what the bank earned this year).
@@ -118,6 +120,7 @@ def _activity_block(gateway: WarehouseGateway, customer: dict, cust_id: str,
                                'Opportunities are withheld because the accounts held could '
                                'not be read, so a suggestion might repeat a product they have.'),
         'watch': activity_rules.watch_signals(prof),
+        'salary_timing': activity_rules.salary_timing(act['data'].get('salary_days') or []),
     }
     if not categories:
         act['status'] = 'none'
@@ -143,12 +146,15 @@ def build_customer_insights(gateway: WarehouseGateway, cust_id: str,
         'activity': _activity_block(gateway, customer, cust_id, products, facilities),
         'profile': _block(gateway.get_customer_profile, cust_id),
         'revenue': _block(gateway.get_revenue, cust_id),
+        'cashflow': _block(gateway.get_cash_flow, cust_id),
+        'loans': _block(gateway.get_loan_details, cust_id),
     }
     # A product mix with nothing in it is "none", not an empty "live" block.
     if products['status'] == 'live' and not (products['data']['deposits'] or products['data']['loans']):
         products['status'] = 'none'
     # Only cache an answer that was actually read; a failed block should be retried.
-    if all(out[b]['status'] != 'unavailable' for b in ('products', 'facilities', 'activity', 'profile', 'revenue')):
+    if all(out[b]['status'] != 'unavailable' for b in
+           ('products', 'facilities', 'activity', 'profile', 'revenue', 'cashflow', 'loans')):
         _store(key, out)
     return out
 

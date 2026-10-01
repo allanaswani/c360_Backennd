@@ -316,6 +316,60 @@ class CustomerInsightsView(APIView):
         return Response(build_customer_insights(gateway, cust_id, raw))
 
 
+class CustomerRelationshipView(APIView):
+    """Overview-tab relationship view: timeline of the relationship and the customer
+    against their segment peers. See services/relationship.py."""
+
+    def get(self, request: Request, cust_id: str):
+        from ..services.relationship import build_relationship
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        return Response(build_relationship(gateway, cust_id, raw))
+
+
+class CustomerStatementView(APIView):
+    """Every money movement in a date range (default: the last 90 days to the newest
+    posting), with totals in and out over the whole range. ?from=&to=&limit= (max 366
+    days, 2000 rows)."""
+
+    def get(self, request: Request, cust_id: str):
+        from datetime import date as _date
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        ledger = getattr(gateway, 'ledger_as_of', gateway.as_of_date)()
+        try:
+            end = _date.fromisoformat(request.query_params.get('to') or ledger.isoformat())
+            start = _date.fromisoformat(request.query_params.get('from')
+                                        or (end - timedelta(days=89)).isoformat())
+            limit = max(1, min(2000, int(request.query_params.get('limit', 500))))
+        except ValueError:
+            return Response({'error': {'status': 400, 'detail': 'from / to must be YYYY-MM-DD.'}},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if start > end:
+            start, end = end, start
+        if (end - start).days > 366:
+            start = end - timedelta(days=366)
+        try:
+            out = gateway.get_statement(cust_id, start, end, limit)
+        except Exception:
+            return Response({'unavailable': True, 'rows': [],
+                             'detail': 'The transaction ledger could not be read just now.'})
+        return Response(out or {'rows': [], 'total_count': 0, 'total_in': 0, 'total_out': 0,
+                                 'from': start.isoformat(), 'to': end.isoformat()})
+
+
 class RecommendationsView(APIView):
     """Next Best Product — Level 2 per-customer panel."""
 
@@ -400,6 +454,31 @@ class ActivityProspectsView(APIView):
         except Exception:                                   # noqa: BLE001
             return Response({'rules': [], 'results': [], 'unavailable': True,
                              'detail': 'The transaction ledger could not be read just now. Try again shortly.'})
+        return Response({**payload, 'cache': cache_meta})
+
+
+class MaturitiesView(APIView):
+    """Fixed and call deposits maturing in the next ?days (default 30, max 90), whole
+    book - the retention call list. Management only; cached six hours."""
+
+    def get(self, request: Request):
+        scope = resolve_scope(request)
+        if not scope.can_view_portfolio():
+            return Response({'error': {'status': 403, 'detail': 'The maturity list requires management access.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        try:
+            days = max(1, min(90, int(request.query_params.get('days', 30))))
+        except ValueError:
+            days = 30
+        gateway = get_gateway()
+        key = f'maturities:{data_mode()}:{gateway.as_of_date().isoformat()}:{days}'
+        try:
+            payload, cache_meta = portfolio_cache.get_or_build(
+                key, lambda: gateway.td_maturities(days) or {'results': [], 'unavailable': True},
+                ttl=6 * 3600)
+        except Exception:                                   # noqa: BLE001
+            return Response({'results': [], 'unavailable': True,
+                             'detail': 'The deposit book could not be read just now.'})
         return Response({**payload, 'cache': cache_meta})
 
 

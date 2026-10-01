@@ -36,12 +36,15 @@ urlpatterns = [
     path('customers/<str:cust_id>/domains/<str:domain>/', views.DomainView.as_view(), name='domain'),
     path('customers/<str:cust_id>/recommendations/', views.RecommendationsView.as_view(), name='recommendations'),
     path('customers/<str:cust_id>/insights/', views.CustomerInsightsView.as_view(), name='customer-insights'),
+    path('customers/<str:cust_id>/relationship/', views.CustomerRelationshipView.as_view(), name='customer-relationship'),
+    path('customers/<str:cust_id>/statement/', views.CustomerStatementView.as_view(), name='customer-statement'),
     # --- recommendation outcome-logging (the feedback loop) ---
     path('recommendations/feedback/', feedback_views.FeedbackView.as_view(), name='rec-feedback'),
     path('recommendations/feedback/stats/', feedback_views.FeedbackStatsView.as_view(), name='rec-feedback-stats'),
     path('portfolio/overview/', views.PortfolioOverviewView.as_view(), name='portfolio-overview'),
     path('portfolio/worklist/', views.WorklistView.as_view(), name='worklist'),
     path('portfolio/activity-prospects/', views.ActivityProspectsView.as_view(), name='activity-prospects'),
+    path('portfolio/maturities/', views.MaturitiesView.as_view(), name='maturities'),
     # --- an RM's own book (or whole book for management) roll-up ---
     path('book/', views.BookSummaryView.as_view(), name='book-summary'),
     # --- admin: live-warehouse data health ---

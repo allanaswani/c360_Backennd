@@ -293,6 +293,30 @@ class WarehouseGateway(abc.ABC):
         """Whole-book activity cross-sell call list, or None when unavailable."""
         return None
 
+    def get_cash_flow(self, cust_id, months: int = 12) -> dict[str, Any] | None:
+        """Money in / out by month and source (c360/cashflow.py)."""
+        return None
+
+    def get_loan_details(self, cust_id) -> dict[str, Any] | None:
+        """Instalments, arrears, maturity and standing-order payment per live loan."""
+        return None
+
+    def get_timeline(self, cust_id) -> dict[str, Any] | None:
+        """The relationship over time (c360/timeline.py)."""
+        return None
+
+    def get_peer_position(self, cust_id, segment) -> dict[str, Any] | None:
+        """The customer against their segment (c360/peers.py)."""
+        return None
+
+    def get_statement(self, cust_id, start, end, limit: int = 500) -> dict[str, Any] | None:
+        """Every money movement in a date range, with totals over the whole range."""
+        return None
+
+    def td_maturities(self, days: int = 30, limit: int = 300) -> dict[str, Any] | None:
+        """Fixed and call deposits maturing soon, whole book."""
+        return None
+
     # --- data-health report (admin panel; live gateways override) -------------
     def health_report(self) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],

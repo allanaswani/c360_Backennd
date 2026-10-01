@@ -252,3 +252,18 @@ def recent_mobile_borrower(mobile: dict | None, as_of: date) -> bool:
         return (as_of - date.fromisoformat(str(latest)[:10])).days <= MOBILE_RECENT_DAYS
     except ValueError:
         return False
+
+
+def salary_timing(days: list[int]) -> str | None:
+    """When salary usually lands, from the calendar days it landed on in the window.
+    None for fewer than two credits - one date is not a pattern."""
+    if not days or len(days) < 2:
+        return None
+    lo, hi = min(days), max(days)
+
+    def th(n: int) -> str:
+        return f"{n}{'th' if 11 <= n % 100 <= 13 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+    if hi - lo <= 3:
+        span = th(lo) if lo == hi else f'{th(lo)} to {th(hi)}'
+        return f'Salary usually lands on the {span} of the month.'
+    return None   # spread across the month - no reliable day to time a call on

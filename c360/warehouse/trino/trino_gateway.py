@@ -32,6 +32,9 @@ from datetime import date, timedelta
 from typing import Any
 
 from ... import activity as activity_shape
+from ... import cashflow as cashflow_shape
+from ... import peers as peers_shape
+from ... import timeline as timeline_shape
 from ... import credit_bureau as bureau_shape
 from ... import customer_profile as profile_shape
 from ... import facilities as facilities_shape
@@ -3762,6 +3765,35 @@ class TrinoWarehouse(WarehouseGateway):
         if not out['facilities'] and not out['mobile']:
             return None
         out['as_of'] = agr_date.isoformat()
+        active = {f['agreement'] for f in out['facilities'] if f.get('active')}
+        if active:
+            try:
+                out['history'] = self._facility_history(cid, active)
+            except Exception:
+                out['history'] = None     # the table above still stands without it
+        return out
+
+    def _facility_history(self, cid: int, agreements: set) -> dict[str, list[dict]]:
+        """Outstanding per active facility at each month's last snapshot, 12 months."""
+        hi = self.loan_as_of()
+        lo = self._months_ago(11)
+        rows = self._t.execute(
+            f"SELECT CAST(eom_date AS varchar) d, TRIM(CAST(agreement_number AS varchar)) agr, "
+            f"SUM(gross_total) o FROM delta.gold_db.eom_loans "
+            f"WHERE cust_id = ? {self._range_part(lo, hi)} "
+            f"AND eom_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} GROUP BY 1, 2",
+            (cid,))
+        last: dict[tuple[str, str], tuple[str, float]] = {}
+        for r in rows:
+            agr, d = r.get('agr'), self._safe_date(r.get('d'))
+            if agr not in agreements or not d:
+                continue
+            key = (agr, d[:7])
+            if key not in last or d > last[key][0]:
+                last[key] = (d, float(r.get('o') or 0))
+        out: dict[str, list[dict]] = {}
+        for (agr, month), (d, o) in sorted(last.items(), key=lambda kv: kv[0][1]):
+            out.setdefault(agr, []).append({'period': f'{month}-01', 'date': d, 'outstanding': round(o)})
         return out
 
     # --- 90-day transaction activity (the activity cross-sell input) -----------
@@ -3785,8 +3817,22 @@ class TrinoWarehouse(WarehouseGateway):
             f"  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
             f"  AND {_MOVEMENT_SQL})) "
             f"WHERE cat IS NOT NULL GROUP BY cat", (cid,))
-        return {'from': lo.isoformat(), 'to': hi.isoformat(),
-                'profile': activity_shape.profile_from_rows(rows)}
+        profile = activity_shape.profile_from_rows(rows)
+        salary_days: list[int] = []
+        if profile['salary']['count'] + profile['salary_acct']['count'] > 0:
+            # The calendar days salary landed on, so an RM can time the call.
+            drows = self._t.execute(
+                f"SELECT day(transaction_date) d FROM ("
+                f" SELECT transaction_date, {activity_shape.CATEGORY_SQL} cat FROM ("
+                f"  SELECT transaction_date, UPPER(TRIM(justific_descrption)) j, "
+                f"         UPPER(TRIM(product_description)) p "
+                f"  FROM delta.gold_db.fact_dep_trx_recording "
+                f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
+                f"  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
+                f"  AND {_MOVEMENT_SQL})) WHERE cat IN ('salary', 'salary_acct')", (cid,))
+            salary_days = sorted(int(r['d']) for r in drows if r.get('d') is not None)
+        return {'from': lo.isoformat(), 'to': hi.isoformat(), 'profile': profile,
+                'salary_days': salary_days}
 
     # --- category register (AML risk, income band, …) + cards -----------------
     def get_customer_profile(self, cust_id):
@@ -3941,6 +3987,14 @@ class TrinoWarehouse(WarehouseGateway):
                     **{k: opp[k] for k in ('rule_id', 'product', 'product_name', 'domain',
                                            'reason', 'reason_short', 'evidence')},
                 })
+        # Breakdowns over EVERY matched customer, not just the rows kept for the list.
+        branch_counts: dict[str, dict[str, int]] = {}
+        all_ids: dict[str, list[str]] = {}
+        for rule_id, items in by_rule.items():
+            for x in items:
+                b = branch_counts.setdefault(x['branch'] or 'No branch', {})
+                b[rule_id] = b.get(rule_id, 0) + 1
+                all_ids.setdefault(x['cust_id'], []).append(rule_id)
         rules = []
         keep: list[dict] = []
         for rule_id in sorted(by_rule):
@@ -3948,11 +4002,27 @@ class TrinoWarehouse(WarehouseGateway):
             rules.append({'rule_id': rule_id, 'product_name': items[0]['product_name'],
                           'reason_short': items[0]['reason_short'], 'customers': len(items)})
             keep.extend(items[:limit_per_rule])
-        alloc = self.get_current_rm([x['cust_id'] for x in keep])
+        alloc = self._current_rm_chunked(list(all_ids))
         for x in keep:
             cur = alloc.get(x['cust_id']) if alloc else None
             x['rm_name'] = (cur or {}).get('name')
-        return {'from': lo.isoformat(), 'to': hi.isoformat(), 'rules': rules, 'results': keep}
+        rm_counts: dict[str, dict[str, int]] = {}
+        for cid_, rids in all_ids.items():
+            name = ((alloc.get(cid_) or {}).get('name')) if alloc else None
+            if not name:
+                continue
+            row = rm_counts.setdefault(name, {})
+            for rid in rids:
+                row[rid] = row.get(rid, 0) + 1
+
+        def ranked(d: dict[str, dict[str, int]], top: int) -> list[dict]:
+            return sorted(({'name': k, 'total': sum(v.values()), 'by_rule': v} for k, v in d.items()),
+                          key=lambda x: x['total'], reverse=True)[:top]
+
+        return {'from': lo.isoformat(), 'to': hi.isoformat(), 'rules': rules, 'results': keep,
+                'by_branch': ranked(branch_counts, 15),
+                # Empty when the RM allocation is unavailable - never guessed.
+                'by_rm': ranked(rm_counts, 15)}
 
     @staticmethod
     def _opp_strength(rule_id: str, prof: dict, liquid: float) -> float:
@@ -3975,3 +4045,311 @@ class TrinoWarehouse(WarehouseGateway):
         if rule_id == 'T7':
             return prof['cash_out']['value']
         return 0.0
+
+    # --- money in / money out by month (signed ledger amounts) -----------------
+    def get_cash_flow(self, cust_id, months: int = 12):
+        """Twelve months of money in and out, by month and by source (c360/cashflow.py),
+        running to the newest posting. None when nothing moved."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        hi = self.ledger_as_of()
+        total = hi.year * 12 + (hi.month - 1) - (int(months) - 1)
+        lo = date(total // 12, total % 12 + 1, 1)
+        rows = self._t.execute(
+            f"SELECT CAST(date_trunc('month', transaction_date) AS varchar) month, grp, "
+            f"SUM(CASE WHEN a > 0 THEN a ELSE 0 END) inflow, "
+            f"SUM(CASE WHEN a < 0 THEN -a ELSE 0 END) outflow, "
+            f"SUM(CASE WHEN a > 0 THEN 1 ELSE 0 END) n_in, SUM(CASE WHEN a < 0 THEN 1 ELSE 0 END) n_out "
+            f"FROM (SELECT transaction_date, a, {cashflow_shape.GROUP_SQL} grp FROM ("
+            f"  SELECT transaction_date, o_final_acc_amount a, UPPER(TRIM(justific_descrption)) j, "
+            f"         UPPER(TRIM(product_description)) p "
+            f"  FROM delta.gold_db.fact_dep_trx_recording "
+            f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
+            f"  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
+            f"  AND {_MOVEMENT_SQL})) "
+            f"GROUP BY 1, 2", (cid,))
+        out = cashflow_shape.shape(rows, cashflow_shape.month_starts(lo, hi))
+        if out is None:
+            return None
+        out['from'], out['to'] = lo.isoformat(), hi.isoformat()
+        return out
+
+    # --- loans in detail: instalments, arrears, maturity, how they are paid ----
+    def get_loan_details(self, cust_id):
+        """Each live loan with its instalment, next due date, days overdue, maturity and
+        rate - and, where a standing order of exactly the instalment amount ran in the
+        last four months, the account that pays it. None when there is no live loan."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        rows = self._t.execute(
+            f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, TRIM(e.account_no) acc, "
+            f"e.gross_total bal, e.installment_amount inst, CAST(e.install_next_dt AS varchar) next_dt, "
+            f"e.overdue_days od, e.ov_balance ov, CAST(e.acc_exp_dt AS varchar) matures, "
+            f"e.remaining_months rem, e.total_months tot, e.final_interest rate, "
+            f"TRIM(e.loan_status_ind_name) st "
+            f"FROM delta.gold_db.eom_loans e "
+            f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
+            f"WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} "
+            f"AND e.cust_id = ? AND e.gross_total <> 0 ORDER BY e.gross_total DESC", (cid,))
+        if not rows:
+            return None
+        hi = self.ledger_as_of()
+        lo = self._months_ago(4)
+        sos = self._t.execute(
+            f"SELECT CAST(transaction_date AS varchar) d, o_final_acc_amount a, "
+            f"TRIM(product_description) prod "
+            f"FROM delta.gold_db.fact_dep_trx_recording "
+            f"WHERE customer_id = ? {self._range_part(lo, hi)} "
+            f"AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
+            f"AND UPPER(TRIM(justific_descrption)) = 'STANDING ORDER PAYMENT' AND {_MOVEMENT_SQL}",
+            (cid,))
+        out = []
+        for r in rows:
+            inst = round(float(r.get('inst') or 0), 2)
+            paid = [s for s in sos if inst > 0 and abs(abs(float(s.get('a') or 0)) - inst) <= 1.0]
+            paid_by = None
+            if paid:
+                days = sorted({int(str(s['d'])[8:10]) for s in paid if s.get('d')})
+                acct = (self._clean(paid[0].get('prod')) or '').title() or None
+                paid_by = {'account': acct, 'days': days,
+                           'last': max(str(s['d'])[:10] for s in paid if s.get('d'))}
+            od = int(float(r.get('od') or 0))
+            matures = self._safe_date(r.get('matures'))
+            cat = products_shape.loan_category(r.get('l2'))
+            out.append({
+                'product': (self._clean(r.get('product')) or '').title(),
+                'type': cat[1] if cat else None,
+                'account_no': self._clean(r.get('acc')),
+                'balance': round(float(r.get('bal') or 0)),
+                'instalment': round(inst) if inst else None,
+                'next_due': self._safe_date(r.get('next_dt')),
+                'days_overdue': od,
+                'arrears': round(float(r.get('ov') or 0)) if od > 0 else 0,
+                'matures': matures if matures and matures[:4] < '2100' else None,
+                'months_left': int(float(r.get('rem') or 0)) or None,
+                'term_months': int(float(r.get('tot') or 0)) or None,
+                'rate': float(r['rate']) if r.get('rate') is not None else None,
+                'status': self._clean(r.get('st')),
+                'paid_by_standing_order': paid_by,
+            })
+        return {'loans': out, 'as_of': self.loan_as_of().isoformat()}
+
+    # --- relationship timeline (full registers, closed accounts included) -------
+    def get_timeline(self, cust_id):
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        ident = self._t.execute(
+            "SELECT CAST(account_opening_date AS varchar) a, CAST(cust_open_date AS varchar) c, "
+            "TRIM(primary_mobile_no) m FROM delta.gold_db.dim_customer WHERE customer_id = ? LIMIT 1",
+            (cid,))
+        if not ident:
+            return None
+        joined = self._safe_date(ident[0].get('a')) or self._safe_date(ident[0].get('c'))
+        deps = self._t.execute(
+            "SELECT TRIM(product_name) product, CAST(opening_date AS varchar) opened, "
+            "CAST(closing_date AS varchar) closed, entry_status status "
+            "FROM delta.gold_db.deposit_account WHERE customer_id = ?", (cid,))
+        loans = self._t.execute(
+            "SELECT TRIM(loan_product_name) product, CAST(acc_open_dt AS varchar) opened, "
+            "CAST(acc_exp_dt AS varchar) matures, account_status status, "
+            "drawdown_first_amount first_dd, acc_limit_amn lim, total_drawdown_amount total_dd "
+            "FROM delta.gold_db.loan_account WHERE customer_id = ?", (cid,))
+        whizz = None
+        mobile = ident[0].get('m')
+        if mobile:
+            w = self._t.execute(
+                "SELECT CAST(min(date_of_reg) AS varchar) d FROM delta.gold_db.customers_whizz "
+                "WHERE CAST(phone_number AS varchar) = ?", (str(mobile),))
+            whizz = self._safe_date(w[0].get('d')) if w else None
+        return timeline_shape.build(
+            joined=joined,
+            deposits=[{'product': d.get('product'), 'opened': self._safe_date(d.get('opened')),
+                       'closed': self._safe_date(d.get('closed')), 'status': d.get('status')}
+                      for d in deps],
+            # The facility's sanctioned limit (KES 9M for 1218821's mortgage, as her cash
+            # flow shows), not the first drawdown (610,080 - construction loans draw in
+            # stages) nor the total drawn (re-draws push it past the limit). A mobile loan
+            # is one drawdown, so its first drawdown is the amount approved.
+            loans=[{'product': l.get('product'), 'opened': self._safe_date(l.get('opened')),
+                    'matures': self._safe_date(l.get('matures')), 'status': l.get('status'),
+                    'amount': (l.get('first_dd') if 'MOBILE' in str(l.get('product') or '').upper()
+                               else (l.get('lim') if float(l.get('lim') or 0) > 0 else l.get('total_dd')))}
+                   for l in loans],
+            whizz_registered=whizz)
+
+    # --- customer vs segment peers ---------------------------------------------
+    _PEER_TTL_SECONDS = 6 * 3600
+
+    def _segment_distributions(self) -> dict[str, dict[str, Any]]:
+        """99 percentile points per measure per segment, whole book, cached 6 hours."""
+        now = time.monotonic()
+        memo = getattr(self, '_peer_memo', None)
+        if memo is not None and (now - getattr(self, '_peer_memo_at', 0.0)) < self._PEER_TTL_SECONDS:
+            return memo
+        d, dp = self._as_of_lit(), self._asof_part().replace('partition_', 'e.partition_')
+        pts = ', '.join(f'{i / 100:.2f}' for i in range(1, 100))
+        internal = "'DUMMY','NOSTRO FCY','VOSTRO A/CS','HIDDEN ACCOUNT'"
+        year = self.as_of_date().year
+        rows = self._t.execute(f"""
+            WITH dep AS (
+              SELECT e.cust_id c, SUM(e.book_balance) dep,
+                     COUNT(DISTINCT CASE WHEN TRIM(p.tree_level_2) IN ({internal}) THEN NULL
+                                         WHEN TRIM(p.tree_level_2) = 'CURRENT ACCOUNT'
+                                              AND UPPER(TRIM(e.product_desc)) = 'VIRTUAL ACCOUNT MOBILE' THEN 'WALLET'
+                                         ELSE TRIM(p.tree_level_2) END) k
+              FROM delta.gold_db.eom_deposits e
+              LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
+              WHERE e.eom_date = {d} {dp} AND e.book_balance <> 0 GROUP BY 1),
+            lo AS (
+              SELECT e.cust_id c, SUM(e.gross_total) loans, COUNT(DISTINCT TRIM(p.tree_level_2)) k
+              FROM delta.gold_db.eom_loans e
+              LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
+              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.gross_total <> 0 GROUP BY 1),
+            rv AS (
+              SELECT cust_cif c, SUM(CASE WHEN TRIM(income_category) = 'Interest_Expenses'
+                                          THEN -revenue ELSE revenue END) rev
+              FROM delta.gold_db.rpt_ceo_all_revenue_trend WHERE YEAR(month_name) = {year} GROUP BY 1),
+            base AS (
+              SELECT dc.customer_segment seg, COALESCE(dep.dep, 0) dep, COALESCE(lo.loans, 0) loans,
+                     COALESCE(dep.k, 0) + COALESCE(lo.k, 0) products, COALESCE(rv.rev, 0) rev
+              FROM dep FULL OUTER JOIN lo ON lo.c = dep.c
+              JOIN delta.gold_db.dim_customer dc ON dc.customer_id = COALESCE(dep.c, lo.c)
+              LEFT JOIN rv ON rv.c = COALESCE(dep.c, lo.c)
+              WHERE dc.customer_segment <> 'INTERNAL ACCOUNTS')
+            SELECT seg, COUNT(*) n,
+                   approx_percentile(CAST(dep AS double), ARRAY[{pts}]) p_dep,
+                   approx_percentile(CAST(loans AS double), ARRAY[{pts}]) p_loans,
+                   approx_percentile(CAST(products AS double), ARRAY[{pts}]) p_products,
+                   approx_percentile(CAST(rev AS double), ARRAY[{pts}]) p_rev
+            FROM base GROUP BY seg""")
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            label = self._seg_label(r.get('seg'))
+            cur = {'customers': int(r.get('n') or 0), 'deposits': list(r.get('p_dep') or []),
+                   'loans': list(r.get('p_loans') or []), 'products': list(r.get('p_products') or []),
+                   'revenue': list(r.get('p_rev') or [])}
+            if label in out and cur['customers'] <= out[label]['customers']:
+                continue      # two raw segments can share a label; keep the larger
+            out[label] = cur
+        if out:
+            self._peer_memo, self._peer_memo_at = out, now
+        return out
+
+    def get_peer_position(self, cust_id, segment):
+        cid = self._cid(cust_id)
+        if cid is None or not segment:
+            return None
+        dist = self._segment_distributions().get(segment)
+        if not dist or dist['customers'] < 20:
+            return None
+        val = self.get_relationship_value(cust_id)
+        mix = self.get_product_mix(cust_id) or {}
+        rev = self.get_revenue(cust_id) or {}
+        mine = {'deposits': val.get('deposits') or 0, 'loans': val.get('loans') or 0,
+                'products': len(mix.get('held_keys') or []),
+                'revenue': ((rev.get('totals') or {}).get('net') or 0)
+                           if rev.get('year') == self.as_of_date().year else 0}
+        out = peers_shape.position(mine, dist)
+        out['segment'] = segment
+        return out
+
+    # --- full statement for a date range ----------------------------------------
+    def get_statement(self, cust_id, start, end, limit: int = 500):
+        """Every money movement between two dates, newest first, with totals in and out
+        over the WHOLE range (not just the rows returned)."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        end = min(end, self.ledger_as_of())
+        if start > end:
+            start = end
+        rp = self._range_part(start, end)
+        where = (f"FROM delta.gold_db.fact_dep_trx_recording WHERE customer_id = ? {rp} "
+                 f"AND transaction_date BETWEEN {self._date_lit(start)} AND {self._date_lit(end)} "
+                 f"AND {_MOVEMENT_SQL}")
+        rows = self._t.execute(
+            f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
+            f"channel_description ch, o_final_acc_amount amt, TRIM(product_description) prod {where} "
+            f"ORDER BY transaction_date DESC, tun_internal_sn DESC LIMIT ?", (cid, int(limit)))
+        tot = self._t.execute(
+            f"SELECT COUNT(*) n, SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) i, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) o {where}", (cid,))
+        t = tot[0] if tot else {}
+        return {
+            'from': start.isoformat(), 'to': end.isoformat(),
+            'total_count': int(t.get('n') or 0),
+            'total_in': round(float(t.get('i') or 0)), 'total_out': round(float(t.get('o') or 0)),
+            'rows': [{'date': self._safe_date(r.get('d')),
+                      'description': (self._clean(r.get('j')) or 'Transaction').title(),
+                      'account': (self._clean(r.get('prod')) or '').title() or None,
+                      'channel': self._feed_channel(r.get('ch')),
+                      'amount': round(float(r.get('amt') or 0)), 'currency': 'KES'} for r in rows],
+        }
+
+    # --- fixed deposits maturing soon (management retention list) --------------
+    def td_maturities(self, days: int = 30, limit: int = 300):
+        d, dp = self._as_of_lit(), self._asof_part().replace('partition_', 'e.partition_')
+        asof = self.as_of_date()
+        until = asof + timedelta(days=int(days))
+        rows = self._t.execute(f"""
+            SELECT CAST(e.cust_id AS BIGINT) cid, TRIM(e.account_no) acc, TRIM(e.product_desc) prod,
+                   e.book_balance bal, CAST(e.expiry_date AS varchar) ex,
+                   dc.full_name, dc.customer_segment, dc.account_branch_name, dc.employer, dc.fk_bankemployeeid
+            FROM delta.gold_db.eom_deposits e
+            JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
+            JOIN delta.gold_db.dim_customer dc ON dc.customer_id = e.cust_id
+            WHERE e.eom_date = {d} {dp} AND e.book_balance > 0
+              AND TRIM(p.tree_level_2) IN ('TERM DEPOSIT ACCOUNT', 'CALL ACCOUNT')
+              AND dc.customer_segment <> 'INTERNAL ACCOUNTS'""")
+        upcoming, past_n, past_v = [], 0, 0.0
+        for r in rows:
+            if is_staff_from_fields(employer=r.get('employer'), segment=r.get('customer_segment'),
+                                    bank_employee_id=r.get('fk_bankemployeeid')):
+                continue
+            ex = self._safe_date(r.get('ex'))
+            if not ex:
+                continue
+            bal = float(r.get('bal') or 0)
+            if ex < asof.isoformat():
+                past_n += 1
+                past_v += bal
+                continue
+            if ex > until.isoformat():
+                continue
+            upcoming.append({'cust_id': str(r['cid']), 'name': self._clean(r.get('full_name')),
+                             'segment': self._seg_label(r.get('customer_segment')),
+                             'branch': self._clean(r.get('account_branch_name')),
+                             'account_no': self._clean(r.get('acc')),
+                             'product': (self._clean(r.get('prod')) or '').title(),
+                             'balance': round(bal), 'matures': ex,
+                             'days_left': (date.fromisoformat(ex) - asof).days})
+        upcoming.sort(key=lambda x: (x['matures'], -x['balance']))
+        weeks = {}
+        for u in upcoming:
+            w = u['days_left'] // 7
+            b = weeks.setdefault(w, {'count': 0, 'value': 0.0})
+            b['count'] += 1
+            b['value'] += u['balance']
+        shown = upcoming[:int(limit)]
+        alloc = self._current_rm_chunked([u['cust_id'] for u in shown])
+        for u in shown:
+            u['rm_name'] = (alloc.get(u['cust_id']) or {}).get('name')
+        return {
+            'as_of': asof.isoformat(), 'until': until.isoformat(), 'days': int(days),
+            'count': len(upcoming), 'value': round(sum(u['balance'] for u in upcoming)),
+            'by_week': [{'week': w + 1, 'label': f'Days {w * 7} to {min(w * 7 + 6, int(days))}',
+                         'count': int(v['count']), 'value': round(v['value'])}
+                        for w, v in sorted(weeks.items())],
+            'past_due_count': past_n, 'past_due_value': round(past_v),
+            'results': shown,
+        }
+
+    def _current_rm_chunked(self, ids, size: int = 2000):
+        out = {}
+        uniq = list(dict.fromkeys(str(i) for i in ids if i))
+        for i in range(0, len(uniq), size):
+            out.update(self.get_current_rm(uniq[i:i + size]) or {})
+        return out
