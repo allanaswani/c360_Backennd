@@ -52,7 +52,7 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
     disb = gateway.disbursement_vs_balance_series(cust_id, period)
     txns = gateway.transaction_series(cust_id, period)
     channels = gateway.channel_usage(cust_id, period)
-    recent = gateway.recent_transactions(cust_id, period=period, limit=8)
+    recent = gateway.recent_transactions(cust_id, period=period, limit=15)
 
     # Where this customer's lending stands in the LIVE book. The allocation upload's
     # npl column is periodic and was flagging performing customers months after they
@@ -148,8 +148,11 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
             },
             'recent_transactions': {
                 'status': series_status.value,
-                'note': series_note or 'Most recent customer-facing activity (looks back up to 24 months so it always loads, independent of the period filter above).',
-                'columns': ['date', 'description', 'channel', 'amount'],
+                'note': series_note or ('Every money movement on the customer’s accounts, newest '
+                                        'first, up to the latest posting: salary credits, standing '
+                                        'orders and other system postings included. Money out is '
+                                        'negative and includes any charge. Looks back up to 24 months.'),
+                'columns': ['date', 'description', 'account', 'channel', 'amount'],
                 'rows': recent,
             },
         },

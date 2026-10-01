@@ -6,9 +6,14 @@ leaving by M-Pesa, cash over the counter, cheques and RTGS going out. Every
 opportunity it raises carries the evidence in plain words ("salary credited 3 times
 in the last 90 days, KES 412,000 in total"), so an RM can check it before calling.
 
-Transactions are classified by their core-banking purpose (``justific_descrption``)
-only. ``trn_type`` is NOT used for direction: verified 2026-09-30 it files M-Pesa
-money in and out under the same code, and JOURNAL DEBIT under the credit code.
+Transactions are classified by their core-banking purpose (``justific_descrption``),
+on every channel, counting only real movements (signed amount not zero). Channel is
+NOT used to filter: M-Pesa deposits ride the integration bus and salaries can arrive
+as a system journal credit (customer 1218821: a monthly JOURNAL CREDIT into her
+MALIPO SALARY ACCOUNT). ``trn_type`` is NOT used for direction: verified 2026-09-30
+it files M-Pesa money in and out under the same code. "DEPOSIT THROUGH TILL" is left
+unclassified on purpose - nothing in the data says whether the till is an M-Pesa
+till or a branch cashier's.
 
 Deliberately absent: an "insurance premium" signal. ``INSURANCE DEBIT`` looks like
 one, but KES 140.5B of it in Jul-Sep 2026 sat on five internal accounts, and the
@@ -29,12 +34,15 @@ from . import brand
 WINDOW_DAYS = 90
 
 # The purpose -> category classification, as a SQL CASE over an upper-cased, trimmed
-# purpose column named ``j``. Shared by the per-customer and whole-book queries so
-# the two can never classify a transaction differently.
+# purpose column ``j`` and product column ``p``. Shared by the per-customer and
+# whole-book queries so the two can never classify a transaction differently.
 CATEGORY_SQL = """CASE
  WHEN j LIKE 'SALARY POSTINGS%' AND j NOT LIKE '%RETURN%' THEN 'salary'
+ WHEN j = 'JOURNAL CREDIT' AND p LIKE '%SALARY%' THEN 'salary_acct'
  WHEN j = 'ACCOUNT TO MPESA(B2C)' THEN 'mpesa_out'
- WHEN j IN ('CR FROM MOBILE BANKING-MPESA TO ACC', 'HFCB MPESA TO ACCOUNT(B2C)') THEN 'mpesa_in'
+ WHEN j IN ('CR FROM MOBILE BANKING-MPESA TO ACC', 'HFCB MPESA TO ACCOUNT(B2C)',
+            'MPESA CR WHIZZPAY') THEN 'mpesa_in'
+ WHEN j IN ('ACCOUNT CREDIT KITS', 'ACCOUNT DEBIT FROM KITS') THEN 'pesalink'
  WHEN j LIKE 'PAY BILL%' OR j LIKE 'BUY GOOD%' OR j LIKE 'AIRTIME PURCHASE%'
       OR j LIKE 'UTILITY BILL PAYMENT%' THEN 'bills'
  WHEN j IN ('DEPOSIT CASH', 'CASH DEPOSIT MACHINE (CDM)') THEN 'cash_in'
@@ -47,8 +55,10 @@ END"""
 
 CATEGORY_LABELS = {
     'salary': 'Salary credits',
+    'salary_acct': 'Credits into a salary account',
     'mpesa_out': 'Sent to M-Pesa',
     'mpesa_in': 'M-Pesa into account',
+    'pesalink': 'PesaLink transfers',
     'bills': 'Pay Bill, Buy Goods, airtime',
     'cash_in': 'Cash deposits',
     'cash_out': 'Cash withdrawals',
@@ -61,6 +71,10 @@ CATEGORIES = tuple(CATEGORY_LABELS)
 
 # Calibrated thresholds (see module docstring).
 SALARY_MIN = 2            # two or more salary credits in 90 days = a salaried customer
+# Journal credits into a salary-type account count as a salary pattern only when they
+# arrive about monthly. A cap matters: one customer had 49 such credits in 90 days
+# (KES 20.5M) - that is money being paid in, not a salary.
+SALARY_ACCT_MAX = 6
 MPESA_OUT_MIN = 10        # a regular M-Pesa user
 CASH_MIN = 6              # cash-in + cash-out, with no digital use at all
 IDLE_LIQUID_MIN = 1_000_000
@@ -146,20 +160,31 @@ def opportunities(profile: dict[str, dict[str, float]], *, held: set[str],
                     'domain': domain, 'reason': reason, 'reason_short': short,
                     'base_score': score, 'evidence': evidence})
 
-    salaried = c['salary'] >= SALARY_MIN
-    sal_ev = [f"Salary credited {_times(c['salary'])} in the last {WINDOW_DAYS} days, "
-              f"{_kes(v['salary'])} in total."] if salaried else []
+    by_posting = c['salary'] >= SALARY_MIN
+    by_account = SALARY_MIN <= c['salary_acct'] <= SALARY_ACCT_MAX
+    salaried = by_posting or by_account
+    if by_posting:
+        sal_ev = [f"Salary credited {_times(c['salary'])} in the last {WINDOW_DAYS} days, "
+                  f"{_kes(v['salary'])} in total."]
+        sal_how = f"Salary is paid into this account ({c['salary']} credits in {WINDOW_DAYS} days)"
+    elif by_account:
+        sal_ev = [f"{c['salary_acct']} credits into a salary account in the last {WINDOW_DAYS} "
+                  f"days, {_kes(v['salary_acct'])} in total."]
+        sal_how = (f"Regular credits land in their salary account ({c['salary_acct']} in "
+                   f"{WINDOW_DAYS} days)")
+    else:
+        sal_ev, sal_how = [], ''
 
     if ok['personal'] and salaried and not held & {'consumer', 'vuna_hela'}:
         add('T1', 'unsecured', 'Salary-backed personal loan', BANK,
-            f"Salary is paid into this account ({c['salary']} credits in {WINDOW_DAYS} days) "
-            f"and there is no personal loan with us. A salary-backed loan is the natural offer.",
+            f"{sal_how} and there is no personal loan with us. A salary-backed loan is the "
+            f"natural offer.",
             'Salaried, no personal loan', 0.78, sal_ev)
 
     if ok['personal'] and salaried and not held & {'savings', 'notice', 'term_deposit'}:
         add('T2', 'savings', 'Savings account', BANK,
-            'Salary is paid into this account but there is no savings product with us. A '
-            'savings or target savings account can take a fixed amount each payday.',
+            f"{sal_how} but there is no savings product with us. A savings or target savings "
+            f"account can take a fixed amount each payday.",
             'Salaried, no savings product', 0.70, sal_ev)
 
     if ok['deposit'] and liquid_balance >= IDLE_LIQUID_MIN and not held & {'term_deposit', 'call_deposit'}:
@@ -186,7 +211,7 @@ def opportunities(profile: dict[str, dict[str, float]], *, held: set[str],
             'Regular M-Pesa user, no recent mobile loan', 0.60,
             [f"{c['mpesa_out']} transfers to M-Pesa, {_kes(v['mpesa_out'])} in total."])
 
-    digital = c['mpesa_out'] + c['mpesa_in'] + c['bills']
+    digital = c['mpesa_out'] + c['mpesa_in'] + c['bills'] + c['pesalink']
     cash = c['cash_in'] + c['cash_out']
     if ok['whizz'] and cash >= CASH_MIN and digital == 0:
         add('T6', 'mobile', 'Whizz / mobile banking', BANK,
@@ -194,7 +219,7 @@ def opportunities(profile: dict[str, dict[str, float]], *, held: set[str],
             f"days) and never digitally. Whizz saves them the branch visit.",
             'Cash only, no digital use', 0.62,
             [f"{c['cash_in']} cash deposits, {c['cash_out']} cash withdrawals; "
-             f"no M-Pesa or bill payments in {WINDOW_DAYS} days."])
+             f"no M-Pesa, PesaLink or bill payments in {WINDOW_DAYS} days."])
 
     if ok['personal'] and has_active_card is False and c['cash_out'] >= CASH_OUT_NO_CARD_MIN:
         add('T7', 'debit_card', 'Debit card', BANK,

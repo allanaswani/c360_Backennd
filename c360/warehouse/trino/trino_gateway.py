@@ -124,14 +124,10 @@ _LOAN_KEYWORDS = (
 )
 
 # --- transaction feed: fact_dep_trx_recording ---------------------------------
-# The real per-customer transaction ledger (covers 200/200 sampled customers, up to
-# the as-of day). The rpt_c360_* summaries were near-empty (0/200) — using them was
-# why the trend/channel/recent charts showed "no data". These are the technical /
-# accounting channels to exclude so only customer-facing activity is counted.
-_SYS_CHANNELS_SQL = (
-    "'BATCH','SAP FINANCE GL','WSO2 - ENTERPRISE SERVICE BUS',"
-    "'ESB - ENTERPRISE SERVICE BUS','DEFAULT'"
-)
+# The real per-customer transaction ledger (covers 200/200 sampled customers). The
+# rpt_c360_* summaries were near-empty (0/200) — using them was why the trend/channel/
+# recent charts showed "no data". Channel scoping is defined further down
+# (_SYSTEM_CHANNELS_SQL, _MOVEMENT_SQL, _ENGAGEMENT_SQL).
 # Friendly display names for the raw channel_description values (keyed upper-cased).
 _CHANNEL_DISPLAY = {
     'KOCELA - SUBSCRIBER AND PAYMENT CHANNEL': 'Whizz / M-Pesa',
@@ -142,11 +138,33 @@ _CHANNEL_DISPLAY = {
     'MIPS CHEQUES': 'Cheque',
     'PROFITS GATEWAY': 'Branch',
 }
+# The ledger's own system channels. Real money moves on them - salary journal
+# credits, standing orders, cheque clearing, incoming RTGS (KES 10.8B in Sep 2026) -
+# so the transaction FEED shows them, labelled "System". Engagement measures (trend,
+# channel mix, last activity) still leave them out: a standing order firing is not the
+# customer choosing to bank. Verified 2026-10-01.
+_SYSTEM_CHANNELS_SQL = "'BATCH','SAP FINANCE GL','DEFAULT'"
+# The integration bus: M-Pesa deposits into accounts (313k in Sep 2026), till
+# collections, PesaLink (KITS) and Whizz Pay. Customer-initiated, so it counts as
+# engagement. Its mirror legs ("DEBIT FROM MOBILE BANKING" …) sit on internal accounts.
+_ESB_CHANNELS_SQL = "'WSO2 - ENTERPRISE SERVICE BUS','ESB - ENTERPRISE SERVICE BUS'"
+# A real money movement: the signed amount the account actually moved by. Zero on
+# accruals, interest calculations, holds, arrears checks and statement requests -
+# verified across Sep 2026 with no exceptions - and never null back to 2024.
+_MOVEMENT_SQL = "o_final_acc_amount <> 0"
+# Customer-initiated money movement: a real movement, not on a system channel.
+_ENGAGEMENT_SQL = (f"{_MOVEMENT_SQL} AND UPPER(TRIM(channel_description)) "
+                   f"NOT IN ({_SYSTEM_CHANNELS_SQL})")
 # Channels that indicate the customer banks digitally (drives the mobile flag).
 _DIGITAL_CHANNELS_SQL = (
     "'MOBILE BANKING CHANNEL','INTERNET','ON-LINE CHANNEL',"
     "'KOCELA - SUBSCRIBER AND PAYMENT CHANNEL'"
 )
+# Digital use: any row on a digital channel, or a real movement on the integration
+# bus (M-Pesa deposits, PesaLink) - the bus also carries zero-value system checks.
+_DIGITAL_USE_SQL = (f"(UPPER(TRIM(channel_description)) IN ({_DIGITAL_CHANNELS_SQL}) "
+                    f"OR (UPPER(TRIM(channel_description)) IN ({_ESB_CHANNELS_SQL}) "
+                    f"AND {_MOVEMENT_SQL}))")
 
 # --- Whizz (KOCELA mobile-money) -----------------------------------------------
 # Whizz activity is captured on the customer's bank account under the KOCELA channel
@@ -255,6 +273,10 @@ class TrinoWarehouse(WarehouseGateway):
             return r[0]['d'] if r and r[0].get('d') else None
 
         dep, loan = _latest('eom_deposits'), _latest('eom_loans')
+        # Each table's own newest date, kept so a per-customer read can use the newest
+        # data its table holds instead of waiting for the slower one (loans post a day
+        # before deposits). The shared as-of below stays for whole-book figures.
+        self._source_dates = {'business': biz, 'deposits': dep, 'loans': loan}
         if dep and loan:
             return min(dep, loan)          # newest date both tables share
         # One side unreadable in the window → use whichever we have, else the biz date.
@@ -263,6 +285,61 @@ class TrinoWarehouse(WarehouseGateway):
     def _as_of_lit(self) -> str:
         # Our own validated date value → safe to inline (enables partition pruning).
         return f"DATE '{self.as_of_date().isoformat()}'"
+
+    def loan_as_of(self) -> date:
+        """Newest eom_loans snapshot (on or before the business date). Per-customer loan
+        reads use it, so lending is not held a day behind by the deposit table."""
+        asof = self.as_of_date()
+        d = (getattr(self, '_source_dates', None) or {}).get('loans')
+        return d if d and d >= asof else asof
+
+    def _loan_lit(self) -> str:
+        return f"DATE '{self.loan_as_of().isoformat()}'"
+
+    def _loan_part(self, alias: str = '') -> str:
+        d = self.loan_as_of()
+        return f" AND {alias}partition_year = {d.year} AND {alias}partition_month = {d.month} "
+
+    _LEDGER_TTL_SECONDS = 1800
+
+    def ledger_as_of(self) -> date:
+        """Newest posting date in the transaction ledger. The ledger loads ahead of the
+        balance snapshots (on 2026-10-01 it held today's postings while deposits stopped
+        at 29 Sep), so transaction views run to here rather than to the balance as-of.
+        Never earlier than the balance as-of; memoised like it."""
+        now = time.monotonic()
+        asof = self.as_of_date()
+        cached = getattr(self, '_ledger_asof', None)
+        if cached is not None and (now - getattr(self, '_ledger_asof_at', 0.0)) < self._LEDGER_TTL_SECONDS:
+            return max(cached, asof)
+        today = date.today()
+        hi = max(today, asof)
+        try:
+            rows = self._t.execute(
+                f"SELECT max(transaction_date) d FROM delta.gold_db.fact_dep_trx_recording "
+                f"WHERE 1=1 {self._range_part(asof, hi)} "
+                f"AND transaction_date BETWEEN {self._date_lit(asof)} AND {self._date_lit(hi)}")
+            d = rows[0]['d'] if rows and rows[0].get('d') else None
+        except Exception:
+            d = None
+        if d is not None:
+            self._ledger_asof, self._ledger_asof_at = d, now
+            return max(d, asof)
+        return asof
+
+    def _txn_end(self, end: date) -> date:
+        """A period that runs to the balance as-of runs, for transactions, to the
+        newest posting instead. An explicitly earlier end date is left alone."""
+        return self.ledger_as_of() if end >= self.as_of_date() else end
+
+    def source_freshness(self) -> dict[str, Any]:
+        """The date each source is current to, for the page to state plainly."""
+        asof = self.as_of_date()
+        sd = getattr(self, '_source_dates', None) or {}
+        def iso(d):
+            return d.isoformat() if d else None
+        return {'business_date': iso(sd.get('business')), 'deposits': iso(sd.get('deposits') or asof),
+                'loans': iso(self.loan_as_of()), 'transactions': iso(self.ledger_as_of())}
 
     _SRC_PROBE_TTL_SECONDS = 900  # 15 min
 
@@ -537,6 +614,16 @@ class TrinoWarehouse(WarehouseGateway):
                    'ESB - ENTERPRISE SERVICE BUS', 'DEFAULT', ''):
             return None
         return _CHANNEL_DISPLAY.get(key, str(raw).strip().title())
+
+    @classmethod
+    def _feed_channel(cls, raw: Any) -> str:
+        """Channel label for the transaction feed, where system postings are shown."""
+        key = str(raw or '').strip().upper()
+        if key in ('BATCH', 'SAP FINANCE GL', 'DEFAULT', ''):
+            return 'System'
+        if key in ('WSO2 - ENTERPRISE SERVICE BUS', 'ESB - ENTERPRISE SERVICE BUS'):
+            return 'M-Pesa, till & PesaLink'
+        return cls._channel_label(raw) or 'Other'
 
     @staticmethod
     def _cid(cust_id: str) -> int | None:
@@ -1004,7 +1091,7 @@ class TrinoWarehouse(WarehouseGateway):
         if not ids:
             return {}
         inlist = ','.join(str(i) for i in ids)
-        d, p = self._as_of_lit(), self._asof_part()
+        d, p = self._loan_lit(), self._loan_part()
         rows = self._t.execute(
             f"SELECT cust_id, TRIM(loan_status_ind_name) status, count(*) accounts, "
             f"SUM(gross_total) gross FROM delta.gold_db.eom_loans "
@@ -1292,13 +1379,14 @@ class TrinoWarehouse(WarehouseGateway):
         if cid is None:
             return {'relationship_value': 0, 'deposits': 0, 'loans': 0, 'revenue': 0}
         d, p = self._as_of_lit(), self._asof_part()
+        ld, lp = self._loan_lit(), self._loan_part()
         rows = self._t.execute(
             f"""
             SELECT
               (SELECT COALESCE(SUM(book_balance), 0) FROM delta.gold_db.eom_deposits
                  WHERE eom_date = {d} {p} AND cust_id = ?) AS deposits,
               (SELECT COALESCE(SUM(gross_total), 0) FROM delta.gold_db.eom_loans
-                 WHERE eom_date = {d} {p} AND cust_id = ?) AS loans
+                 WHERE eom_date = {ld} {lp} AND cust_id = ?) AS loans
             """,
             (cid, cid),
         )
@@ -1351,7 +1439,7 @@ class TrinoWarehouse(WarehouseGateway):
                    CAST(acc_open_dt AS varchar) AS acc_open_dt,
                    loan_status_ind_name, final_sub_class
             FROM delta.gold_db.eom_loans
-            WHERE eom_date = {self._as_of_lit()} {self._asof_part()} AND cust_id = ?
+            WHERE eom_date = {self._loan_lit()} {self._loan_part()} AND cust_id = ?
               AND gross_total <> 0
             ORDER BY gross_total DESC
             LIMIT 40
@@ -1439,7 +1527,7 @@ class TrinoWarehouse(WarehouseGateway):
             f"WHERE eom_date={d} {pp} AND cust_id=?", (cid,))
         loan = self._t.execute(
             f"SELECT DISTINCT product_desc p FROM delta.gold_db.eom_loans "
-            f"WHERE eom_date={d} {pp} AND cust_id=?", (cid,))
+            f"WHERE eom_date={self._loan_lit()} {self._loan_part()} AND cust_id=?", (cid,))
         for r in dep:
             self._apply_flags(flags, r.get('p'), _DEPOSIT_KEYWORDS, base='deposit')
         for r in loan:
@@ -1449,7 +1537,7 @@ class TrinoWarehouse(WarehouseGateway):
         dig = self._t.execute(
             f"SELECT COUNT(*) n FROM delta.gold_db.fact_dep_trx_recording "
             f"WHERE customer_id=? {rp} "
-            f"AND UPPER(TRIM(channel_description)) IN ({_DIGITAL_CHANNELS_SQL})", (cid,))
+            f"AND {_DIGITAL_USE_SQL}", (cid,))
         if dig and (dig[0].get('n') or 0) > 0:
             flags['mobile'] = True
         return {'flags': flags, 'product_map': dict(CANON_LABELS)}
@@ -1546,14 +1634,14 @@ class TrinoWarehouse(WarehouseGateway):
         cid = self._cid(cust_id)
         if cid is None:
             return []
-        lo, hi = self._date_lit(period.start), self._date_lit(period.end)
-        rp = self._range_part(period.start, period.end)
+        end = self._txn_end(period.end)
+        lo, hi = self._date_lit(period.start), self._date_lit(end)
+        rp = self._range_part(period.start, end)
         rows = self._t.execute(
             f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n "
             f"FROM delta.gold_db.fact_dep_trx_recording "
             f"WHERE customer_id=? {rp} AND transaction_date BETWEEN {lo} AND {hi} "
-            f"AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}) "
-            f"AND UPPER(justific_descrption) NOT LIKE '%ACCRUED INTEREST%' "
+            f"AND {_ENGAGEMENT_SQL} "
             f"GROUP BY CAST(transaction_date AS varchar) ORDER BY 1", (cid,))
         return [{'period': self._safe_date(r['d']), 'count': int(r['n'] or 0)}
                 for r in rows if self._safe_date(r['d'])]
@@ -1562,18 +1650,18 @@ class TrinoWarehouse(WarehouseGateway):
         cid = self._cid(cust_id)
         if cid is None:
             return []
-        lo, hi = self._date_lit(period.start), self._date_lit(period.end)
-        rp = self._range_part(period.start, period.end)
+        end = self._txn_end(period.end)
+        lo, hi = self._date_lit(period.start), self._date_lit(end)
+        rp = self._range_part(period.start, end)
         rows = self._t.execute(
             f"SELECT TRIM(channel_description) ch, COUNT(*) n "
             f"FROM delta.gold_db.fact_dep_trx_recording "
             f"WHERE customer_id=? {rp} AND transaction_date BETWEEN {lo} AND {hi} "
-            f"AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}) "
-            f"AND UPPER(justific_descrption) NOT LIKE '%ACCRUED INTEREST%' "
+            f"AND {_ENGAGEMENT_SQL} "
             f"GROUP BY TRIM(channel_description)", (cid,))
         agg: dict[str, int] = {}
         for r in rows:
-            label = self._channel_label(r.get('ch'))
+            label = self._feed_channel(r.get('ch'))
             if label:
                 agg[label] = agg.get(label, 0) + int(r['n'] or 0)
         total = sum(agg.values())
@@ -1582,34 +1670,53 @@ class TrinoWarehouse(WarehouseGateway):
         ordered = sorted(agg.items(), key=lambda kv: kv[1], reverse=True)
         return [{'channel': name, 'share': round(n / total, 4)} for name, n in ordered]
 
-    def recent_transactions(self, cust_id, *, period=None, limit=8, lookback_months=24):
-        """Latest customer-facing transactions. Uses a wide (24-month) lookback so
-        the feed always shows the customer's most recent activity even if it was a
-        while ago — 'recent' means most-recent-available, not last-N-days. When a
-        period is given, the window widens to cover it (so QTD/YTD still work).
-        ``lookback_months`` can be shrunk by callers that only need a light activity
-        probe (e.g. the recommendation engine) to avoid a wide scan per customer."""
+    def recent_transactions(self, cust_id, *, period=None, limit=8, lookback_months=24,
+                            engagement_only=False):
+        """The customer's latest money movements, newest first, up to the newest posting
+        in the ledger (which runs ahead of the balance snapshot).
+
+        Every real movement is included, on every channel: salary journal credits,
+        standing orders, cheque clearing and incoming RTGS are posted on the ledger's
+        "system" channels, and leaving those out showed a salaried customer's account
+        as nothing but M-Pesa sends. Amounts are SIGNED (money out is negative) and
+        are what the account actually moved by, so an M-Pesa send includes its fee.
+
+        Uses a wide (24-month) lookback so the feed always loads even for a customer
+        whose last movement was months ago; a period widens it further.
+        ``engagement_only`` keeps to customer-initiated movements - the
+        recommendation engine's activity probe, which must not count standing orders."""
         cid = self._cid(cust_id)
         if cid is None:
             return []
         floor = getattr(period, 'start', None)
-        start, asof, rp = self._lookback_window(lookback_months, floor=floor)
-        rows = self._t.execute(
-            f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
-            f"channel_description ch, i_amount amt "
-            f"FROM delta.gold_db.fact_dep_trx_recording "
-            f"WHERE customer_id=? {rp} "
-            f"AND transaction_date BETWEEN {self._date_lit(start)} AND {self._date_lit(asof)} "
-            f"AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}) "
-            f"AND UPPER(justific_descrption) NOT LIKE '%ACCRUED INTEREST%' "
-            f"AND i_amount <> 0 "
-            f"ORDER BY transaction_date DESC LIMIT ?", (cid, int(limit)))
+        start, _, _ = self._lookback_window(lookback_months, floor=floor)
+        hi = self.ledger_as_of()
+        scope = _ENGAGEMENT_SQL if engagement_only else _MOVEMENT_SQL
+
+        def fetch(lo: date, top: date, n: int) -> list[dict]:
+            return self._t.execute(
+                f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
+                f"channel_description ch, o_final_acc_amount amt, TRIM(product_description) prod "
+                f"FROM delta.gold_db.fact_dep_trx_recording "
+                f"WHERE customer_id=? {self._range_part(lo, top)} "
+                f"AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(top)} "
+                f"AND {scope} "
+                f"ORDER BY transaction_date DESC, tun_internal_sn DESC LIMIT ?", (cid, int(n)))
+
+        # Newest three months first; reach back further only when they do not fill the
+        # feed. Same rows either way - the older read starts the day before the recent
+        # one ends - but most customers never pay for the 24-month scan.
+        recent_lo = max(start, self._lookback_window(3)[0])
+        rows = fetch(recent_lo, hi, limit)
+        if len(rows) < int(limit) and start < recent_lo:
+            rows += fetch(start, recent_lo - timedelta(days=1), int(limit) - len(rows))
         out = []
         for r in rows:
             out.append({
                 'date': self._safe_date(r.get('d')),
                 'description': (self._clean(r.get('j')) or 'Transaction').title(),
-                'channel': self._channel_label(r.get('ch')) or 'Other',
+                'account': (self._clean(r.get('prod')) or '').title() or None,
+                'channel': self._feed_channel(r.get('ch')),
                 'amount': round(float(r.get('amt') or 0)),
                 'currency': 'KES',
             })
@@ -1642,7 +1749,7 @@ class TrinoWarehouse(WarehouseGateway):
         cid = self._cid(cust_id)
         if cid is None:
             return None
-        asof = self.as_of_date()
+        asof = self.ledger_as_of()
         for older, newer in self._LAST_TXN_WINDOWS:
             lo = self._months_ago(older)
             hi = asof if newer == 0 else self._months_ago(newer)
@@ -1652,9 +1759,7 @@ class TrinoWarehouse(WarehouseGateway):
                 f"FROM delta.gold_db.fact_dep_trx_recording "
                 f"WHERE customer_id=? {rp} "
                 f"AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
-                f"AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}) "
-                f"AND UPPER(justific_descrption) NOT LIKE '%ACCRUED INTEREST%' "
-                f"AND i_amount <> 0", (cid,))
+                f"AND {_ENGAGEMENT_SQL}", (cid,))
             d = self._safe_date(rows[0]['d']) if rows else None
             if d:
                 return d
@@ -1872,7 +1977,7 @@ class TrinoWarehouse(WarehouseGateway):
             'address': self._clean(r.get('address')),
         }
         # Loan classifications at the as-of snapshot (drives operational risk).
-        d, p = self._as_of_lit(), self._asof_part()
+        d, p = self._loan_lit(), self._loan_part()
         lrows = self._t.execute(
             f"SELECT DISTINCT loan_status_ind_name s, final_sub_class f "
             f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} AND cust_id=? "
@@ -2031,7 +2136,7 @@ class TrinoWarehouse(WarehouseGateway):
         for r in self._t.execute(
             f"SELECT DISTINCT customer_id c FROM delta.gold_db.fact_dep_trx_recording "
             f"WHERE customer_id IN ({inlist}) {rp} "
-            f"AND UPPER(TRIM(channel_description)) IN ({_DIGITAL_CHANNELS_SQL})", ()):
+            f"AND {_DIGITAL_USE_SQL}", ()):
             cid = self._cid(r['c'])
             if cid in flags:
                 flags[cid]['mobile'] = True
@@ -2342,8 +2447,9 @@ class TrinoWarehouse(WarehouseGateway):
         cid = self._cid(cust_id)
         if cid is None:
             return None
-        lo, hi = self._date_lit(period.start), self._date_lit(period.end)
-        rp = self._range_part(period.start, period.end)
+        end = self._txn_end(period.end)
+        lo, hi = self._date_lit(period.start), self._date_lit(end)
+        rp = self._range_part(period.start, end)
         where = (f"FROM delta.gold_db.fact_dep_trx_recording WHERE customer_id=? {rp} "
                  f"AND transaction_date BETWEEN {lo} AND {hi} AND {_KOCELA_SQL} "
                  f"AND i_amount <> 0 AND UPPER(justific_descrption) NOT LIKE '%JOURNAL%'")
@@ -3556,7 +3662,8 @@ class TrinoWarehouse(WarehouseGateway):
         d, pp = self._as_of_lit(), self._asof_part()
         dep = self._t.execute(
             f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, "
-            f"TRIM(e.account_no) account_no, e.book_balance balance, e.entry_status "
+            f"TRIM(e.account_no) account_no, e.book_balance balance, e.entry_status, "
+            f"CAST(e.expiry_date AS varchar) expiry, CAST(e.opening_date AS varchar) opened "
             f"FROM delta.gold_db.eom_deposits e "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
             f"WHERE e.eom_date = {d} {pp.replace('partition_', 'e.partition_')} "
@@ -3567,7 +3674,7 @@ class TrinoWarehouse(WarehouseGateway):
             f"TRIM(e.loan_status_ind_name) status, CAST(e.acc_open_dt AS varchar) opened "
             f"FROM delta.gold_db.eom_loans e "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
-            f"WHERE e.eom_date = {d} {pp.replace('partition_', 'e.partition_')} "
+            f"WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} "
             f"AND e.cust_id = ? AND e.gross_total <> 0", (cid,))
         dep_rows = [{'level2': r.get('l2'), 'product': r.get('product'),
                      'balance': float(r.get('balance') or 0)} for r in dep]
@@ -3583,7 +3690,12 @@ class TrinoWarehouse(WarehouseGateway):
             accounts.append({'category': cat[1], 'product': self._clean(r.get('product')),
                              'account_no': self._clean(r.get('account_no')),
                              'balance': round(float(r.get('balance') or 0)),
-                             'status': _ENTRY_STATUS.get(es, 'Active'), 'side': 'deposit'})
+                             'status': _ENTRY_STATUS.get(es, 'Active'), 'side': 'deposit',
+                             'opened': self._safe_date(r.get('opened')),
+                             # Only a term or call deposit matures; other accounts carry
+                             # placeholder expiry dates that mean nothing.
+                             'maturity': (self._safe_date(r.get('expiry'))
+                                          if cat[0] in ('term_deposit', 'call_deposit') else None)})
         for r in loan:
             cat = products_shape.loan_category(r.get('l2'))
             if not cat:
@@ -3597,6 +3709,7 @@ class TrinoWarehouse(WarehouseGateway):
         mix['liquid_balance'] = sum(g['balance'] for g in mix['deposits']
                                     if g['key'] in ('current', 'current_fcy', 'savings', 'notice'))
         mix['as_of'] = self.as_of_date().isoformat()
+        mix['loans_as_of'] = self.loan_as_of().isoformat()
         return mix
 
     # --- credit facilities + mobile-loan history (eom_agreement) ---------------
@@ -3609,7 +3722,7 @@ class TrinoWarehouse(WarehouseGateway):
         cached = getattr(self, '_agr_asof', None)
         if cached is not None and (now - getattr(self, '_agr_asof_at', 0.0)) < self._AGR_TTL_SECONDS:
             return cached
-        asof = self.as_of_date()
+        asof = self.loan_as_of()   # agreements are read beside the loan book
         rows = self._t.execute(
             f"SELECT max(eom_date) d FROM delta.gold_db.eom_agreement "
             f"WHERE eom_date <= {self._date_lit(asof)} "
@@ -3639,7 +3752,7 @@ class TrinoWarehouse(WarehouseGateway):
         outs = self._t.execute(
             f"SELECT TRIM(CAST(agreement_number AS varchar)) agr, SUM(gross_total) o "
             f"FROM delta.gold_db.eom_loans "
-            f"WHERE eom_date = {self._as_of_lit()} {self._asof_part()} AND cust_id = ? "
+            f"WHERE eom_date = {self._loan_lit()} {self._loan_part()} AND cust_id = ? "
             f"GROUP BY 1", (cid,))
         by_agr = {r.get('agr'): float(r.get('o') or 0) for r in outs}
         rows = [{'agreement': r.get('agr'), 'type': r.get('typ'),
@@ -3658,17 +3771,19 @@ class TrinoWarehouse(WarehouseGateway):
         cid = self._cid(cust_id)
         if cid is None:
             return None
-        hi = self.as_of_date()
+        hi = self.ledger_as_of()
         lo = hi - timedelta(days=activity_shape.WINDOW_DAYS - 1)
+        # Classified by purpose alone, on every channel: M-Pesa deposits ride the
+        # integration bus and salary can arrive as a system journal credit.
         rows = self._t.execute(
             f"SELECT cat, COUNT(*) n, SUM(amt) v FROM ("
             f" SELECT amt, {activity_shape.CATEGORY_SQL} cat FROM ("
-            f"  SELECT i_amount amt, UPPER(TRIM(justific_descrption)) j "
+            f"  SELECT i_amount amt, UPPER(TRIM(justific_descrption)) j, "
+            f"         UPPER(TRIM(product_description)) p "
             f"  FROM delta.gold_db.fact_dep_trx_recording "
             f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
             f"  AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} "
-            f"  AND i_amount <> 0 "
-            f"  AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}))) "
+            f"  AND {_MOVEMENT_SQL})) "
             f"WHERE cat IS NOT NULL GROUP BY cat", (cid,))
         return {'from': lo.isoformat(), 'to': hi.isoformat(),
                 'profile': activity_shape.profile_from_rows(rows)}
@@ -3724,7 +3839,7 @@ class TrinoWarehouse(WarehouseGateway):
         """Customers across the whole book whose last 90 days of transactions trigger an
         activity rule (c360/activity.py), with the evidence. One scan of 90 days of the
         transaction ledger + one as-of holdings scan; the caller caches it."""
-        hi = self.as_of_date()
+        hi = self.ledger_as_of()
         lo = hi - timedelta(days=activity_shape.WINDOW_DAYS - 1)
         d, pp = self._as_of_lit(), self._asof_part()
         ep = pp.replace('partition_', 'e.partition_')
@@ -3739,12 +3854,12 @@ class TrinoWarehouse(WarehouseGateway):
         rows = self._t.execute(f"""
             WITH t AS (
               SELECT customer_id cid, amt, {cat_sql} cat FROM (
-                SELECT customer_id, i_amount amt, UPPER(TRIM(justific_descrption)) j
+                SELECT customer_id, i_amount amt, UPPER(TRIM(justific_descrption)) j,
+                       UPPER(TRIM(product_description)) p
                 FROM delta.gold_db.fact_dep_trx_recording
                 WHERE 1=1 {self._range_part(lo, hi)}
                   AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)}
-                  AND i_amount <> 0
-                  AND UPPER(TRIM(channel_description)) NOT IN ({_SYS_CHANNELS_SQL}))),
+                  AND {_MOVEMENT_SQL})),
             a AS (SELECT cid, {cols} FROM t WHERE cat IS NOT NULL GROUP BY cid),
             h AS (
               SELECT e.cust_id cid,
@@ -3766,7 +3881,7 @@ class TrinoWarehouse(WarehouseGateway):
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'WORKING CAPITAL' THEN 1 ELSE 0 END) h_working_capital
               FROM delta.gold_db.eom_loans e
               JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
-              WHERE e.eom_date = {d} {ep} AND e.gross_total <> 0 GROUP BY 1),
+              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.gross_total <> 0 GROUP BY 1),
             k AS (SELECT DISTINCT fk_customercust_id cid FROM delta.gold_db.cust_card_info
                   WHERE TRIM(entry_status_description) = 'Active'),
             m AS (SELECT DISTINCT ag.cust_id cid FROM delta.gold_db.eom_agreement ag
@@ -3796,7 +3911,8 @@ class TrinoWarehouse(WarehouseGateway):
                    OR a.n_payments_out + a.n_cheque_in >= {activity_shape.BUSINESS_PAYMENTS_MIN}
                    OR a.n_mpesa_out >= {activity_shape.MPESA_OUT_MIN}
                    OR a.n_cash_in + a.n_cash_out >= {activity_shape.CASH_MIN}
-                   OR a.n_cash_out >= {activity_shape.CASH_OUT_NO_CARD_MIN})
+                   OR a.n_cash_out >= {activity_shape.CASH_OUT_NO_CARD_MIN}
+                   OR a.n_salary_acct BETWEEN {activity_shape.SALARY_MIN} AND {activity_shape.SALARY_ACCT_MAX})
         """)
         held_cols = ('term_deposit', 'call_deposit', 'savings', 'notice', 'consumer',
                      'vuna_hela', 'mobile_loan', 'overdraft', 'working_capital')
@@ -3843,7 +3959,11 @@ class TrinoWarehouse(WarehouseGateway):
         """How strongly a customer shows the behaviour behind a rule, for ordering the
         call list within that rule (bigger salary, bigger idle balance, …)."""
         if rule_id in ('T1', 'T2'):
-            return prof['salary']['value']
+            # The same evidence the rule used: salary postings when there are enough of
+            # them, otherwise the about-monthly credits into a salary account.
+            if prof['salary']['count'] >= activity_shape.SALARY_MIN:
+                return prof['salary']['value']
+            return prof['salary_acct']['value']
         if rule_id == 'T3':
             return liquid
         if rule_id == 'T4':

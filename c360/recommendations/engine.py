@@ -227,7 +227,8 @@ def recommend_for_customer(
     try:
         # Light activity probe only — a narrow lookback keeps the worklist (which runs
         # this per customer) fast; the full feed uses the default wide lookback.
-        txns = gateway.recent_transactions(cust_id, limit=30, lookback_months=2)
+        txns = gateway.recent_transactions(cust_id, limit=30, lookback_months=2,
+                                           engagement_only=True)
         txn_count = len(txns) * 8  # scale sample to a period-level proxy
     except Exception:
         txn_count = 0

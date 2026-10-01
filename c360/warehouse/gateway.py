@@ -87,7 +87,8 @@ class WarehouseGateway(abc.ABC):
 
     @abc.abstractmethod
     def recent_transactions(self, cust_id: str, *, period: ResolvedPeriod | None = None,
-                            limit: int = 8, lookback_months: int = 24) -> list[dict[str, Any]]:
+                            limit: int = 8, lookback_months: int = 24,
+                            engagement_only: bool = False) -> list[dict[str, Any]]:
         """Latest customer-facing transactions — a wide lookback so a customer's most
         recent activity always loads even if it was months ago (never a blank feed).
         ``lookback_months`` may be reduced for a light activity probe."""

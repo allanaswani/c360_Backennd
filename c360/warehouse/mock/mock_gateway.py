@@ -337,7 +337,8 @@ class MockWarehouse(WarehouseGateway):
         total = sum(weights) or 1
         return [{'channel': ch, 'share': round(w / total, 4)} for ch, w in zip(_CHANNELS, weights)]
 
-    def recent_transactions(self, cust_id, *, period=None, limit=8, lookback_months=24):
+    def recent_transactions(self, cust_id, *, period=None, limit=8, lookback_months=24,
+                            engagement_only=False):
         c = seed.CUSTOMER_INDEX.get(cust_id)
         if c is None:
             return []

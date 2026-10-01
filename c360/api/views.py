@@ -65,9 +65,17 @@ class MetaView(APIView):
     def get(self, request: Request):
         gateway = get_gateway()
         scope = resolve_scope(request)
+        # The date each source is current to. Deposits, loans and the transaction
+        # ledger load on different days, and the page says which is which.
+        fresh = getattr(gateway, 'source_freshness', None)
+        try:
+            freshness = fresh() if fresh else None
+        except Exception:
+            freshness = None
         return Response({
             'data_mode': data_mode(),
             'as_of': gateway.as_of_date().isoformat(),
+            'freshness': freshness,
             'period_presets': list(PRESETS),
             'scope': {
                 'role': scope.role,
