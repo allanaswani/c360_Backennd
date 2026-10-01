@@ -12,6 +12,8 @@ credentials are required to run the app.
 """
 from __future__ import annotations
 
+import threading
+
 from typing import Any, Protocol, Sequence, runtime_checkable
 
 
@@ -37,10 +39,15 @@ class TrinoDBAPIConnector:
 
     def __init__(self, config: dict[str, Any]):
         self._config = config
-        self._conn = None
+        # One connection PER THREAD. The customer insights read seven blocks side by
+        # side (services/insights.py); the trino dbapi declares threadsafety 2, but
+        # its HTTP session is not guaranteed safe under concurrent requests, so each
+        # thread keeps its own. A plain request on the main thread behaves as before.
+        self._local = threading.local()
 
     def _connection(self):
-        if self._conn is None:
+        conn = getattr(self._local, 'conn', None)
+        if conn is None:
             import trino  # imported lazily; not needed in mock mode
             from trino.auth import BasicAuthentication
 
@@ -60,7 +67,7 @@ class TrinoDBAPIConnector:
             # Capped well below that, Trino cancels and raises, the caller's
             # try/except degrades the panel, and the page still renders.
             run_time = int(cfg.get('query_max_run_time_s') or 60)
-            self._conn = trino.dbapi.connect(
+            conn = trino.dbapi.connect(
                 host=cfg['host'],
                 port=cfg['port'],
                 user=cfg['user'],
@@ -72,7 +79,8 @@ class TrinoDBAPIConnector:
                 session_properties={'query_max_run_time': f'{run_time}s'},
                 request_timeout=float(cfg.get('request_timeout_s') or run_time),
             )
-        return self._conn
+            self._local.conn = conn
+        return conn
 
     def execute(self, sql: str, params: Sequence[Any] | None = None) -> list[dict[str, Any]]:
         cur = self._connection().cursor()

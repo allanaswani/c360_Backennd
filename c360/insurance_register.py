@@ -136,7 +136,9 @@ def shape_client(row: dict, *, policies: dict | None = None, receipts: dict | No
             'bank_cust_id': b.get('cust_id'),
             'policies': int(p.get('total') or 0),
             'active_policies': int(p.get('active') or 0),
+            # Premium on policies in force; premium_all is every renewal on file.
             'premium': round(float(p.get('premium') or 0)),
+            'premium_all': round(float(p.get('premium_all', p.get('premium')) or 0)),
             'sum_insured': round(float(p.get('sum_insured') or 0)),
             # None when the receipts feed holds no row for this client, which is
             # 54% of the register. 0 would mean it holds rows summing to nothing,

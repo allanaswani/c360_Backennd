@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from typing import Any
 
@@ -82,16 +83,26 @@ def _is_individual(customer: dict) -> bool | None:
     return None
 
 
+#: One long-lived pool per worker process. Its threads are reused, so each keeps
+#: its own Trino connection across requests; a pool per request opened eight new
+#: HTTPS sessions every time, which cost more than running the reads side by side saved.
+_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix='insights')
+
+
+def _card(gateway: WarehouseGateway, cust_id: str) -> bool | None:
+    try:
+        return gateway.has_active_card(cust_id)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
 def _activity_block(gateway: WarehouseGateway, customer: dict, cust_id: str,
-                    products: dict, facilities: dict) -> dict[str, Any]:
-    act = _block(gateway.get_activity, cust_id)
+                    products: dict, facilities: dict, act: dict | None = None,
+                    card: bool | None = None) -> dict[str, Any]:
+    act = act if act is not None else _block(gateway.get_activity, cust_id)
     if act['status'] != 'live':
         return act
     mix = products.get('data') if products.get('status') == 'live' else None
-    try:
-        card = gateway.has_active_card(cust_id)
-    except Exception:                                          # noqa: BLE001
-        card = None
     prof = act['data']['profile']
     categories = [{'key': k, 'label': activity_rules.CATEGORY_LABELS[k],
                    'count': prof[k]['count'], 'value': prof[k]['value']}
@@ -136,18 +147,43 @@ def build_customer_insights(gateway: WarehouseGateway, cust_id: str,
     if hit is not None:
         return hit
 
-    products = _block(gateway.get_product_mix, cust_id)
-    facilities = _block(gateway.get_facilities, cust_id)
+    # The reads are independent warehouse queries, so they run side by side: the
+    # first load took ~17s as seven sequential reads (2026-10-01) and now takes about
+    # as long as the slowest one. The shared date anchors are resolved first so the
+    # threads do not each re-query them. Each thread uses its own Trino connection
+    # (connector.TrinoDBAPIConnector is per-thread).
+    for anchor in ('ledger_as_of', 'loan_as_of'):
+        fn = getattr(gateway, anchor, None)
+        if callable(fn):
+            try:
+                fn()
+            except Exception:                                  # noqa: BLE001
+                pass
+    reads = {
+        'products': gateway.get_product_mix,
+        'facilities': gateway.get_facilities,
+        'activity': gateway.get_activity,
+        'profile': gateway.get_customer_profile,
+        'revenue': gateway.get_revenue,
+        'cashflow': gateway.get_cash_flow,
+        'loans': gateway.get_loan_details,
+    }
+    futures = {k: _POOL.submit(_block, fn, cust_id) for k, fn in reads.items()}
+    card_future = _POOL.submit(_card, gateway, cust_id)
+    got = {k: f.result() for k, f in futures.items()}
+    card = card_future.result()
+    products, facilities = got['products'], got['facilities']
     out = {
         'cust_id': str(cust_id),
         'as_of': as_of,
         'products': products,
         'facilities': facilities,
-        'activity': _activity_block(gateway, customer, cust_id, products, facilities),
-        'profile': _block(gateway.get_customer_profile, cust_id),
-        'revenue': _block(gateway.get_revenue, cust_id),
-        'cashflow': _block(gateway.get_cash_flow, cust_id),
-        'loans': _block(gateway.get_loan_details, cust_id),
+        'activity': _activity_block(gateway, customer, cust_id, products, facilities,
+                                    act=got['activity'], card=card),
+        'profile': got['profile'],
+        'revenue': got['revenue'],
+        'cashflow': got['cashflow'],
+        'loans': got['loans'],
     }
     # A product mix with nothing in it is "none", not an empty "live" block.
     if products['status'] == 'live' and not (products['data']['deposits'] or products['data']['loans']):

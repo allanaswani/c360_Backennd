@@ -407,7 +407,8 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     # generic 'pending the property register CRM integration' placeholder would report a known,
     # exact figure as unsourced - and leave the page reading as if we hold nothing
     # on someone with six units. Their number comes straight off the register.
-    # Insurance value: the annual premium across the policies this customer holds.
+    # Insurance value: the annual premium on the policies IN FORCE (the book repeats
+    # a policy at each renewal, so summing every row added expired years together).
     # The row used to be a flat 'not sourced' for everyone, so a customer with 28
     # policies and a real premium still read as nothing on the overview. That is the
     # zero people have been reporting. None (not 0) when they genuinely hold no
@@ -418,7 +419,8 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     except Exception:
         banc = None
     if banc and banc.get('policies'):
-        insurance_value = round(sum(p.get('premium') or 0 for p in banc['policies']))
+        insurance_value = round(sum(p.get('premium') or 0 for p in banc['policies']
+                                    if str(p.get('status', '')).lower() == 'active'))
 
     hfdi_value = None
     client_id_int = prop_reg.parse_id(cust_id)

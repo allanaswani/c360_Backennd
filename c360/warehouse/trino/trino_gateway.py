@@ -3074,6 +3074,10 @@ class TrinoWarehouse(WarehouseGateway):
 
         Deduped on the natural key rather than the policy number, for the same reason
         get_bancassurance is: policy_policy_no is blank on 98% of rows.
+
+        ``premium`` and ``sum_insured`` are for policies IN FORCE: the summary repeats a
+        policy at every annual renewal, so summing every row added expired years
+        together. ``premium_all`` keeps the lifetime figure, named as such.
         """
         if not client_nos:
             return {}
@@ -3081,7 +3085,9 @@ class TrinoWarehouse(WarehouseGateway):
         rows = self._t.execute(
             "SELECT client_no, count(*) total, "
             "count(CASE WHEN status = 'active' THEN 1 END) active, "
-            "SUM(premium) premium, SUM(insured) insured FROM ("
+            "SUM(CASE WHEN status = 'active' THEN premium ELSE 0 END) premium, "
+            "SUM(premium) premium_all, "
+            "SUM(CASE WHEN status = 'active' THEN insured ELSE 0 END) insured FROM ("
             "  SELECT TRIM(s.policy_client_no) client_no, TRIM(s.product) product, "
             "         TRIM(s.policy_start_date) sd, TRIM(s.policy_end_date) ed, "
             "         COALESCE(s.policy_sum_insured, 0) insured, "
@@ -3092,7 +3098,8 @@ class TrinoWarehouse(WarehouseGateway):
             "   GROUP BY 1,2,3,4,5) p GROUP BY client_no", tuple(client_nos))
         return {self._clean(r['client_no']): {
             'total': int(r.get('total') or 0), 'active': int(r.get('active') or 0),
-            'premium': float(r.get('premium') or 0), 'sum_insured': float(r.get('insured') or 0),
+            'premium': float(r.get('premium') or 0), 'premium_all': float(r.get('premium_all') or 0),
+            'sum_insured': float(r.get('insured') or 0),
         } for r in rows if self._clean(r.get('client_no'))}
 
     def _ins_receipt_counts(self, names: list[str]) -> dict[str, int]:
@@ -3214,7 +3221,10 @@ class TrinoWarehouse(WarehouseGateway):
             out.extend(self._receipt_only_clients(raw, max(10, int(limit) // 4)))
         if unbanked_only:
             out = [c for c in out if not c['insurance']['bank_cust_id']]
+        # Premium in force first (current relationships), then lifetime premium, so a
+        # large lapsed client - a win-back call - ranks above a small one.
         out.sort(key=lambda c: (-(c['insurance']['premium'] or 0),
+                                -(c['insurance'].get('premium_all') or 0),
                                 -(c['insurance']['receipts'] or 0), c['name'] or ''))
         return out[:int(limit)]
 
