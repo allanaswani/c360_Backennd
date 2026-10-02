@@ -132,6 +132,11 @@ for _key in ('USER', 'PASSWORD', 'HOST', 'PORT'):
         DATABASES['default'][_key] = _val
 if DATABASES['default']['ENGINE'] != 'django.db.backends.sqlite3':
     DATABASES['default'].setdefault('CONN_MAX_AGE', 60)
+else:
+    # Three worker processes, each now serving several requests at once (gthread, see
+    # Dockerfile), write the audit log and sessions to one SQLite file. Wait up to 20s
+    # for a competing write instead of the default 5s before "database is locked".
+    DATABASES['default']['OPTIONS'] = {'timeout': 20}
 
 
 # Password validation

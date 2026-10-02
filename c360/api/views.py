@@ -23,7 +23,7 @@ from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
-from ..services import (portfolio_cache, property_clients as pc_service,
+from ..services import (portfolio_cache, tabcache, property_clients as pc_service,
                         insurance_clients as ic_service)
 from .. import property_register as prop_reg
 from .. import brand
@@ -183,17 +183,20 @@ class CustomerDetailView(APIView):
                 detail = 'Outside your book.'
             return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
-        header = build_customer_header(gateway, cust_id, raw)
-        if header is None:
+        def build():
+            header = build_customer_header(gateway, cust_id, raw)
+            if header is None:
+                return None
+            value_summary = build_value_summary(gateway, cust_id)
+            # One plain-language line for the top of the page — composed from the facts
+            # already assembled above, so it's testable and never invents a figure.
+            header['summary'] = relationship_summary(header, value_summary)
+            return {'header': header, 'value_summary': value_summary}
+
+        payload = tabcache.get_or_build(tabcache.key('detail', cust_id, gateway.as_of_date()), build)
+        if payload is None:
             return _not_found()
-        value_summary = build_value_summary(gateway, cust_id)
-        # One plain-language line for the top of the page — composed from the facts
-        # already assembled above, so it's testable and never invents a figure.
-        header['summary'] = relationship_summary(header, value_summary)
-        return Response({
-            'header': header,
-            'value_summary': value_summary,
-        })
+        return Response(payload)
 
 
 class LinkedPartiesView(APIView):
@@ -238,7 +241,8 @@ class CustomerLastTransactionView(APIView):
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
-        d = gateway.last_transaction_date(cust_id)
+        d = tabcache.get_or_build(tabcache.key('last_txn', cust_id, gateway.as_of_date()),
+                                  lambda: gateway.last_transaction_date(cust_id) or '')
         iso = d.isoformat() if hasattr(d, 'isoformat') else (str(d)[:10] if d else None)
         return Response({
             'last_transaction': live(
@@ -261,7 +265,9 @@ class CustomerOverviewView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        return Response(build_customer_overview(gateway, cust_id, period, raw))
+        return Response(tabcache.get_or_build(
+            tabcache.key('overview', cust_id, gateway.as_of_date(), period),
+            lambda: build_customer_overview(gateway, cust_id, period, raw)))
 
 
 class HFCBDomainView(APIView):
@@ -277,7 +283,9 @@ class HFCBDomainView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        return Response(build_hfcb_domain(gateway, cust_id, period, raw))
+        return Response(tabcache.get_or_build(
+            tabcache.key('hfcb', cust_id, gateway.as_of_date(), period),
+            lambda: build_hfcb_domain(gateway, cust_id, period, raw)))
 
 
 class DomainView(APIView):
@@ -297,7 +305,9 @@ class DomainView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        payload = builder(gateway, cust_id, period)
+        payload = tabcache.get_or_build(
+            tabcache.key(f'domain:{domain}', cust_id, gateway.as_of_date(), period),
+            lambda: builder(gateway, cust_id, period))
         return Response(payload)
 
 
@@ -334,7 +344,9 @@ class CustomerRelationshipView(APIView):
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
-        return Response(build_relationship(gateway, cust_id, raw))
+        return Response(tabcache.get_or_build(
+            tabcache.key('relationship', cust_id, gateway.as_of_date()),
+            lambda: build_relationship(gateway, cust_id, raw)))
 
 
 class CustomerStatementView(APIView):
@@ -386,9 +398,10 @@ class RecommendationsView(APIView):
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
-        result = recommend_for_customer(gateway, cust_id, limit=int(request.query_params.get('limit', 3)),
-                                        customer=raw)
-        return Response(result.to_dict())
+        limit = int(request.query_params.get('limit', 3))
+        return Response(tabcache.get_or_build(
+            tabcache.key(f'recs:{limit}', cust_id, gateway.as_of_date()),
+            lambda: recommend_for_customer(gateway, cust_id, limit=limit, customer=raw).to_dict()))
 
 
 class PortfolioOverviewView(APIView):

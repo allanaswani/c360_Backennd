@@ -55,4 +55,8 @@ EXPOSE 9001
 
 # Gunicorn binds ${PORT} on all interfaces. With `--network=host` at run time this
 # is the host port. 3 workers × 120s timeout matches the portfolio backend.
-CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT} --workers 3 --timeout 120 --access-logfile - --error-logfile -"]
+# Each worker serves 6 requests at once (gthread). A customer page fires about seven
+# requests together; with plain sync workers only three ran and the rest queued
+# behind the slowest warehouse read, so the page took the SUM of its tabs (2026-10-02).
+# The warehouse and Postgres connectors are per-thread, so the threads do not share one.
+CMD ["sh", "-c", "gunicorn config.wsgi:application --bind 0.0.0.0:${PORT} --workers 3 --worker-class gthread --threads 6 --timeout 120 --access-logfile - --error-logfile -"]
