@@ -183,7 +183,7 @@ class CustomerDetailView(APIView):
                 detail = 'Outside your book.'
             return Response({'error': {'status': 403, 'detail': detail}},
                             status=status.HTTP_403_FORBIDDEN)
-        header = build_customer_header(gateway, cust_id)
+        header = build_customer_header(gateway, cust_id, raw)
         if header is None:
             return _not_found()
         value_summary = build_value_summary(gateway, cust_id)

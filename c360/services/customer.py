@@ -7,6 +7,8 @@ instead of rendering a bare ``--``.
 """
 from __future__ import annotations
 
+import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any
 
@@ -14,6 +16,33 @@ from .. import property_register as prop_reg
 from .. import brand
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.provenance import Provenance, derived, live, to_source
+
+
+logger = logging.getLogger(__name__)
+
+#: One long-lived pool per worker process (as in services/insights.py): its threads
+#: are reused, so each keeps its own warehouse connection across requests. The header
+#: and value summary make about ten independent warehouse reads; one after another they
+#: took long enough that the customer page timed out (2026-10-02).
+_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix='customer')
+
+_UNSET = object()      # "not fetched yet"
+_FAILED = object()     # a read that raised, as opposed to one that found nothing
+
+
+def _quiet(fn, *args):
+    """Call ``fn``; None on any failure. Every read run this way is optional."""
+    try:
+        return fn(*args)
+    except Exception as exc:                                   # noqa: BLE001
+        logger.warning('customer read %s failed: %s', getattr(fn, '__name__', fn), exc)
+        return None
+
+
+def _parallel(calls: dict[str, tuple]) -> dict[str, Any]:
+    """Run ``{key: (fn, *args)}`` side by side; each result, or None if it failed."""
+    futures = {k: _POOL.submit(_quiet, *call) for k, call in calls.items()}
+    return {k: f.result() for k, f in futures.items()}
 
 
 # Bio fields carried as ISO dates so the UI can format them; the rest are strings.
@@ -144,7 +173,8 @@ def relationship_summary(header: dict[str, Any], value: dict[str, Any]) -> str:
     return ' '.join(parts)
 
 
-def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+def _credit_bureau(gateway: WarehouseGateway, cust_id: str,
+                   fetched: Any = _UNSET) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     """Fetch the customer's TransUnion (CRB) record and produce (panel, crb_chip).
 
     ``panel`` is the full bureau card data (or None when there's nothing to show);
@@ -156,9 +186,8 @@ def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, A
     exists, they simply aren't in it — rather than the old blanket 'not sourced', which
     is reserved for a genuine load failure. Display-only for now: this does NOT gate the
     recommendation engine yet (planned next step, per the agreed sequence)."""
-    try:
-        b = gateway.get_credit_bureau(cust_id)
-    except Exception:
+    b = _bureau_read(gateway, cust_id) if fetched is _UNSET else fetched
+    if b is _FAILED:
         # A real probe failure — honestly unsourced, not "no record".
         return None, to_source(note='Credit-bureau feed unavailable for this customer.').to_dict()
     if not b:
@@ -174,21 +203,12 @@ def _credit_bureau(gateway: WarehouseGateway, cust_id: str) -> tuple[dict[str, A
     return b, chip
 
 
-def _build_crm(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any] | None:
-    """Subsidiary CRM panels: property-register leads (phone-matched) and the insurance
-    CRM profile (HFBI, national-ID bridged). Returns {'property_leads':…, 'insurance':…}
-    with either sub-key None when absent, or None overall when the customer has neither —
-    so the frontend renders nothing rather than an empty shell. Never raises."""
-    def _safe(fn):
-        try:
-            return fn(cust_id)
-        except Exception:
-            return None
-    prop = _safe(gateway.get_property_leads)
-    ins = _safe(gateway.get_insurance_crm)
-    if not prop and not ins:
-        return None
-    return {'property_leads': prop, 'insurance': ins}
+def _bureau_read(gateway: WarehouseGateway, cust_id: str) -> Any:
+    """The bureau record, None when there is none, or _FAILED when the read raised."""
+    try:
+        return gateway.get_credit_bureau(cust_id)
+    except Exception:                                          # noqa: BLE001
+        return _FAILED
 
 
 def _build_bio(bio: dict[str, Any]) -> dict[str, Any]:
@@ -199,19 +219,31 @@ def _build_bio(bio: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any] | None:
-    c = gateway.get_customer(cust_id)
+def build_customer_header(gateway: WarehouseGateway, cust_id: str,
+                          customer: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    # The view has already read the customer to check access; reuse it rather than
+    # paying for the same dim_customer + allocation lookup twice.
+    c = customer if customer is not None else gateway.get_customer(cust_id)
     if not c:
         return None
+
+    # The reads below are independent, so they run side by side; each is optional and
+    # a failure leaves its panel empty exactly as before.
+    got = _parallel({
+        'profile': (gateway.get_risk_profile, cust_id),
+        'bureau': (_bureau_read, gateway, cust_id),
+        'property_leads': (gateway.get_property_leads, cust_id),
+        'insurance_crm': (gateway.get_insurance_crm, cust_id),
+        'lending': (gateway.get_lending_health, cust_id),
+        'retention': (gateway.get_retention_signal, cust_id),
+        'profitability': (gateway.get_profitability, cust_id),
+    })
 
     # Risk & KYC are DERIVED from live data (identity completeness + loan
     # performance), not read from a dedicated feed — so they're real and shown,
     # badged 'derived' with the basis in the note. CRB genuinely needs an external
     # bureau feed we don't have, so it stays honestly 'not sourced'.
-    try:
-        profile = gateway.get_risk_profile(cust_id)
-    except Exception:
-        profile = None
+    profile = got['profile']
     if profile:
         risk_metric = derived(profile['risk']['class'], note=profile['risk']['note'] + ' Factors: '
                               + '; '.join(profile['risk']['factors']) + '.').to_dict()
@@ -226,26 +258,23 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     # Display-only: the panel + the header CRB chip are populated here; it does not yet
     # gate recommendations. Returns (panel, chip); panel is None when there's nothing to
     # show and the chip then reads 'No bureau record' / 'not sourced' honestly.
-    bureau_panel, crb_metric = _credit_bureau(gateway, cust_id)
+    bureau_panel, crb_metric = _credit_bureau(gateway, cust_id, got['bureau'])
 
     # Subsidiary CRM — property-sales leads (phone-matched) + insurance CRM profile
     # (national-ID bridged). None when the customer has neither.
-    crm_panel = _build_crm(gateway, cust_id)
+    # Either sub-key is None when absent; None overall when the customer has neither, so
+    # the frontend renders nothing rather than an empty shell.
+    crm_panel = ({'property_leads': got['property_leads'], 'insurance': got['insurance_crm']}
+                 if got['property_leads'] or got['insurance_crm'] else None)
 
     # Lending health — delinquency standing (NPL/watch + impairment) + collateral held.
     # None when neither applies. Display-only (does not feed the risk gate).
-    try:
-        lending_panel = gateway.get_lending_health(cust_id)
-    except Exception:
-        lending_panel = None
+    lending_panel = got['lending']
 
     # Silent-attrition early warning — DERIVED from the deposit-balance history
     # (c360/retention.py). Optional: None when the gateway has no history or the
     # trend can't be judged, in which case the UI simply omits the chip.
-    try:
-        retention = gateway.get_retention_signal(cust_id)
-    except Exception:
-        retention = None
+    retention = got['retention']
 
     # RM provenance: 'allocation' = the current relationship manager (portfolio
     # allocation); 'onboarding' = the account-opening officer we fall back to when the
@@ -257,13 +286,10 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str) -> dict[str, 
     # Previous RM (reassignment signal) from the allocation base, shown only when it
     # genuinely differs from the current RM. Optional; absent → simply not rendered.
     prev_rm = None
-    try:
-        prof = gateway.get_profitability(cust_id)
-        pr = prof.get('prev_rm') if prof else None
-        if pr and pr != c.get('rm_name'):
-            prev_rm = pr
-    except Exception:
-        prev_rm = None
+    prof = got['profitability']
+    pr = prof.get('prev_rm') if prof else None
+    if pr and pr != c.get('rm_name'):
+        prev_rm = pr
 
     return {
         'cust_id': c['cust_id'],
@@ -401,7 +427,15 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     """Cross-domain value summary. Core banking is LIVE; the other three domains
     are declared but PREVIEW/TO_SOURCE until their pipelines land, so the donut
     never shows a phantom slice as if it were real."""
-    v = gateway.get_relationship_value(cust_id)
+    client_id_int = prop_reg.parse_id(cust_id)
+    calls: dict[str, tuple] = {'banc': (gateway.get_bancassurance, cust_id, None)}
+    if client_id_int is not None:
+        calls['client'] = (gateway.get_property_client, client_id_int)
+    # The headline value is not optional - if it fails the page must still fail, as it
+    # always has - so it runs without the quiet wrapper and its error is re-raised here.
+    v_future = _POOL.submit(gateway.get_relationship_value, cust_id)
+    got = _parallel(calls)
+    v = v_future.result()
     # An property client has no bank relationship at all, and their entire
     # holding with the group is the property. Leaving the Properties row on the
     # generic 'pending the property register CRM integration' placeholder would report a known,
@@ -414,21 +448,14 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
     # zero people have been reporting. None (not 0) when they genuinely hold no
     # policy, which keeps the honest 'not sourced' state for that case.
     insurance_value = None
-    try:
-        banc = gateway.get_bancassurance(cust_id, None)
-    except Exception:
-        banc = None
+    banc = got['banc']
     if banc and banc.get('policies'):
         insurance_value = round(sum(p.get('premium') or 0 for p in banc['policies']
                                     if str(p.get('status', '')).lower() == 'active'))
 
     hfdi_value = None
-    client_id_int = prop_reg.parse_id(cust_id)
     if client_id_int is not None:
-        try:
-            client = gateway.get_property_client(client_id_int)
-        except Exception:
-            client = None
+        client = got.get('client')
         if client:
             hfdi_value = client['property_client']['units_value']
     return {

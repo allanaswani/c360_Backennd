@@ -106,7 +106,18 @@ class PostgresDBAPIConnector:
 
     def __init__(self, config: dict[str, Any]):
         self._config = config
-        self._conn = None
+        # One connection PER THREAD, as for Trino: the customer header and insights read
+        # side by side, and two threads opening the shared connection at once would each
+        # connect and leak one.
+        self._local = threading.local()
+
+    @property
+    def _conn(self):
+        return getattr(self._local, 'conn', None)
+
+    @_conn.setter
+    def _conn(self, value):
+        self._local.conn = value
 
     def _connection(self):
         if self._conn is None or getattr(self._conn, 'closed', 0):
