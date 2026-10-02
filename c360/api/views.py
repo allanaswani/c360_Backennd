@@ -559,9 +559,9 @@ def _annotate_drops(report: dict, prior: dict) -> None:
     """Compare each check's value to the previous snapshot; attach a delta and downgrade
     a healthy source to 'warn' when its row count has dropped sharply (a partial load)."""
     for c in report.get('checks') or []:
-        # Only row counts can "drop". A Freshness value is days behind (falling is
-        # good news) and a Deployment value is a yes/no flag.
-        if c.get('group') in ('Freshness', 'Deployment'):
+        # Only row counts can "drop". A Freshness value is days behind and a Service
+        # value an error count (falling is good news); a Deployment value is a flag.
+        if c.get('group') in ('Freshness', 'Deployment', 'Service'):
             continue
         prev, cur = prior.get(c.get('key')), c.get('value')
         if not isinstance(prev, (int, float)) or not isinstance(cur, (int, float)) or prev <= 0:

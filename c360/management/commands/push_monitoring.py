@@ -14,7 +14,10 @@ a Customer 360 table check or change.
   each source is current to, the reporting Postgres, and the deployment checks
   (build, LAN proxy hosts, sign-in key). Re-sending replaces each row.
 * audit_events: who changed which account, role, book or recommendation outcome,
-  with before/after values. Each carries its history id, so re-sending is ignored.
+  with before/after values; and who OPENED which customer or statement or exported
+  a report (the access trail a bank audit asks for). Each carries its own id, so
+  re-sending is ignored. Sign-ins are not sent: the request log cannot name the
+  person at that moment, and an "anonymous signed in" line would audit nothing.
 * usage_days: as push_usage (yesterday and today).
 
 Each part is sent on its own, so a failure in one (say, the warehouse is down and
@@ -54,9 +57,10 @@ def table_rows(checks: list[dict]) -> list[dict]:
             continue
         status = STATUS_MAP.get(str(c.get('status') or 'unknown'), 'unknown')
         value = c.get('value')
-        # Only a row count is a row count: a Freshness value is days behind and a
-        # Deployment value is a flag, and neither should read as "N rows".
-        counts = c.get('group') not in ('Freshness', 'Deployment') and isinstance(value, (int, float))
+        # Only a row count is a row count: a Freshness value is days behind, a Service
+        # value an error count and a Deployment value a flag - none is "N rows".
+        counts = (c.get('group') not in ('Freshness', 'Deployment', 'Service')
+                  and isinstance(value, (int, float)))
         out.append({
             'table': str(key),
             'label': f"{c.get('label') or key} ({c.get('group') or 'Customer 360'})",
@@ -92,6 +96,49 @@ def audit_events(hours: int) -> list[dict]:
     return out
 
 
+#: Request-log routes that are an access worth auditing -> (action, record type).
+#: Both spellings: rows before 9 Sep 2026 carry ':cust_id', later ones Django's own
+#: '<str:cust_id>'; one request writes one row, so nothing is counted twice.
+ACCESS_ROUTES = {
+    '/api/customers/<str:cust_id>/': ('viewed', 'Customer'),
+    '/api/customers/:cust_id/': ('viewed', 'Customer'),
+    '/api/customers/<str:cust_id>/statement/': ('viewed', 'Customer statement'),
+    '/api/customers/:cust_id/statement/': ('viewed', 'Customer statement'),
+    '/api/observability/export/': ('exported', 'Report'),
+}
+
+
+def access_events(hours: int) -> list[dict]:
+    """Who opened which customer or statement, or exported a report."""
+    from ...models import AuditEvent
+
+    since = timezone.now() - timedelta(hours=hours)
+    qs = (AuditEvent.objects.filter(kind=AuditEvent.KIND_API, ts__gte=since,
+                                    route__in=list(ACCESS_ROUTES))
+          .order_by('-ts')[:2000])
+    out = []
+    for e in qs:
+        # Only successful reads by a known person: a refused request opened nothing,
+        # and a row with no username cannot say who did it.
+        if e.status is None or not 200 <= e.status < 300 or not e.username:
+            continue
+        action, label = ACCESS_ROUTES[e.route]
+        obj = e.target or ''
+        obj_label = e.path if label == 'Report' else (f'Customer {obj}' if obj else '')
+        out.append({
+            'id': f'c360:access:{e.pk}',
+            'action': action,
+            'model_label': label,
+            'object_id': str(obj)[:100],
+            'object_label': obj_label[:200],
+            'username': e.username,
+            'reason': '',
+            'occurred_at': e.ts.isoformat(),
+            'changes': [],
+        })
+    return out
+
+
 class Command(BaseCommand):
     help = "Push Customer 360 health, change audit and usage to the portfolio tool."
 
@@ -122,9 +169,12 @@ class Command(BaseCommand):
         self.stdout.write(f'health: {len(tables)} checks, {len(bad)} not ok'
                           + (': ' + ', '.join(f"{t['table']}={t['status']}" for t in bad) if bad else ''))
 
-        # 2. Change audit.
-        events = audit_events(max(1, int(opts['audit_hours'])))
-        self.stdout.write(f"audit: {len(events)} change(s) in the last {opts['audit_hours']}h")
+        # 2. Change audit and access trail.
+        hours = max(1, int(opts['audit_hours']))
+        events = audit_events(hours)
+        access = access_events(hours)
+        self.stdout.write(f"audit: {len(events)} change(s), {len(access)} access event(s) in the last {hours}h")
+        events = events + access
 
         # 3. Usage.
         today = usage.local_day(timezone.now())

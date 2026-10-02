@@ -93,3 +93,61 @@ class DropDetectionTests(SimpleTestCase):
                               'detail': '5,000 rows'}]}
         _annotate_drops(report, {'hfdi_payments': 17395})
         self.assertEqual(report['checks'][0]['status'], 'warn')
+
+
+from datetime import timedelta as _td
+
+from django.test import TestCase
+from django.utils import timezone as _tz
+
+from c360.management.commands.push_monitoring import access_events
+from c360.models import AuditEvent
+
+
+def _ev(route, status=200, username='jdoe', target='1218821', minutes_ago=5, kind='api', path=''):
+    return AuditEvent.objects.create(ts=_tz.now() - _td(minutes=minutes_ago), username=username, kind=kind,
+                                     method='GET', route=route, path=path or route, status=status, target=target)
+
+
+class ServiceCheckTests(TestCase):
+    def test_no_errors_is_ok(self):
+        self.assertEqual(deployment.service_checks()[0]['status'], 'ok')
+
+    def test_a_few_errors_need_attention_and_name_the_route(self):
+        for _ in range(2):
+            _ev('/api/customers/<str:cust_id>/insights/', status=500)
+        row = deployment.service_checks()[0]
+        self.assertEqual((row['status'], row['value']), ('warn', 2))
+        self.assertIn('/api/customers/<str:cust_id>/insights/ (2)', row['detail'])
+
+    def test_five_in_an_hour_is_an_error(self):
+        for _ in range(5):
+            _ev('/api/book/', status=502)
+        self.assertEqual(deployment.service_checks()[0]['status'], 'error')
+
+    def test_older_errors_do_not_count(self):
+        _ev('/api/book/', status=500, minutes_ago=90)
+        self.assertEqual(deployment.service_checks()[0]['status'], 'ok')
+
+
+class AccessTrailTests(TestCase):
+    def test_customer_and_statement_views_by_a_named_person(self):
+        _ev('/api/customers/<str:cust_id>/')
+        _ev('/api/customers/<str:cust_id>/statement/')
+        events = access_events(3)
+        self.assertEqual({(e['action'], e['model_label']) for e in events},
+                         {('viewed', 'Customer'), ('viewed', 'Customer statement')})
+        self.assertTrue(all(e['username'] == 'jdoe' and e['object_id'] == '1218821' for e in events))
+        self.assertTrue(all(e['id'].startswith('c360:access:') for e in events))
+
+    def test_refused_anonymous_and_other_requests_are_not_access(self):
+        _ev('/api/customers/<str:cust_id>/', status=403)
+        _ev('/api/customers/<str:cust_id>/', username='')
+        _ev('/api/customers/<str:cust_id>/insights/')
+        _ev('/api/auth/login/', target='')
+        self.assertEqual(access_events(3), [])
+
+    def test_both_route_spellings_count_once_each(self):
+        _ev('/api/customers/<str:cust_id>/')
+        _ev('/api/customers/:cust_id/')
+        self.assertEqual(len(access_events(3)), 2)

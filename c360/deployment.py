@@ -91,4 +91,37 @@ def checks() -> list[dict[str, Any]]:
     else:
         out.append(_row('portfolio_feed', 'Portfolio monitoring feed', 'C360_PORTFOLIO_INGEST_*', 'empty',
                         'not configured: the portfolio cannot see Customer 360 usage, health or audit', 0))
-    return out
+    return out + service_checks()
+
+
+#: Server errors in the last hour before the row is an error (and alerts). One or two
+#: is a bad request somewhere; five in an hour is something broken for users.
+ERRORS_ALERT_AT = 5
+
+
+def service_checks() -> list[dict[str, Any]]:
+    """Is the app answering users without failing? From the request log it already
+    keeps (AuditEvent), so this needs no warehouse either."""
+    from datetime import timedelta
+
+    from django.db.models import Count
+    from django.utils import timezone
+
+    from .models import AuditEvent
+
+    base = {'key': 'server_errors', 'label': 'Server errors (last hour)', 'group': 'Service',
+            'table': 'c360_audit_event'}
+    try:
+        since = timezone.now() - timedelta(hours=1)
+        qs = AuditEvent.objects.filter(kind=AuditEvent.KIND_API, ts__gte=since, status__gte=500)
+        n = qs.count()
+        top = list(qs.values('route').annotate(c=Count('id')).order_by('-c')[:3])
+    except Exception as exc:                                       # noqa: BLE001
+        return [{**base, 'status': 'unknown', 'value': None,
+                 'detail': f'request log could not be read: {type(exc).__name__}'}]
+    if n == 0:
+        return [{**base, 'status': 'ok', 'value': 0, 'detail': 'no failed requests in the last hour'}]
+    where = ', '.join(f"{t['route']} ({t['c']})" for t in top)
+    status = 'error' if n >= ERRORS_ALERT_AT else 'warn'
+    return [{**base, 'status': status, 'value': n,
+             'detail': f'{n} request{"s" if n != 1 else ""} failed with a server error: {where}'}]
