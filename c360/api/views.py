@@ -261,7 +261,7 @@ class CustomerOverviewView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        return Response(build_customer_overview(gateway, cust_id, period))
+        return Response(build_customer_overview(gateway, cust_id, period, raw))
 
 
 class HFCBDomainView(APIView):
@@ -277,7 +277,7 @@ class HFCBDomainView(APIView):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        return Response(build_hfcb_domain(gateway, cust_id, period))
+        return Response(build_hfcb_domain(gateway, cust_id, period, raw))
 
 
 class DomainView(APIView):
@@ -386,7 +386,8 @@ class RecommendationsView(APIView):
         if not customer_visible(scope, raw):
             return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
                             status=status.HTTP_403_FORBIDDEN)
-        result = recommend_for_customer(gateway, cust_id, limit=int(request.query_params.get('limit', 3)))
+        result = recommend_for_customer(gateway, cust_id, limit=int(request.query_params.get('limit', 3)),
+                                        customer=raw)
         return Response(result.to_dict())
 
 

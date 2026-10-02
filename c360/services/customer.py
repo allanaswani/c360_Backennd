@@ -7,42 +7,18 @@ instead of rendering a bare ``--``.
 """
 from __future__ import annotations
 
-import logging
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any
 
 from .. import property_register as prop_reg
 from .. import brand
+from . import parallel
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.provenance import Provenance, derived, live, to_source
 
 
-logger = logging.getLogger(__name__)
-
-#: One long-lived pool per worker process (as in services/insights.py): its threads
-#: are reused, so each keeps its own warehouse connection across requests. The header
-#: and value summary make about ten independent warehouse reads; one after another they
-#: took long enough that the customer page timed out (2026-10-02).
-_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix='customer')
-
 _UNSET = object()      # "not fetched yet"
 _FAILED = object()     # a read that raised, as opposed to one that found nothing
-
-
-def _quiet(fn, *args):
-    """Call ``fn``; None on any failure. Every read run this way is optional."""
-    try:
-        return fn(*args)
-    except Exception as exc:                                   # noqa: BLE001
-        logger.warning('customer read %s failed: %s', getattr(fn, '__name__', fn), exc)
-        return None
-
-
-def _parallel(calls: dict[str, tuple]) -> dict[str, Any]:
-    """Run ``{key: (fn, *args)}`` side by side; each result, or None if it failed."""
-    futures = {k: _POOL.submit(_quiet, *call) for k, call in calls.items()}
-    return {k: f.result() for k, f in futures.items()}
 
 
 # Bio fields carried as ISO dates so the UI can format them; the rest are strings.
@@ -229,7 +205,7 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str,
 
     # The reads below are independent, so they run side by side; each is optional and
     # a failure leaves its panel empty exactly as before.
-    got = _parallel({
+    got = parallel.gather(parallel.optional({
         'profile': (gateway.get_risk_profile, cust_id),
         'bureau': (_bureau_read, gateway, cust_id),
         'property_leads': (gateway.get_property_leads, cust_id),
@@ -237,7 +213,7 @@ def build_customer_header(gateway: WarehouseGateway, cust_id: str,
         'lending': (gateway.get_lending_health, cust_id),
         'retention': (gateway.get_retention_signal, cust_id),
         'profitability': (gateway.get_profitability, cust_id),
-    })
+    }))
 
     # Risk & KYC are DERIVED from live data (identity completeness + loan
     # performance), not read from a dedicated feed — so they're real and shown,
@@ -433,8 +409,8 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
         calls['client'] = (gateway.get_property_client, client_id_int)
     # The headline value is not optional - if it fails the page must still fail, as it
     # always has - so it runs without the quiet wrapper and its error is re-raised here.
-    v_future = _POOL.submit(gateway.get_relationship_value, cust_id)
-    got = _parallel(calls)
+    v_future = parallel.submit(gateway.get_relationship_value, cust_id)
+    got = parallel.gather(parallel.optional(calls))
     v = v_future.result()
     # An property client has no bank relationship at all, and their entire
     # holding with the group is the property. Leaving the Properties row on the

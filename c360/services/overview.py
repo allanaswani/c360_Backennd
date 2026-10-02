@@ -19,22 +19,31 @@ from ..warehouse.factory import data_mode
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.periods import ResolvedPeriod
 from ..warehouse.provenance import Provenance, live
+from . import parallel
 
 LIVE = Provenance.LIVE.value
 PREVIEW = Provenance.PREVIEW.value
 
 
-def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
-    customer = gateway.get_customer(cust_id)
+def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod,
+                            customer: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    # The view has already read the customer for the access check; reuse it.
+    customer = customer if customer is not None else gateway.get_customer(cust_id)
     if not customer:
         return None
 
-    value = gateway.get_relationship_value(cust_id)
+    # Independent reads, side by side. The value and the trend are required (their
+    # errors still fail the tab, as before); the three domains may each fail alone.
+    value_f = parallel.submit(gateway.get_relationship_value, cust_id)
+    dl_f = parallel.submit(gateway.deposit_loan_series, cust_id, period)
+    domains = parallel.gather(parallel.optional({
+        'whizz': (gateway.get_whizz, cust_id, period),
+        'props': (gateway.get_properties, cust_id),
+        'banc': (gateway.get_bancassurance, cust_id, period),
+    }))
+    value = value_f.result()
     rel_value = value['relationship_value']
-
-    whizz = _safe(gateway.get_whizz, cust_id, period)
-    props = _safe(gateway.get_properties, cust_id)
-    banc = _safe(gateway.get_bancassurance, cust_id, period)
+    whizz, props, banc = domains['whizz'], domains['props'], domains['banc']
 
     # ---- value-by-domain slices ----------------------------------------
     slices = [{'domain': brand.DOMAIN_LABELS['bank'], 'value': rel_value, 'status': LIVE}]
@@ -76,7 +85,7 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
 
     # ---- relationship trend, split into deposits vs loans ----
     # Real EOM day-grouped balances in live mode; simulated in mock.
-    dl = gateway.deposit_loan_series(cust_id, period)
+    dl = dl_f.result()
     trend = _split_trend(dl)
     trend_live = data_mode() == 'live'
     trend_status = LIVE if trend_live else PREVIEW
@@ -116,13 +125,6 @@ def _split_trend(dl: dict[str, list[dict]]) -> list[dict]:
 
 def _empty_snapshot(domain: str, tab: str, reason: str) -> dict:
     return {'domain': domain, 'tab': tab, 'status': 'to_source', 'label': reason, 'value': None, 'sub': ''}
-
-
-def _safe(fn, *args):
-    try:
-        return fn(*args)
-    except Exception:
-        return None
 
 
 def _m(v: int | float | None) -> str:

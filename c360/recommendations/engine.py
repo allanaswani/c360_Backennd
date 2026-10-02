@@ -178,8 +178,10 @@ def recommend_for_customer(
     cust_id: str,
     *,
     limit: int = 3,
+    customer: dict | None = None,
 ) -> RecommendationResult:
-    customer = gateway.get_customer(cust_id)
+    # The view has already read the customer for the access check; reuse it.
+    customer = customer if customer is not None else gateway.get_customer(cust_id)
     if not customer:
         return RecommendationResult('ok', [], [], {'gate_evaluable': False, 'note': 'Unknown customer.'})
 
@@ -203,13 +205,17 @@ def recommend_for_customer(
     # OR when it yields no *confident* pick for this customer (an empty list). The rules
     # are specific and auditable, so a weak ML guess never crowds out an honest rule —
     # and if the rules are silent too, the panel shows nothing rather than a generic pick.
-    activity = _activity_candidates(gateway, cust_id, customer)
-    ml = _ml_candidates(gateway, cust_id, limit=limit)
+    #
+    # The activity rules, the ML model and the risk profile (which both routes end
+    # with) are independent reads, so they run side by side. Neither candidate builder
+    # raises; a failed profile read is None, as before.
+    from ..services import parallel
+    activity_f = parallel.submit(_activity_candidates, gateway, cust_id, customer)
+    ml_f = parallel.submit(_ml_candidates, gateway, cust_id, limit=limit)
+    profile_f = parallel.optional({'profile': (gateway.get_risk_profile, cust_id)})['profile']
+    activity, ml = activity_f.result(), ml_f.result()
     if ml:
-        try:
-            profile = gateway.get_risk_profile(cust_id)
-        except Exception:
-            profile = None
+        profile = profile_f.result()
         return _result_from(_merge_activity(activity, ml, limit), profile,
                             engine='ml.lgbm-v1+activity' if activity else 'ml.lgbm-v1')
 
@@ -242,10 +248,7 @@ def recommend_for_customer(
         candidates.extend(rule(**facts))
 
     ranked = _merge_activity(activity, _dedupe_rank(candidates, value), limit)
-    try:
-        profile = gateway.get_risk_profile(cust_id)
-    except Exception:
-        profile = None
+    profile = profile_f.result()
     return _result_from(ranked, profile,
                         engine=f'{ENGINE_VERSION}+activity' if activity else ENGINE_VERSION)
 

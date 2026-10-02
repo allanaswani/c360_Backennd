@@ -21,6 +21,7 @@ from ..warehouse.factory import data_mode
 from ..warehouse.gateway import WarehouseGateway
 from ..warehouse.periods import ResolvedPeriod
 from ..warehouse.provenance import Provenance, Series, derived, live, to_source
+from . import parallel
 
 # In mock, per-customer series are a simulated must-build derivation → PREVIEW.
 # In live, they are real (EOM day-grouped balances / rpt_c360 summaries) → LIVE.
@@ -38,29 +39,44 @@ def _provenance() -> tuple[Provenance, str | None]:
     return Provenance.PREVIEW, _SERIES_NOTE
 
 
-def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod) -> dict[str, Any] | None:
-    customer = gateway.get_customer(cust_id)
+def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod,
+                      customer: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    # The view has already read the customer for the access check; reuse it.
+    customer = customer if customer is not None else gateway.get_customer(cust_id)
     if not customer:
         return None
 
-    value = gateway.get_relationship_value(cust_id)
-    holdings = gateway.get_product_holdings(cust_id)
-    deposit_accts = gateway.get_deposit_accounts(cust_id)
-    loan_accts = gateway.get_loan_accounts(cust_id)
-
-    dl = gateway.deposit_loan_series(cust_id, period)
-    disb = gateway.disbursement_vs_balance_series(cust_id, period)
-    txns = gateway.transaction_series(cust_id, period)
-    channels = gateway.channel_usage(cust_id, period)
-    recent = gateway.recent_transactions(cust_id, period=period, limit=15)
-
+    # Every read below is independent, so they run side by side. The first group is
+    # required - an error still fails the tab, as it did when they ran in turn - and
+    # the second may each fail alone, leaving its tile 'not sourced'.
+    need = {
+        'value': parallel.submit(gateway.get_relationship_value, cust_id),
+        'holdings': parallel.submit(gateway.get_product_holdings, cust_id),
+        'deposit_accts': parallel.submit(gateway.get_deposit_accounts, cust_id),
+        'loan_accts': parallel.submit(gateway.get_loan_accounts, cust_id),
+        'dl': parallel.submit(gateway.deposit_loan_series, cust_id, period),
+        'disb': parallel.submit(gateway.disbursement_vs_balance_series, cust_id, period),
+        'txns': parallel.submit(gateway.transaction_series, cust_id, period),
+        'channels': parallel.submit(gateway.channel_usage, cust_id, period),
+        'recent': parallel.submit(gateway.recent_transactions, cust_id, period=period, limit=15),
+    }
     # Where this customer's lending stands in the LIVE book. The allocation upload's
     # npl column is periodic and was flagging performing customers months after they
     # cured, so it no longer gets to decide this on its own.
-    try:
-        live_standing = gateway.live_loan_standing([cust_id]).get(_numeric_id(cust_id))
-    except Exception:
-        live_standing = None
+    extra = parallel.optional({
+        'standing': (gateway.live_loan_standing, [cust_id]),
+        # AUM + profitability + NPL from the reporting Postgres (customer_allocation_base).
+        'prof': (gateway.get_profitability, cust_id),
+        # Revenue earned from the customer this year (rpt_ceo_all_revenue_trend).
+        'rev': (gateway.get_revenue, cust_id),
+    })
+    got = parallel.gather(need)
+    opt = parallel.gather(extra)
+    value, holdings = got['value'], got['holdings']
+    deposit_accts, loan_accts = got['deposit_accts'], got['loan_accts']
+    dl, disb, txns = got['dl'], got['disb'], got['txns']
+    channels, recent = got['channels'], got['recent']
+    live_standing = (opt['standing'] or {}).get(_numeric_id(cust_id))
 
     products_held = sum(1 for held in holdings['flags'].values() if held)
     deposits = value['deposits'] or 0
@@ -68,18 +84,9 @@ def build_hfcb_domain(gateway: WarehouseGateway, cust_id: str, period: ResolvedP
     net_position = deposits - loans
     series_status, series_note = _provenance()
 
-    # AUM + profitability + NPL from the reporting Postgres (customer_allocation_base).
-    # None when that source isn't wired (mock / Postgres down) → badged 'not sourced'.
-    try:
-        prof = gateway.get_profitability(cust_id)
-    except Exception:
-        prof = None
-    # Revenue earned from the customer this year (rpt_ceo_all_revenue_trend). The
-    # tile used to read value['revenue'], a hard-coded 0 badged live.
-    try:
-        rev = gateway.get_revenue(cust_id)
-    except Exception:
-        rev = None
+    # None when the Postgres source isn't wired (mock / Postgres down) → badged 'not
+    # sourced'. The revenue tile used to read value['revenue'], a hard-coded 0 badged live.
+    prof, rev = opt['prof'], opt['rev']
 
     return {
         'cust_id': cust_id,
