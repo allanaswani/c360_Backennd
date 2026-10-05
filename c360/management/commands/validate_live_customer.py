@@ -50,8 +50,8 @@ class Command(BaseCommand):
 
         # Cross-check: ground-truth standalone sums must equal the gateway values.
         d = f"DATE '{gw.as_of_date().isoformat()}'"
-        gt_dep = conn.execute(f"SELECT COALESCE(SUM(book_balance),0) v, COUNT(*) c FROM delta.gold_db.eom_deposits WHERE eom_date={d} AND cust_id=?", (int(cid),))[0]
-        gt_loan = conn.execute(f"SELECT COALESCE(SUM(gross_total),0) v, COUNT(*) c FROM delta.gold_db.eom_loans WHERE eom_date={d} AND cust_id=?", (int(cid),))[0]
+        gt_dep = conn.execute(f"SELECT COALESCE(SUM(euro_book_bal),0) v, COUNT(*) c FROM delta.gold_db.eom_deposits WHERE eom_date={d} AND cust_id=?", (int(cid),))[0]
+        gt_loan = conn.execute(f"SELECT COALESCE(SUM(lc_gross_total),0) v, COUNT(*) c FROM delta.gold_db.eom_loans WHERE eom_date={d} AND cust_id=?", (int(cid),))[0]
         dep_ok = round(float(gt_dep['v'])) == val['deposits'] and gt_dep['c'] == len(deps)
         loan_ok = round(float(gt_loan['v'])) == val['loans'] and gt_loan['c'] == len(loans)
         self.stdout.write(self.style.SUCCESS('\nDedup cross-check vs standalone ground truth:'))

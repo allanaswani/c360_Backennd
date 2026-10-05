@@ -35,10 +35,10 @@ class _Conn:
             return [{'d': LOAN}]
         if 'max(transaction_date)' in s:
             return [{'d': LEDGER}]
-        if 'o_final_acc_amount amt' in s:
+        if 'ch, o_final_acc_amount' in s:
             # The staged feed: answer the first (recent) read with recent_rows when
             # given, every other read with feed_rows.
-            if self.recent_rows is not None and len([x for x in self.sql if 'o_final_acc_amount amt' in x.lower()]) == 1:
+            if self.recent_rows is not None and len([x for x in self.sql if 'ch, o_final_acc_amount' in x.lower()]) == 1:
                 return list(self.recent_rows)
             return list(self.feed_rows)
         return []
@@ -94,7 +94,7 @@ class FeedTests(SimpleTestCase):
                          ['System', 'System', 'Whizz / M-Pesa', 'M-Pesa, till & PesaLink'])
         self.assertEqual([r['amount'] for r in rows], [-108087, 275970, -70076, 5000])
         self.assertEqual(rows[0]['account'], 'Malipo Salary Account')
-        feed_sql = [x for x in conn.sql if 'o_final_acc_amount amt' in x][0]
+        feed_sql = [x for x in conn.sql if 'ch, o_final_acc_amount' in x][0]
         self.assertIn('o_final_acc_amount <> 0', feed_sql)
         self.assertNotIn("'BATCH'", feed_sql)            # system postings are not filtered out
         self.assertIn("DATE '2026-10-01'", feed_sql)      # to the newest posting
@@ -102,18 +102,18 @@ class FeedTests(SimpleTestCase):
     def test_engagement_probe_still_excludes_system_postings(self):
         conn = _Conn()
         TrinoWarehouse(conn).recent_transactions('1', limit=30, lookback_months=2, engagement_only=True)
-        feed_sql = [x for x in conn.sql if 'o_final_acc_amount amt' in x][0]
+        feed_sql = [x for x in conn.sql if 'ch, o_final_acc_amount' in x][0]
         self.assertIn("NOT IN ('BATCH','SAP FINANCE GL','DEFAULT')", feed_sql)
 
     def test_older_months_are_read_only_when_recent_ones_are_short(self):
         full = [_row('2026-09-30', 'JOURNAL CREDIT', 'BATCH', 1)] * 15
         conn = _Conn(recent_rows=full)
         TrinoWarehouse(conn).recent_transactions('1', limit=15)
-        self.assertEqual(sum('o_final_acc_amount amt' in x for x in conn.sql), 1)
+        self.assertEqual(sum('ch, o_final_acc_amount' in x for x in conn.sql), 1)
 
         conn = _Conn(recent_rows=full[:4], feed_rows=full[:11])
         rows = TrinoWarehouse(conn).recent_transactions('1', limit=15)
-        self.assertEqual(sum('o_final_acc_amount amt' in x for x in conn.sql), 2)
+        self.assertEqual(sum('ch, o_final_acc_amount' in x for x in conn.sql), 2)
         self.assertEqual(len(rows), 15)
 
 

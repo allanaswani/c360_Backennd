@@ -162,7 +162,9 @@ def derive_risk(
 
     # Leverage: only meaningful with material absolute exposure.
     if loans >= 1_000_000:
-        ratio = loans / (deposits + 1.0)
+        # An overdrawn deposit total is no cover; below zero it also made the ratio
+        # negative (read as 'no leverage') and at exactly -1 divided by zero.
+        ratio = loans / (max(deposits, 0.0) + 1.0)
         if ratio >= 8:
             factors.append(f'Loans are {ratio:.0f}× deposits, which is high leverage')
             base = min(base + 1, 2)

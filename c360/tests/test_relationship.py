@@ -121,7 +121,7 @@ class _Conn:
 class LoanDetailTests(SimpleTestCase):
     def test_standing_order_matching_the_instalment_is_found(self):
         loan = {'l2': 'PURCHASE MORTGAGES', 'product': 'PURCHASE OWNER OCCUPIER', 'acc': 'X', 'bal': 8439127.37,
-                'inst': 108087.36, 'next_dt': '2026-10-31', 'od': 0, 'ov': 5, 'matures': '2038-01-31',
+                'inst': 108087.36, 'inst_own': 108087.36, 'next_dt': '2026-10-31', 'od': 0, 'ov': 5, 'matures': '2038-01-31',
                 'rem': 136, 'tot': 144, 'rate': 9.5, 'st': 'Normal'}
         sos = [{'d': '2026-09-30', 'a': -108087.36, 'prod': 'MALIPO SALARY ACCOUNT'},
                {'d': '2026-08-31', 'a': -108087.36, 'prod': 'MALIPO SALARY ACCOUNT'},

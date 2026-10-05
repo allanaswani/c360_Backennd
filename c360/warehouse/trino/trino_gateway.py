@@ -186,6 +186,20 @@ _WHIZZ_CATEGORY = {
 
 
 
+# Core banking's currency id for the Kenya shilling (eom_deposits.id_currency,
+# fact_dep_trx_recording.currency_id, eom_agreement.id_currency all share it).
+_KES_CURRENCY_ID = 22
+
+
+def _own_currency(code: Any, amount: Any) -> dict[str, Any]:
+    """The account's own currency and amount, for a foreign-currency account only -
+    every figure C360 shows or adds up is in KES; this is the line under it."""
+    ccy = str(code or '').strip().upper()
+    if not ccy or ccy == 'KES' or amount is None:
+        return {}
+    return {'account_currency': ccy, 'account_currency_amount': round(float(amount), 2)}
+
+
 class LiveDataNotReady(RuntimeError):
     """Raised when a live query depends on a source/view not yet built."""
 
@@ -1176,7 +1190,7 @@ class TrinoWarehouse(WarehouseGateway):
         d, p = self._loan_lit(), self._loan_part()
         rows = self._t.execute(
             f"SELECT cust_id, TRIM(loan_status_ind_name) status, count(*) accounts, "
-            f"SUM(gross_total) gross FROM delta.gold_db.eom_loans "
+            f"SUM(lc_gross_total) gross FROM delta.gold_db.eom_loans "
             f"WHERE eom_date = {d} {p} AND cust_id IN ({inlist}) GROUP BY cust_id, 2")
         # Worst classification wins. 'Normal' is the only performing value in the
         # live vocabulary (the others are 'Overdue' and 'Write Off').
@@ -1206,7 +1220,7 @@ class TrinoWarehouse(WarehouseGateway):
         inlist = ','.join(str(i) for i in ids)
         d, p = self._as_of_lit(), self._asof_part()
         rows = self._t.execute(
-            f"SELECT cust_id, SUM(book_balance) bal, count(*) accounts "
+            f"SELECT cust_id, SUM(euro_book_bal) bal, count(*) accounts "
             f"FROM delta.gold_db.eom_deposits WHERE eom_date = {d} {p} "
             f"AND cust_id IN ({inlist}) GROUP BY cust_id")
         return {self._cid(r['cust_id']): float(r.get('bal') or 0)
@@ -1465,9 +1479,9 @@ class TrinoWarehouse(WarehouseGateway):
         rows = self._t.execute(
             f"""
             SELECT
-              (SELECT COALESCE(SUM(book_balance), 0) FROM delta.gold_db.eom_deposits
+              (SELECT COALESCE(SUM(euro_book_bal), 0) FROM delta.gold_db.eom_deposits
                  WHERE eom_date = {d} {p} AND cust_id = ?) AS deposits,
-              (SELECT COALESCE(SUM(gross_total), 0) FROM delta.gold_db.eom_loans
+              (SELECT COALESCE(SUM(lc_gross_total), 0) FROM delta.gold_db.eom_loans
                  WHERE eom_date = {ld} {lp} AND cust_id = ?) AS loans
             """,
             (cid, cid),
@@ -1488,12 +1502,12 @@ class TrinoWarehouse(WarehouseGateway):
             return []
         rows = self._t.execute(
             f"""
-            SELECT account_no, product_desc, book_balance, currency, entry_status,
+            SELECT account_no, product_desc, euro_book_bal, book_balance, currency, entry_status,
                    CAST(last_trx_date AS varchar) AS last_trx_date
             FROM delta.gold_db.eom_deposits
             WHERE eom_date = {self._as_of_lit()} {self._asof_part()} AND cust_id = ?
-              AND book_balance <> 0
-            ORDER BY book_balance DESC
+              AND euro_book_bal <> 0
+            ORDER BY euro_book_bal DESC
             LIMIT 40
             """,
             (cid,),
@@ -1504,8 +1518,9 @@ class TrinoWarehouse(WarehouseGateway):
             out.append({
                 'account_no': str(r.get('account_no') or '').strip(),
                 'product': self._clean(r.get('product_desc')) or 'Deposit account',
-                'balance': round(float(r.get('book_balance') or 0)),
-                'currency': self._clean(r.get('currency')) or 'KES',
+                'balance': round(float(r.get('euro_book_bal') or 0)),
+                'currency': 'KES',
+                **_own_currency(r.get('currency'), r.get('book_balance')),
                 'status': _ENTRY_STATUS.get(es, 'Active'),
                 'last_transaction_date': self._safe_date(r.get('last_trx_date')),
             })
@@ -1517,13 +1532,13 @@ class TrinoWarehouse(WarehouseGateway):
             return []
         rows = self._t.execute(
             f"""
-            SELECT account_no, product_desc, gross_total,
+            SELECT account_no, product_desc, lc_gross_total, gross_total, currency,
                    CAST(acc_open_dt AS varchar) AS acc_open_dt,
                    loan_status_ind_name, final_sub_class
             FROM delta.gold_db.eom_loans
             WHERE eom_date = {self._loan_lit()} {self._loan_part()} AND cust_id = ?
-              AND gross_total <> 0
-            ORDER BY gross_total DESC
+              AND lc_gross_total <> 0
+            ORDER BY lc_gross_total DESC
             LIMIT 40
             """,
             (cid,),
@@ -1531,8 +1546,9 @@ class TrinoWarehouse(WarehouseGateway):
         return [{
             'account_no': str(r.get('account_no') or '').strip(),
             'product': self._clean(r.get('product_desc')) or 'Loan facility',
-            'outstanding_balance': round(float(r.get('gross_total') or 0)),
+            'outstanding_balance': round(float(r.get('lc_gross_total') or 0)),
             'currency': 'KES',
+            **_own_currency(r.get('currency'), r.get('gross_total')),
             'classification': self._clean(r.get('loan_status_ind_name')) or self._clean(r.get('final_sub_class')) or 'Performing',
             'opened': self._safe_date(r.get('acc_open_dt')),
         } for r in rows]
@@ -1644,12 +1660,12 @@ class TrinoWarehouse(WarehouseGateway):
         lo, hi = self._date_lit(period.start), self._date_lit(period.end)
         rp = self._range_part(period.start, period.end)
         dep = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) p, SUM(book_balance) b "
+            f"SELECT CAST(eom_date AS varchar) p, SUM(euro_book_bal) b "
             f"FROM delta.gold_db.eom_deposits "
             f"WHERE cust_id=? {rp} AND eom_date BETWEEN {lo} AND {hi} "
             f"GROUP BY eom_date ORDER BY eom_date", (cid,))
         loan = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) p, SUM(gross_total) b "
+            f"SELECT CAST(eom_date AS varchar) p, SUM(lc_gross_total) b "
             f"FROM delta.gold_db.eom_loans "
             f"WHERE cust_id=? {rp} AND eom_date BETWEEN {lo} AND {hi} "
             f"GROUP BY eom_date ORDER BY eom_date", (cid,))
@@ -1673,7 +1689,7 @@ class TrinoWarehouse(WarehouseGateway):
         lo, hi = self._date_lit(start), self._date_lit(asof)
         rp = self._range_part(start, asof)
         rows = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) p, SUM(book_balance) b "
+            f"SELECT CAST(eom_date AS varchar) p, SUM(euro_book_bal) b "
             f"FROM delta.gold_db.eom_deposits "
             f"WHERE cust_id=? {rp} AND eom_date BETWEEN {lo} AND {hi} "
             f"GROUP BY eom_date ORDER BY eom_date", (cid,))
@@ -1695,7 +1711,7 @@ class TrinoWarehouse(WarehouseGateway):
         lo, hi = self._date_lit(period.start), self._date_lit(period.end)
         rp = self._range_part(period.start, period.end)
         rows = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) p, SUM(tot_drawdown_amn) d, SUM(gross_total) b "
+            f"SELECT CAST(eom_date AS varchar) p, SUM(tot_drawdown_amn * fixing_rate) d, SUM(lc_gross_total) b "
             f"FROM delta.gold_db.eom_loans "
             f"WHERE cust_id=? {rp} AND eom_date BETWEEN {lo} AND {hi} "
             f"GROUP BY eom_date ORDER BY eom_date", (cid,))
@@ -1778,7 +1794,7 @@ class TrinoWarehouse(WarehouseGateway):
         def fetch(lo: date, top: date, n: int) -> list[dict]:
             return self._t.execute(
                 f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
-                f"channel_description ch, o_final_acc_amount amt, TRIM(product_description) prod "
+                f"channel_description ch, o_final_acc_amount * {self._trx_fx} amt, TRIM(product_description) prod "
                 f"FROM delta.gold_db.fact_dep_trx_recording "
                 f"WHERE customer_id=? {self._range_part(lo, top)} "
                 f"AND transaction_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(top)} "
@@ -1883,10 +1899,10 @@ class TrinoWarehouse(WarehouseGateway):
         d, p = self._as_of_lit(), self._asof_part()
         inlist = ','.join(str(i) for i in ids)
         dep = {self._cid(r['c']): (float(r['v'] or 0), int(r['n'] or 0)) for r in self._t.execute(
-            f"SELECT cust_id c, SUM(book_balance) v, COUNT(DISTINCT product_desc) n "
+            f"SELECT cust_id c, SUM(euro_book_bal) v, COUNT(DISTINCT product_desc) n "
             f"FROM delta.gold_db.eom_deposits WHERE eom_date={d} {p} AND cust_id IN ({inlist}) GROUP BY cust_id")}
         loan = {self._cid(r['c']): (float(r['v'] or 0), int(r['n'] or 0)) for r in self._t.execute(
-            f"SELECT cust_id c, SUM(gross_total) v, COUNT(DISTINCT product_desc) n "
+            f"SELECT cust_id c, SUM(lc_gross_total) v, COUNT(DISTINCT product_desc) n "
             f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} AND cust_id IN ({inlist}) GROUP BY cust_id")}
         idn = {self._cid(r['id']): r for r in self._t.execute(
             f"SELECT CAST(customer_id AS BIGINT) id, full_name, customer_segment, "
@@ -2063,7 +2079,7 @@ class TrinoWarehouse(WarehouseGateway):
         lrows = self._t.execute(
             f"SELECT DISTINCT loan_status_ind_name s, final_sub_class f "
             f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} AND cust_id=? "
-            f"AND gross_total <> 0", (cid,))
+            f"AND lc_gross_total <> 0", (cid,))
         statuses: list[str] = []
         for lr in lrows:
             statuses.append(self._clean(lr.get('s')) or '')
@@ -2131,8 +2147,8 @@ class TrinoWarehouse(WarehouseGateway):
                 f"WHERE eom_date BETWEEN {lo} AND {hi} {rp} AND cust_id IN ({inlist}) "
                 f"GROUP BY eom_date, cust_id", ())
 
-        dep_rows = eom('eom_deposits', 'book_balance')
-        loan_rows = eom('eom_loans', 'gross_total')
+        dep_rows = eom('eom_deposits', 'euro_book_bal')
+        loan_rows = eom('eom_loans', 'lc_gross_total')
 
         # Aggregate to per-date book totals, per-(date, segment) value, and
         # per-(date, customer) value (the last drives movers, no extra query).
@@ -2241,7 +2257,7 @@ class TrinoWarehouse(WarehouseGateway):
         for r in self._t.execute(
             f"SELECT cust_id c, loan_status_ind_name s, final_sub_class f "
             f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} AND cust_id IN ({inlist}) "
-            f"AND gross_total <> 0", ()):
+            f"AND lc_gross_total <> 0", ()):
             cid = self._cid(r['c'])
             lstat.setdefault(cid, []).extend([self._clean(r.get('s')) or '', self._clean(r.get('f')) or ''])
         out = {}
@@ -2271,11 +2287,11 @@ class TrinoWarehouse(WarehouseGateway):
 
         excl = f" AND dc.customer_segment <> '{self._INTERNAL_SEGMENT}' "
         dep_seg = self._t.execute(
-            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.book_balance) v "
+            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.euro_book_bal) v "
             f"FROM delta.gold_db.eom_deposits e JOIN delta.gold_db.dim_customer dc "
             f"ON dc.customer_id = e.cust_id WHERE e.eom_date={d} {p} {excl} GROUP BY dc.customer_segment", ())
         loan_seg = self._t.execute(
-            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.gross_total) v "
+            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.lc_gross_total) v "
             f"FROM delta.gold_db.eom_loans e JOIN delta.gold_db.dim_customer dc "
             f"ON dc.customer_id = e.cust_id WHERE e.eom_date={d} {p} {excl} GROUP BY dc.customer_segment", ())
 
@@ -2322,8 +2338,8 @@ class TrinoWarehouse(WarehouseGateway):
         # Top deposit products by balance — "what actually holds the book" (cross-sell
         # headroom lives in the products a segment under-holds).
         tp = self._t.execute(
-            f"SELECT product_desc pd, SUM(book_balance) v, COUNT(DISTINCT cust_id) n "
-            f"FROM delta.gold_db.eom_deposits WHERE eom_date={d} {p} {ni} AND book_balance > 0 "
+            f"SELECT product_desc pd, SUM(euro_book_bal) v, COUNT(DISTINCT cust_id) n "
+            f"FROM delta.gold_db.eom_deposits WHERE eom_date={d} {p} {ni} AND euro_book_bal > 0 "
             f"GROUP BY product_desc ORDER BY 2 DESC LIMIT 8", ())
         top_products = [{'product': (self._clean(r.get('pd')) or 'Other').title(),
                          'value': round(float(r.get('v') or 0)),
@@ -2379,11 +2395,11 @@ class TrinoWarehouse(WarehouseGateway):
             f" SELECT CASE "
             f"   WHEN COALESCE(l.loan,0) <= 0 AND COALESCE(dp.dep,0) <= 0 THEN 'Unclassified' "
             f"   WHEN COALESCE(l.loan,0) <= 0 THEN 'Low' "
-            f"   WHEN l.loan / (COALESCE(dp.dep,0) + 1) >= 8 AND l.loan >= 1000000 THEN 'High' "
-            f"   WHEN l.loan / (COALESCE(dp.dep,0) + 1) >= 3 THEN 'Medium' ELSE 'Low' END bucket "
-            f" FROM (SELECT cust_id, SUM(book_balance) dep FROM delta.gold_db.eom_deposits "
+            f"   WHEN l.loan / (GREATEST(COALESCE(dp.dep,0), 0) + 1) >= 8 AND l.loan >= 1000000 THEN 'High' "
+            f"   WHEN l.loan / (GREATEST(COALESCE(dp.dep,0), 0) + 1) >= 3 THEN 'Medium' ELSE 'Low' END bucket "
+            f" FROM (SELECT cust_id, SUM(euro_book_bal) dep FROM delta.gold_db.eom_deposits "
             f"       WHERE eom_date={d} {p} {ni} GROUP BY cust_id) dp "
-            f" FULL OUTER JOIN (SELECT cust_id, SUM(gross_total) loan FROM delta.gold_db.eom_loans "
+            f" FULL OUTER JOIN (SELECT cust_id, SUM(lc_gross_total) loan FROM delta.gold_db.eom_loans "
             f"       WHERE eom_date={d} {p} {ni} GROUP BY cust_id) l ON dp.cust_id = l.cust_id"
             f") GROUP BY bucket", ())
         counts = {self._clean(r['bucket']): int(r['n'] or 0) for r in rows}
@@ -2402,8 +2418,8 @@ class TrinoWarehouse(WarehouseGateway):
             f"SELECT cust_id, "
             f"  SUM(CASE WHEN eom_date={now} THEN v ELSE 0 END) - SUM(CASE WHEN eom_date={prev} THEN v ELSE 0 END) delta, "
             f"  SUM(CASE WHEN eom_date={now} THEN v ELSE 0 END) now_v FROM ("
-            f"  SELECT cust_id, eom_date, book_balance v FROM delta.gold_db.eom_deposits WHERE eom_date IN ({now},{prev}) {rp} {ni} "
-            f"  UNION ALL SELECT cust_id, eom_date, gross_total v FROM delta.gold_db.eom_loans WHERE eom_date IN ({now},{prev}) {rp} {ni} "
+            f"  SELECT cust_id, eom_date, euro_book_bal v FROM delta.gold_db.eom_deposits WHERE eom_date IN ({now},{prev}) {rp} {ni} "
+            f"  UNION ALL SELECT cust_id, eom_date, lc_gross_total v FROM delta.gold_db.eom_loans WHERE eom_date IN ({now},{prev}) {rp} {ni} "
             f") GROUP BY cust_id "
             f"ORDER BY abs(SUM(CASE WHEN eom_date={now} THEN v ELSE 0 END) - SUM(CASE WHEN eom_date={prev} THEN v ELSE 0 END)) DESC "
             f"LIMIT {int(limit)}", ())
@@ -2443,10 +2459,10 @@ class TrinoWarehouse(WarehouseGateway):
         ni = self._not_internal_cid()
 
         bt_dep = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) d, SUM(book_balance) v FROM delta.gold_db.eom_deposits "
+            f"SELECT CAST(eom_date AS varchar) d, SUM(euro_book_bal) v FROM delta.gold_db.eom_deposits "
             f"WHERE eom_date BETWEEN {lo} AND {hi} {rp} {ni} GROUP BY eom_date ORDER BY eom_date", ())
         bt_loan = self._t.execute(
-            f"SELECT CAST(eom_date AS varchar) d, SUM(gross_total) v FROM delta.gold_db.eom_loans "
+            f"SELECT CAST(eom_date AS varchar) d, SUM(lc_gross_total) v FROM delta.gold_db.eom_loans "
             f"WHERE eom_date BETWEEN {lo} AND {hi} {rp} {ni} GROUP BY eom_date ORDER BY eom_date", ())
         dep_by = {self._safe_date(r['d']): float(r['v'] or 0) for r in bt_dep if self._safe_date(r['d'])}
         loan_by = {self._safe_date(r['d']): float(r['v'] or 0) for r in bt_loan if self._safe_date(r['d'])}
@@ -2489,7 +2505,7 @@ class TrinoWarehouse(WarehouseGateway):
         dd = self._date_lit(on)
         pp = self._asof_part() if on == self.as_of_date() else self._range_part(on, on)
         out: dict[str, float] = {}
-        for table, col in (('eom_deposits', 'book_balance'), ('eom_loans', 'gross_total')):
+        for table, col in (('eom_deposits', 'euro_book_bal'), ('eom_loans', 'lc_gross_total')):
             for r in self._t.execute(
                 f"SELECT dc.customer_segment seg, SUM(e.{col}) v FROM delta.gold_db.{table} e "
                 f"JOIN delta.gold_db.dim_customer dc ON dc.customer_id=e.cust_id "
@@ -2546,10 +2562,10 @@ class TrinoWarehouse(WarehouseGateway):
         # money-out side (debited amount - payment value) is what the customer paid in
         # charges. Linda (1218821): 9 sends of KES 470,000 debited KES 470,684.
         cats = self._t.execute(
-            f"SELECT TRIM(justific_descrption) j, COUNT(*) n, SUM(i_amount) v, "
-            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) vin, "
-            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) vout, "
-            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN i_amount ELSE 0 END) vout_principal {where} "
+            f"SELECT TRIM(justific_descrption) j, COUNT(*) n, SUM(i_amount * {self._trx_fx}) v, "
+            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount * {self._trx_fx} ELSE 0 END) vin, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount * {self._trx_fx} ELSE 0 END) vout, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN i_amount * {self._trx_fx} ELSE 0 END) vout_principal {where} "
             f"GROUP BY TRIM(justific_descrption) ORDER BY v DESC", (cid,))
         txn_count = sum(int(r['n'] or 0) for r in cats)
 
@@ -2585,9 +2601,9 @@ class TrinoWarehouse(WarehouseGateway):
             float(r['vout'] or 0) if _re.search(r'FEE|CHARGE', str(r['j'] or '').upper())
             else float(r['vout'] or 0) - float(r['vout_principal'] or 0) for r in cats))
         activity = self._t.execute(
-            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n, SUM(i_amount) v, "
-            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) vin, "
-            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) vout {where} "
+            f"SELECT CAST(transaction_date AS varchar) d, COUNT(*) n, SUM(i_amount * {self._trx_fx}) v, "
+            f"SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount * {self._trx_fx} ELSE 0 END) vin, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount * {self._trx_fx} ELSE 0 END) vout {where} "
             f"GROUP BY CAST(transaction_date AS varchar) ORDER BY 1", (cid,))
         activity_pts = [{'period': self._safe_date(r['d']), 'count': int(r['n'] or 0),
                          'value': round(float(r['v'] or 0)),
@@ -2596,7 +2612,7 @@ class TrinoWarehouse(WarehouseGateway):
         # Signed, so the table reads money in and out like the statement does.
         recent = self._t.execute(
             f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
-            f"o_final_acc_amount amt {where} "
+            f"o_final_acc_amount * {self._trx_fx} amt {where} "
             f"ORDER BY transaction_date DESC, tun_internal_sn DESC LIMIT 50", (cid,))
         recent_rows = [{'date': self._safe_date(r['d']), 'description': self._whizz_cat(r['j']),
                         'amount': round(float(r['amt'] or 0)), 'currency': 'KES'} for r in recent]
@@ -3967,20 +3983,22 @@ class TrinoWarehouse(WarehouseGateway):
         d, pp = self._as_of_lit(), self._asof_part()
         dep = self._t.execute(
             f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, "
-            f"TRIM(e.account_no) account_no, e.book_balance balance, e.entry_status, "
+            f"TRIM(e.account_no) account_no, e.euro_book_bal balance, e.entry_status, "
+            f"e.currency ccy, e.book_balance own, "
             f"CAST(e.expiry_date AS varchar) expiry, CAST(e.opening_date AS varchar) opened "
             f"FROM delta.gold_db.eom_deposits e "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
             f"WHERE e.eom_date = {d} {pp.replace('partition_', 'e.partition_')} "
-            f"AND e.cust_id = ? AND e.book_balance <> 0", (cid,))
+            f"AND e.cust_id = ? AND e.euro_book_bal <> 0", (cid,))
         loan = self._t.execute(
             f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, "
-            f"TRIM(e.account_no) account_no, e.gross_total balance, "
+            f"TRIM(e.account_no) account_no, e.lc_gross_total balance, "
+            f"e.currency ccy, e.gross_total own, "
             f"TRIM(e.loan_status_ind_name) status, CAST(e.acc_open_dt AS varchar) opened "
             f"FROM delta.gold_db.eom_loans e "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
             f"WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} "
-            f"AND e.cust_id = ? AND e.gross_total <> 0", (cid,))
+            f"AND e.cust_id = ? AND e.lc_gross_total <> 0", (cid,))
         dep_rows = [{'level2': r.get('l2'), 'product': r.get('product'),
                      'balance': float(r.get('balance') or 0)} for r in dep]
         loan_rows = [{'level2': r.get('l2'), 'product': r.get('product'),
@@ -3995,6 +4013,7 @@ class TrinoWarehouse(WarehouseGateway):
             accounts.append({'category': cat[1], 'product': self._clean(r.get('product')),
                              'account_no': self._clean(r.get('account_no')),
                              'balance': round(float(r.get('balance') or 0)),
+                             **_own_currency(r.get('ccy'), r.get('own')),
                              'status': _ENTRY_STATUS.get(es, 'Active'), 'side': 'deposit',
                              'opened': self._safe_date(r.get('opened')),
                              # Only a term or call deposit matures; other accounts carry
@@ -4008,6 +4027,7 @@ class TrinoWarehouse(WarehouseGateway):
             accounts.append({'category': cat[1], 'product': self._clean(r.get('product')),
                              'account_no': self._clean(r.get('account_no')),
                              'balance': round(float(r.get('balance') or 0)),
+                             **_own_currency(r.get('ccy'), r.get('own')),
                              'status': self._clean(r.get('status')) or 'Active', 'side': 'loan',
                              'opened': self._safe_date(r.get('opened'))})
         mix['accounts'] = accounts
@@ -4019,6 +4039,43 @@ class TrinoWarehouse(WarehouseGateway):
 
     # --- credit facilities + mobile-loan history (eom_agreement) ---------------
     _AGR_TTL_SECONDS = 1800
+
+    # --- foreign currency -----------------------------------------------------
+    # Core banking keeps each account's amounts in the account's own currency. Adding
+    # a USD balance to a KES one as if both were shillings understated a USD 1.05M call
+    # deposit (customer 72336) as KES 1.05M instead of KES 135.5M, so every amount is
+    # valued in KES: balances from the KES columns core banking already carries
+    # (euro_book_bal, lc_gross_total), everything else at core banking's own rate.
+    _FX_TTL_SECONDS = 1800
+
+    def _fx_rates(self) -> dict[int, float]:
+        """KES per unit of each currency at the as-of close, by core-banking currency id."""
+        now = time.monotonic()
+        cached = getattr(self, '_fx', None)
+        if cached is not None and (now - getattr(self, '_fx_at', 0.0)) < self._FX_TTL_SECONDS:
+            return cached
+        rows = self._t.execute(
+            f"SELECT CAST(id_currency AS integer) i, max(fixing_rate) r "
+            f"FROM delta.gold_db.eom_deposits WHERE eom_date = {self._as_of_lit()} {self._asof_part()} "
+            f"AND fixing_rate > 0 GROUP BY 1")
+        rates = {int(r['i']): float(r['r']) for r in rows if r.get('i') is not None and r.get('r')}
+        rates[_KES_CURRENCY_ID] = 1.0
+        self._fx, self._fx_at = rates, now
+        return rates
+
+    def _fx_case(self, col: str) -> str:
+        """SQL: KES per unit of the currency id in ``col``; NULL for a currency with no
+        rate, so an amount that cannot be valued is left out rather than miscounted."""
+        whens = ' '.join(f'WHEN {i} THEN {r!r}' for i, r in sorted(self._fx_rates().items()))
+        return f"(CASE CAST({col} AS integer) {whens} END)"
+
+    @property
+    def _trx_fx(self) -> str:
+        """SQL: KES per unit of a transaction's amount. The ledger carries the day's rate
+        on the row; the few foreign rows without one (67 of ~48,800 in Sep 2026) take
+        the as-of rate."""
+        return (f"(CASE WHEN currency_id = {_KES_CURRENCY_ID} THEN 1 "
+                f"WHEN o_fixing_rate > 0 THEN o_fixing_rate ELSE {self._fx_case('currency_id')} END)")
 
     def _agreement_as_of(self) -> date | None:
         """Newest ``eom_agreement`` snapshot on or before the app's as-of date. The table
@@ -4047,7 +4104,7 @@ class TrinoWarehouse(WarehouseGateway):
         if agr_date is None:
             raise LiveDataNotReady('eom_agreement has no recent snapshot')
         agr = self._t.execute(
-            f"SELECT TRIM(a.account_number) agr, TRIM(p.description) typ, a.agr_limit lim, "
+            f"SELECT TRIM(a.account_number) agr, TRIM(p.description) typ, a.agr_limit * {self._fx_case('a.id_currency')} lim, "
             f"CAST(a.agr_issue_dt AS varchar) issued "
             f"FROM delta.gold_db.eom_agreement a "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = a.fk_agreement_tyfk "
@@ -4055,7 +4112,7 @@ class TrinoWarehouse(WarehouseGateway):
         if not agr:
             return None
         outs = self._t.execute(
-            f"SELECT TRIM(CAST(agreement_number AS varchar)) agr, SUM(gross_total) o "
+            f"SELECT TRIM(CAST(agreement_number AS varchar)) agr, SUM(lc_gross_total) o "
             f"FROM delta.gold_db.eom_loans "
             f"WHERE eom_date = {self._loan_lit()} {self._loan_part()} AND cust_id = ? "
             f"GROUP BY 1", (cid,))
@@ -4081,7 +4138,7 @@ class TrinoWarehouse(WarehouseGateway):
         lo = self._months_ago(11)
         rows = self._t.execute(
             f"SELECT CAST(eom_date AS varchar) d, TRIM(CAST(agreement_number AS varchar)) agr, "
-            f"SUM(gross_total) o FROM delta.gold_db.eom_loans "
+            f"SUM(lc_gross_total) o FROM delta.gold_db.eom_loans "
             f"WHERE cust_id = ? {self._range_part(lo, hi)} "
             f"AND eom_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)} GROUP BY 1, 2",
             (cid,))
@@ -4112,7 +4169,7 @@ class TrinoWarehouse(WarehouseGateway):
         rows = self._t.execute(
             f"SELECT cat, COUNT(*) n, SUM(amt) v FROM ("
             f" SELECT amt, {activity_shape.CATEGORY_SQL} cat FROM ("
-            f"  SELECT i_amount amt, UPPER(TRIM(justific_descrption)) j, "
+            f"  SELECT i_amount * {self._trx_fx} amt, UPPER(TRIM(justific_descrption)) j, "
             f"         UPPER(TRIM(product_description)) p "
             f"  FROM delta.gold_db.fact_dep_trx_recording "
             f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
@@ -4202,7 +4259,7 @@ class TrinoWarehouse(WarehouseGateway):
         rows = self._t.execute(f"""
             WITH t AS (
               SELECT customer_id cid, amt, {cat_sql} cat FROM (
-                SELECT customer_id, i_amount amt, UPPER(TRIM(justific_descrption)) j,
+                SELECT customer_id, i_amount * {self._trx_fx} amt, UPPER(TRIM(justific_descrption)) j,
                        UPPER(TRIM(product_description)) p
                 FROM delta.gold_db.fact_dep_trx_recording
                 WHERE 1=1 {self._range_part(lo, hi)}
@@ -4212,14 +4269,14 @@ class TrinoWarehouse(WarehouseGateway):
             h AS (
               SELECT e.cust_id cid,
                 SUM(CASE WHEN TRIM(p.tree_level_2) IN ('CURRENT ACCOUNT','SAVINGS ACCOUNT','NOTICE ACCOUNT','OVERDRAFT')
-                          AND UPPER(TRIM(e.product_desc)) <> 'VIRTUAL ACCOUNT MOBILE' THEN e.book_balance ELSE 0 END) liquid,
+                          AND UPPER(TRIM(e.product_desc)) <> 'VIRTUAL ACCOUNT MOBILE' THEN e.euro_book_bal ELSE 0 END) liquid,
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'TERM DEPOSIT ACCOUNT' THEN 1 ELSE 0 END) h_term_deposit,
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'CALL ACCOUNT' THEN 1 ELSE 0 END) h_call_deposit,
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'SAVINGS ACCOUNT' THEN 1 ELSE 0 END) h_savings,
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'NOTICE ACCOUNT' THEN 1 ELSE 0 END) h_notice
               FROM delta.gold_db.eom_deposits e
               JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
-              WHERE e.eom_date = {d} {ep} AND e.book_balance <> 0 GROUP BY 1),
+              WHERE e.eom_date = {d} {ep} AND e.euro_book_bal <> 0 GROUP BY 1),
             l AS (
               SELECT e.cust_id cid,
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'CONSUMER LOANS' THEN 1 ELSE 0 END) h_consumer,
@@ -4229,7 +4286,7 @@ class TrinoWarehouse(WarehouseGateway):
                 MAX(CASE WHEN TRIM(p.tree_level_2) = 'WORKING CAPITAL' THEN 1 ELSE 0 END) h_working_capital
               FROM delta.gold_db.eom_loans e
               JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
-              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.gross_total <> 0 GROUP BY 1),
+              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.lc_gross_total <> 0 GROUP BY 1),
             k AS (SELECT DISTINCT fk_customercust_id cid FROM delta.gold_db.cust_card_info
                   WHERE TRIM(entry_status_description) = 'Active'),
             m AS (SELECT DISTINCT ag.cust_id cid FROM delta.gold_db.eom_agreement ag
@@ -4364,7 +4421,7 @@ class TrinoWarehouse(WarehouseGateway):
             f"SUM(CASE WHEN a < 0 THEN -a ELSE 0 END) outflow, "
             f"SUM(CASE WHEN a > 0 THEN 1 ELSE 0 END) n_in, SUM(CASE WHEN a < 0 THEN 1 ELSE 0 END) n_out "
             f"FROM (SELECT transaction_date, a, {cashflow_shape.GROUP_SQL} grp FROM ("
-            f"  SELECT transaction_date, o_final_acc_amount a, UPPER(TRIM(justific_descrption)) j, "
+            f"  SELECT transaction_date, o_final_acc_amount * {self._trx_fx} a, UPPER(TRIM(justific_descrption)) j, "
             f"         UPPER(TRIM(product_description)) p "
             f"  FROM delta.gold_db.fact_dep_trx_recording "
             f"  WHERE customer_id = ? {self._range_part(lo, hi)} "
@@ -4387,14 +4444,14 @@ class TrinoWarehouse(WarehouseGateway):
             return None
         rows = self._t.execute(
             f"SELECT TRIM(p.tree_level_2) l2, TRIM(e.product_desc) product, TRIM(e.account_no) acc, "
-            f"e.gross_total bal, e.installment_amount inst, CAST(e.install_next_dt AS varchar) next_dt, "
-            f"e.overdue_days od, e.ov_balance ov, CAST(e.acc_exp_dt AS varchar) matures, "
+            f"e.lc_gross_total bal, e.currency ccy, e.gross_total own, e.installment_amount * e.fixing_rate inst, e.installment_amount inst_own, CAST(e.install_next_dt AS varchar) next_dt, "
+            f"e.overdue_days od, e.ov_balance * e.fixing_rate ov, CAST(e.acc_exp_dt AS varchar) matures, "
             f"e.remaining_months rem, e.total_months tot, e.final_interest rate, "
             f"TRIM(e.loan_status_ind_name) st "
             f"FROM delta.gold_db.eom_loans e "
             f"LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product "
             f"WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} "
-            f"AND e.cust_id = ? AND e.gross_total <> 0 ORDER BY e.gross_total DESC", (cid,))
+            f"AND e.cust_id = ? AND e.lc_gross_total <> 0 ORDER BY e.lc_gross_total DESC", (cid,))
         if not rows:
             return None
         hi = self.ledger_as_of()
@@ -4410,7 +4467,8 @@ class TrinoWarehouse(WarehouseGateway):
         out = []
         for r in rows:
             inst = round(float(r.get('inst') or 0), 2)
-            paid = [s for s in sos if inst > 0 and abs(abs(float(s.get('a') or 0)) - inst) <= 1.0]
+            inst_own = round(float(r.get('inst_own') or 0), 2)
+            paid = [s for s in sos if inst_own > 0 and abs(abs(float(s.get('a') or 0)) - inst_own) <= 1.0]
             paid_by = None
             if paid:
                 days = sorted({int(str(s['d'])[8:10]) for s in paid if s.get('d')})
@@ -4425,6 +4483,7 @@ class TrinoWarehouse(WarehouseGateway):
                 'type': cat[1] if cat else None,
                 'account_no': self._clean(r.get('acc')),
                 'balance': round(float(r.get('bal') or 0)),
+                **_own_currency(r.get('ccy'), r.get('own')),
                 'instalment': round(inst) if inst else None,
                 'next_due': self._safe_date(r.get('next_dt')),
                 'days_overdue': od,
@@ -4497,19 +4556,19 @@ class TrinoWarehouse(WarehouseGateway):
         year = self.as_of_date().year
         rows = self._t.execute(f"""
             WITH dep AS (
-              SELECT e.cust_id c, SUM(e.book_balance) dep,
+              SELECT e.cust_id c, SUM(e.euro_book_bal) dep,
                      COUNT(DISTINCT CASE WHEN TRIM(p.tree_level_2) IN ({internal}) THEN NULL
                                          WHEN TRIM(p.tree_level_2) = 'CURRENT ACCOUNT'
                                               AND UPPER(TRIM(e.product_desc)) = 'VIRTUAL ACCOUNT MOBILE' THEN 'WALLET'
                                          ELSE TRIM(p.tree_level_2) END) k
               FROM delta.gold_db.eom_deposits e
               LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
-              WHERE e.eom_date = {d} {dp} AND e.book_balance <> 0 GROUP BY 1),
+              WHERE e.eom_date = {d} {dp} AND e.euro_book_bal <> 0 GROUP BY 1),
             lo AS (
-              SELECT e.cust_id c, SUM(e.gross_total) loans, COUNT(DISTINCT TRIM(p.tree_level_2)) k
+              SELECT e.cust_id c, SUM(e.lc_gross_total) loans, COUNT(DISTINCT TRIM(p.tree_level_2)) k
               FROM delta.gold_db.eom_loans e
               LEFT JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
-              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.gross_total <> 0 GROUP BY 1),
+              WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} AND e.lc_gross_total <> 0 GROUP BY 1),
             rv AS (
               SELECT cust_cif c, SUM(CASE WHEN TRIM(income_category) = 'Interest_Expenses'
                                           THEN -revenue ELSE revenue END) rev
@@ -4574,11 +4633,11 @@ class TrinoWarehouse(WarehouseGateway):
                  f"AND {_MOVEMENT_SQL}")
         rows = self._t.execute(
             f"SELECT CAST(transaction_date AS varchar) d, TRIM(justific_descrption) j, "
-            f"channel_description ch, o_final_acc_amount amt, TRIM(product_description) prod {where} "
+            f"channel_description ch, o_final_acc_amount * {self._trx_fx} amt, TRIM(product_description) prod {where} "
             f"ORDER BY transaction_date DESC, tun_internal_sn DESC LIMIT ?", (cid, int(limit)))
         tot = self._t.execute(
-            f"SELECT COUNT(*) n, SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount ELSE 0 END) i, "
-            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount ELSE 0 END) o {where}", (cid,))
+            f"SELECT COUNT(*) n, SUM(CASE WHEN o_final_acc_amount > 0 THEN o_final_acc_amount * {self._trx_fx} ELSE 0 END) i, "
+            f"SUM(CASE WHEN o_final_acc_amount < 0 THEN -o_final_acc_amount * {self._trx_fx} ELSE 0 END) o {where}", (cid,))
         t = tot[0] if tot else {}
         return {
             'from': start.isoformat(), 'to': end.isoformat(),
@@ -4598,12 +4657,12 @@ class TrinoWarehouse(WarehouseGateway):
         until = asof + timedelta(days=int(days))
         rows = self._t.execute(f"""
             SELECT CAST(e.cust_id AS BIGINT) cid, TRIM(e.account_no) acc, TRIM(e.product_desc) prod,
-                   e.book_balance bal, CAST(e.expiry_date AS varchar) ex,
+                   e.euro_book_bal bal, CAST(e.expiry_date AS varchar) ex,
                    dc.full_name, dc.customer_segment, dc.account_branch_name, dc.employer, dc.fk_bankemployeeid
             FROM delta.gold_db.eom_deposits e
             JOIN delta.gold_db.w_dim_product p ON p.product_code = e.id_product
             JOIN delta.gold_db.dim_customer dc ON dc.customer_id = e.cust_id
-            WHERE e.eom_date = {d} {dp} AND e.book_balance > 0
+            WHERE e.eom_date = {d} {dp} AND e.euro_book_bal > 0
               AND TRIM(p.tree_level_2) IN ('TERM DEPOSIT ACCOUNT', 'CALL ACCOUNT')
               AND dc.customer_segment <> 'INTERNAL ACCOUNTS'""")
         upcoming, past_n, past_v = [], 0, 0.0

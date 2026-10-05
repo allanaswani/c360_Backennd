@@ -139,7 +139,7 @@ def extract_training_rows(gateway, *, sample: int = 80_000, id_chunk: int = 2000
     not_internal = gateway._not_internal_cid()
 
     dep_rows = t.execute(
-        f"SELECT cust_id cid, SUM(book_balance) bal, array_agg(DISTINCT product_desc) prods "
+        f"SELECT cust_id cid, SUM(euro_book_bal) bal, array_agg(DISTINCT product_desc) prods "
         f"FROM delta.gold_db.eom_deposits WHERE eom_date={d} {p} {not_internal} "
         f"GROUP BY cust_id LIMIT {int(sample)}")
     dep = {int(r['cid']): (float(r['bal'] or 0), list(r['prods'] or [])) for r in dep_rows if r.get('cid') is not None}
@@ -150,7 +150,7 @@ def extract_training_rows(gateway, *, sample: int = 80_000, id_chunk: int = 2000
     # lending products. A random deposit sample is Whizz-heavy and catches almost no
     # borrowers, so lending models starved; pulling every borrower fixes that.
     loan_rows = t.execute(
-        f"SELECT cust_id cid, SUM(gross_total) bal, array_agg(DISTINCT product_desc) prods "
+        f"SELECT cust_id cid, SUM(lc_gross_total) bal, array_agg(DISTINCT product_desc) prods "
         f"FROM delta.gold_db.eom_loans WHERE eom_date={d} {p} GROUP BY cust_id")
     loan = {int(r['cid']): (float(r['bal'] or 0), list(r['prods'] or [])) for r in loan_rows if r.get('cid') is not None}
 
@@ -161,7 +161,7 @@ def extract_training_rows(gateway, *, sample: int = 80_000, id_chunk: int = 2000
         chunk = missing[j:j + id_chunk]
         inlist = ','.join(str(x) for x in chunk)
         for r in t.execute(
-            f"SELECT cust_id cid, SUM(book_balance) bal, array_agg(DISTINCT product_desc) prods "
+            f"SELECT cust_id cid, SUM(euro_book_bal) bal, array_agg(DISTINCT product_desc) prods "
             f"FROM delta.gold_db.eom_deposits WHERE eom_date={d} {p} AND cust_id IN ({inlist}) "
             f"GROUP BY cust_id"):
             if r.get('cid') is not None:
