@@ -73,13 +73,27 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
     else:
         snapshots.append(_empty_snapshot('Properties', 'properties', 'No linked properties'))
 
-    if banc:
-        bv = sum(p['premium'] for p in banc['policies'])
+    if banc and banc.get('policies'):
+        # Premium IN FORCE, like the header and the Bancassurance tab. Summing every
+        # row added each expired annual renewal and called the total "annual premium".
+        pols = banc['policies']
+        active = [p for p in pols if str(p.get('status', '')).lower() == 'active']
+        bv = sum(p['premium'] for p in active)
         bst = LIVE if data_mode() == 'live' else PREVIEW
         slices.append({'domain': 'Bancassurance', 'value': bv, 'status': bst})
         snapshots.append({'domain': 'Bancassurance', 'tab': 'bancassurance', 'status': bst,
-                          'label': 'Annual premium', 'value': bv,
-                          'sub': f"{len(banc['policies'])} polic{'y' if len(banc['policies']) == 1 else 'ies'}"})
+                          'label': 'Annual premium in force', 'value': bv,
+                          'sub': (f"{len(active)} active of {len(pols)} polic{'y' if len(pols) == 1 else 'ies'}"
+                                  if active else
+                                  f"none active of {len(pols)} polic{'y' if len(pols) == 1 else 'ies'}")})
+    elif banc and (banc.get('receipts') or {}).get('amounts_available'):
+        # Premiums paid, with no policy record behind them: what is known, said as
+        # such, and kept out of the value mix (it is not a holding).
+        rc = banc['receipts']
+        snapshots.append({'domain': 'Bancassurance', 'tab': 'bancassurance',
+                          'status': LIVE if data_mode() == 'live' else PREVIEW,
+                          'label': 'Premiums paid', 'value': rc.get('amount_paid'),
+                          'sub': f"{rc['receipts']} receipt{'' if rc['receipts'] == 1 else 's'}, no policy record"})
     else:
         snapshots.append(_empty_snapshot('Bancassurance', 'bancassurance', 'No policies'))
 

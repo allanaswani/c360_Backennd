@@ -20,6 +20,8 @@ against the ID's 4,413, and it is safe precisely because of the uniqueness
 requirement: SUSAN WANJIKU KARIUKI has five bank records, so that name is ambiguous
 and the bridge declines rather than guessing.
 """
+from datetime import date
+
 from django.test import SimpleTestCase
 
 from c360.warehouse.trino.trino_gateway import TrinoWarehouse
@@ -233,7 +235,8 @@ class ReceiptEvidenceTests(SimpleTestCase):
     class _WithReceipts(_Warehouse):
         def execute(self, sql, params=None):
             if 'hfbi_receipt_data' in sql:
-                return [{'receipts': 133, 'risknotes': ['RN1', 'RN2', '']}]
+                self.receipt_sql = sql
+                return [{'receipts': 133, 'paid': 3020025.0, 'risknotes': ['RN1', 'RN2', '']}]
             if 'rpt_c360_customer_policies_summary' in sql and 'count(' not in sql.lower():
                 return []            # the policy extract lost them
             return super().execute(sql, params)
@@ -252,11 +255,52 @@ class ReceiptEvidenceTests(SimpleTestCase):
         out = gw.get_bancassurance(str(RAJAA_BANK), None)
         self.assertEqual(out['receipts']['risknotes'], ['RN1', 'RN2'])
 
-    def test_no_money_or_dates_are_claimed(self):
-        """receipt_date is NULL on all 31,975 rows and receipt_amount is negative on
-        24,693 with no documented sign convention. A count is the only honest figure."""
-        gw = TrinoWarehouse(self._WithReceipts(bank_nid='', bank_mobile=''))
-        rc = gw.get_bancassurance(str(RAJAA_BANK), None)['receipts']
-        self.assertNotIn('total_paid', rc)
-        self.assertFalse(rc['amounts_available'])
+    def test_premiums_paid_are_given_but_no_dates(self):
+        """The sign of receipt_amount is the posting era (2025 negative, 2026 positive,
+        none reversed - checked 2026-10-07), so the premium paid is the absolute
+        amount. receipt_date is NULL on every row, so no date is claimed."""
+        conn = self._WithReceipts(bank_nid='', bank_mobile='')
+        out = TrinoWarehouse(conn).get_bancassurance(str(RAJAA_BANK), None)
+        rc = out['receipts']
+        self.assertTrue(rc['amounts_available'])
+        self.assertEqual(rc['amount_paid'], 3020025)
         self.assertFalse(rc['dates_available'])
+        self.assertIn('KES 3,020,025 paid', out['match_note'])
+        self.assertIn('ABS(', conn.receipt_sql)          # sign is the posting era
+        self.assertIn('SELECT DISTINCT', conn.receipt_sql)  # a receipt loaded twice counts once
+
+
+class NoPolicyRecordPanelTests(SimpleTestCase):
+    """150707 (2026-10-07): two premium receipts for KES 90,000 and no policy record.
+    The tab said 'Annual premium in force KES 0 / Policies 0' as live fact."""
+
+    class _Gw:
+        def get_customer(self, cust_id):
+            return {'cust_id': cust_id}
+
+        def get_bancassurance(self, cust_id, period):
+            return {'policies': [], 'active': 0, 'expired': 0, 'unnumbered': 0,
+                    'phone_matched': 0, 'name_matched': 0, 'claims': None,
+                    'receipts': {'receipts': 2, 'risknotes': ['209607'], 'amount_paid': 90000,
+                                 'amounts_available': True, 'dates_available': False},
+                    'match_note': 'No policy record survives ...'}
+
+    def test_premiums_paid_lead_and_nothing_is_claimed_as_zero(self):
+        from c360.services.domains import build_bancassurance
+        from c360.warehouse.periods import resolve_period
+        out = build_bancassurance(self._Gw(), '150707', resolve_period('30D', as_of=date(2026, 10, 6)))
+        m = {x['label']: x for x in out['metrics']}
+        self.assertEqual(m['Premiums paid']['value'], 90000)
+        self.assertTrue(m['Premiums paid'].get('lead'))
+        for label in ('Annual premium in force', 'Sum insured in force', 'Policies'):
+            self.assertIsNone(m[label]['value'], label)
+            self.assertEqual(m[label]['status'], 'to_source', label)
+
+
+class OverviewPremiumInForceTests(SimpleTestCase):
+    def test_overview_counts_only_policies_in_force(self):
+        import inspect
+        from c360.services import overview
+        src = inspect.getsource(overview.build_customer_overview)
+        self.assertNotIn("sum(p['premium'] for p in banc['policies'])", src)
+        self.assertIn("'Annual premium in force'", src)

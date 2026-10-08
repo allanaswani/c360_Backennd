@@ -399,6 +399,15 @@ def build_linked_parties(gateway: WarehouseGateway, scope, cust_id: str) -> dict
     }
 
 
+def _no_policy_note(banc: dict | None) -> str:
+    """Why there is no insurance value - which is not always "no insurance"."""
+    rc = (banc or {}).get('receipts') or {}
+    if rc.get('amounts_available') and rc.get('receipts'):
+        return (f"No policy record in the insurance extract, but {rc['receipts']} premium "
+                f"receipt{'' if rc['receipts'] == 1 else 's'} for KES {rc.get('amount_paid', 0):,} paid.")
+    return 'No insurance policy linked to this customer.'
+
+
 def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, Any]:
     """Cross-domain value summary. Core banking is LIVE; the other three domains
     are declared but PREVIEW/TO_SOURCE until their pipelines land, so the donut
@@ -462,6 +471,6 @@ def build_value_summary(gateway: WarehouseGateway, cust_id: str) -> dict[str, An
              if insurance_value is not None else
              {'domain': brand.DOMAIN_LABELS['insurance'], 'value': None,
               'status': Provenance.TO_SOURCE.value,
-              'note': 'No insurance policy linked to this customer.'}),
+              'note': _no_policy_note(banc)}),
         ],
     }

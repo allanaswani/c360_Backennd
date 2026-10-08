@@ -390,6 +390,35 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
     policies = data['policies']
     live = data_mode() == 'live'
     st = LIVE if live else PREVIEW
+    receipts = data.get('receipts') or {}
+    paid = receipts.get('amount_paid') if receipts.get('amounts_available') else None
+    paid_metric = ([_metric('Premiums paid', paid, 'KES', status=st,
+                            meta=f"{receipts['receipts']} receipt{'' if receipts['receipts'] == 1 else 's'}, "
+                                 'all years')]
+                   if paid is not None else [])
+
+    if not policies:
+        # Receipts prove premiums were paid, but no policy record survived the
+        # insurance extract. A live "KES 0 in force / 0 policies" would state as fact
+        # what the source cannot say, so those read as not stated, and what IS known
+        # (the premiums paid) leads.
+        unknown = 'no policy record in the insurance extract'
+        return {
+            'cust_id': cust_id, 'domain': 'Bancassurance', 'preview': not live, 'period': period.to_dict(),
+            'metrics': [{**m, 'lead': True} for m in paid_metric] + [
+                _metric('Annual premium in force', None, 'KES', status=TO_SOURCE, meta=unknown),
+                _metric('Sum insured in force', None, 'KES', status=TO_SOURCE, meta=unknown),
+                _metric('Policies', None, 'count', status=TO_SOURCE, meta=unknown),
+            ],
+            'match_note': data.get('match_note'),
+            'claims': data.get('claims'),
+            'coverage': {'active': 0, 'expired': 0, 'unnumbered': 0,
+                         'matched_by_phone': data.get('phone_matched', 0),
+                         'matched_by_name': data.get('name_matched', 0)},
+            'charts': [],
+            'note': data.get('match_note'),
+            'tables': [],
+        }
 
     # Per-policy monthly payment = premium spread over the policy's term of cover
     # (annual by default). Injected onto each row so the table shows it too.
@@ -471,7 +500,7 @@ def build_bancassurance(gateway: WarehouseGateway, cust_id: str, period: Resolve
             _metric('Policies', len(policies), 'count', status=st,
                     meta=((f'{n_active} active' + (f', next renewal {next_renewal}' if next_renewal else ''))
                           if n_active else 'none currently active')),
-        ] + ([
+        ] + paid_metric + ([
             # Only when there IS a claim. 223 exist across 11,105 clients, so this
             # tile is absent almost always - and when it appears it is the most
             # important thing on the panel. Walking into a renewal without knowing

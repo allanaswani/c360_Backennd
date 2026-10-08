@@ -3131,16 +3131,22 @@ class TrinoWarehouse(WarehouseGateway):
             return None
         placeholders = ','.join(['?'] * len(keys))
         norm = self._sql_name_key('receipt_client')
-        # Count and risknotes only. receipt_date is NULL on all 31,975 rows, and
-        # receipt_amount is negative on 24,693 of them with no event_type and no
-        # documented sign convention - Rajaa Stones alone nets to -3,020,025 across
-        # 136 receipts. A count proves the relationship; a negative "premiums paid"
-        # would misinform, and an absolute value would assert a convention nobody has
-        # confirmed. Both questions are with the insurance team.
+        # The amount is the premium paid; its sign is only the posting era. Every
+        # receipt is a "premium payment" credited to Trade Debtors; the 2025 postings
+        # are negative (24,689 of 24,693) and the 2026 ones positive (4,112 of 4,116),
+        # and no receipt is reversed by another (checked 2026-10-07: of 2,651 receipt
+        # numbers that repeat, none nets to zero - 2,639 are one payment split across
+        # several risknotes). So the premium paid is the absolute amount. Rows are
+        # deduplicated first: 3 receipts are loaded twice, identically.
+        # receipt_date is NULL on every row, and receipt_created_at is the load time
+        # (the 2025 book was migrated in bulk on 27 May 2025), so no date is given.
         rows = self._t.execute(
-            f"SELECT count(*) receipts, "
-            f"ARRAY_AGG(DISTINCT TRIM(COALESCE(receipt_risknote_no, ''))) risknotes "
-            f"FROM delta.gold_db.hfbi_receipt_data WHERE {norm} IN ({placeholders})",
+            f"SELECT count(*) receipts, SUM(ABS(TRY_CAST(amt AS double))) paid, "
+            f"ARRAY_AGG(DISTINCT rn) risknotes FROM ("
+            f" SELECT DISTINCT CAST(receipt_receipt_no AS varchar) no, "
+            f"        TRIM(COALESCE(receipt_risknote_no, '')) rn, receipt_amount amt, "
+            f"        TRIM(receipt_client) client "
+            f" FROM delta.gold_db.hfbi_receipt_data WHERE {norm} IN ({placeholders}))",
             tuple(keys))
         if not rows or not int(rows[0].get('receipts') or 0):
             return None
@@ -3149,8 +3155,9 @@ class TrinoWarehouse(WarehouseGateway):
         return {
             'receipts': int(r.get('receipts') or 0),
             'risknotes': risknotes,
-            # Stated so the panel never implies it is withholding a figure it has.
-            'amounts_available': False,
+            'amount_paid': round(float(r.get('paid') or 0)),
+            'amounts_available': True,
+            # Stated so the panel never implies it is withholding a date it has.
             'dates_available': False,
         }
 
@@ -3797,8 +3804,10 @@ class TrinoWarehouse(WarehouseGateway):
                     'claims': self._safe_claims(receipts.get('risknotes') or []),
                     'match_note': (
                         'No policy record survives in the warehouse for this customer, but '
-                        f"{receipts['receipts']} premium receipts do. The policy detail is "
-                        'missing from the insurance extract, not from the relationship.'),
+                        f"{receipts['receipts']} premium receipts do, for KES "
+                        f"{receipts.get('amount_paid', 0):,} paid. Which policy they paid for, "
+                        'and whether it is still in force, is missing from the insurance '
+                        'extract, not from the relationship.'),
                 }
             # Distinguish a genuinely policy-free customer from an empty or
             # unreachable source (see get_properties).
