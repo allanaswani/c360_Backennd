@@ -243,7 +243,10 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     props = data['properties']
     live = data_mode() == 'live'
     st = LIVE if live else PREVIEW
-    total_value = sum(p['value'] for p in props)
+    total_value = sum(p['value'] or 0 for p in props)
+    n_unvalued = sum(1 for p in props if not p['value'])
+    n_shared = sum(1 for p in props if p.get('shared'))
+    n_phone = sum(1 for p in props if p.get('matched_by') == 'phone')
     n_units = len(props)
     n_mortgaged = sum(1 for p in props if p.get('mortgage'))
     projects = {p['project'] for p in props}
@@ -252,10 +255,10 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     # perc_paid is 0 on 9,686 of 9,708 units and is not used). A unit with no payment
     # on record has paid_pct None - "not known", never "0% paid".
     for p in props:
-        if p.get('paid_pct') is not None and 'paid' not in p:
+        if p.get('paid_pct') is not None and 'paid' not in p and p['value']:
             p['paid'] = round(p['value'] * p['paid_pct'])
             p['outstanding'] = max(p['value'] - p['paid'], 0)
-    known = [p for p in props if p.get('paid_pct') is not None]
+    known = [p for p in props if p.get('paid_pct') is not None and p.get('outstanding') is not None]
     unknown = n_units - len(known)
     paid_total = sum(p['paid'] for p in known)
     owed_total = sum(p['outstanding'] for p in known)
@@ -266,11 +269,18 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     def unit_label(p: dict) -> str:
         return f"{p['project']} · {p['unit']}"
 
-    mortgaged_value = sum(p['value'] for p in props if p.get('mortgage'))
+    mortgaged_value = sum(p['value'] or 0 for p in props if p.get('mortgage'))
     outright_value = total_value - mortgaged_value
 
+    value_notes = [n for n in (
+        (f"{n_unvalued} of {n_units} units carry no value in the register" if n_unvalued else None),
+        (f"{n_shared} also registered to another client" if n_shared else None)) if n]
     metrics = [
-        _metric('Property value', total_value, 'KES', lead=True, status=st),
+        (_metric('Property value', total_value, 'KES', lead=True, status=st,
+                 meta='; '.join(value_notes) or None)
+         if total_value or not n_unvalued else
+         _metric('Property value', None, 'KES', lead=True, status=TO_SOURCE,
+                 meta='no value stated in the register')),
         _metric('Properties', n_units, 'count', status=st,
                 meta=f"{len(projects)} project{'s' if len(projects) != 1 else ''}"),
     ]
@@ -288,7 +298,7 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     if len(projects) > 1:
         by_project: dict[str, int] = {}
         for p in props:
-            by_project[p['project']] = by_project.get(p['project'], 0) + p['value']
+            by_project[p['project']] = by_project.get(p['project'], 0) + (p['value'] or 0)
         charts.append({'kind': 'donut', 'id': 'by_project', 'title': 'Property value by project',
                        'question': 'Where is the customer\u2019s property wealth concentrated?', 'status': st,
                        'fmt': 'kes', 'data': [{'label': k, 'value': v} for k, v in
@@ -328,10 +338,18 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     register_note = ('Paid to date is from the property payment register, which starts in April 2021: '
                      'a unit paid before then shows less paid than it cost.'
                      if data.get('payments_available') else None)
+    match_note = (f"{n_phone} unit{'s were' if n_phone > 1 else ' was'} linked to this customer by "
+                  'phone number, because the national ID did not match the property register. '
+                  'A shared phone can link the wrong person; confirm with the customer.'
+                  if n_phone else None)
+    shared_note = ('A unit marked as shared is also registered to another client, and the '
+                   'register does not say which holding is current.' if n_shared else None)
     tables = [
-        {'id': 'props', 'title': 'Properties held', 'status': st, 'note': register_note,
+        {'id': 'props', 'title': 'Properties held', 'status': st,
+         'note': ' '.join(n for n in (register_note, shared_note) if n) or None,
          'columns': ['project', 'unit', 'value', 'paid', 'outstanding', 'paid_pct',
-                     'last_payment', 'mortgage'],
+                     'last_payment', 'mortgage']
+                    + (['shared'] if n_shared else []) + (['matched_by'] if n_phone else []),
          'rows': props, 'sum_columns': ['value', 'paid', 'outstanding']},
     ]
     if payments:
@@ -347,6 +365,7 @@ def build_properties(gateway: WarehouseGateway, cust_id: str, period: ResolvedPe
     return {
         'cust_id': cust_id, 'domain': 'Properties', 'preview': not live, 'period': period.to_dict(),
         'metrics': metrics, 'charts': charts, 'tables': tables,
+        'note': match_note, 'match_note': match_note,
     }
 
 

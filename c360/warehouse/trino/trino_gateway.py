@@ -2655,17 +2655,38 @@ class TrinoWarehouse(WarehouseGateway):
         if cid is None:
             return None
         nid_rows = self._t.execute(
-            "SELECT TRIM(customer_id_no) nid FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
-        nid = (nid_rows[0]['nid'] if nid_rows else None) or ''
+            "SELECT TRIM(customer_id_no) nid, primary_mobile_no mobile, mobile_tel2 alt "
+            "FROM delta.gold_db.dim_customer WHERE customer_id=? LIMIT 1", (cid,))
+        if not nid_rows:
+            return None
+        nid = nid_rows[0].get('nid') or ''
         # Guard against blank/placeholder national IDs matching many property clients.
         if len(nid) < 5 or not any(ch.isdigit() for ch in nid):
-            return None
+            nid = ''
         units = self._t.execute(
             "SELECT cp.unit_id, MAX(TRIM(cp.project_name)) project, MAX(TRIM(cp.unit_name)) unit, "
             "MAX(TRY_CAST(cp.unit_value AS double)) value, MAX(cp.perc_paid) paid "
             "FROM delta.gold_db.rpt_c360_customer_property cp "
             "WHERE TRIM(cp.client_idno) = ? AND cp.unit_id IS NOT NULL "
-            "GROUP BY cp.unit_id", (nid,))
+            "GROUP BY cp.unit_id", (nid,)) if nid else []
+        matched_by = 'national ID'
+        if not units:
+            # Second bridge, the same one the insurance panel uses: the phone on the
+            # property client record. On 2026-10-08 it reached 80 owners with a bank
+            # account that the ID alone did not (the ID is missing or typed
+            # differently on one side). Said on the panel as a phone match.
+            phone_key = (self._phone_key(nid_rows[0].get('mobile'))
+                         or self._phone_key(nid_rows[0].get('alt')))
+            if phone_key:
+                units = self._t.execute(
+                    "SELECT cp.unit_id, MAX(TRIM(cp.project_name)) project, MAX(TRIM(cp.unit_name)) unit, "
+                    "MAX(TRY_CAST(cp.unit_value AS double)) value, MAX(cp.perc_paid) paid "
+                    "FROM delta.gold_db.rpt_c360_customer_property cp "
+                    "WHERE cp.unit_id IS NOT NULL AND cp.client_id IN ("
+                    "  SELECT c.client_id FROM delta.gold_db.hfdi_client_data c "
+                    f"  WHERE {self._sql_phone_key('c.client_phone')} = ?) "
+                    "GROUP BY cp.unit_id", (phone_key,))
+                matched_by = 'phone'
         if not units:
             # No units for this national ID. Before saying "no properties", make sure the
             # source itself is populated — an empty/unreachable property table must surface
@@ -2673,7 +2694,7 @@ class TrinoWarehouse(WarehouseGateway):
             if not self._source_has_rows('delta.gold_db.rpt_c360_customer_property'):
                 raise LiveDataNotReady('property source (rpt_c360_customer_property) is empty or unreachable')
             return None
-        return self._properties_for_units(units)
+        return self._properties_for_units(units, matched_by=matched_by)
 
     def _property_units_by_client(self, client_id: int) -> list[dict[str, Any]]:
         """Units owned by one property-register client, deduped by unit_id.
@@ -2689,17 +2710,29 @@ class TrinoWarehouse(WarehouseGateway):
             "WHERE cp.client_id = ? AND cp.unit_id IS NOT NULL "
             "GROUP BY cp.unit_id", (float(client_id),))
 
-    def _properties_for_units(self, units: list[dict[str, Any]]) -> dict[str, Any] | None:
-        """Shape deduped unit rows into the properties payload, flagging mortgages."""
+    def _properties_for_units(self, units: list[dict[str, Any]], *,
+                              matched_by: str | None = None) -> dict[str, Any] | None:
+        """Shape deduped unit rows into the properties payload, flagging mortgages and
+        units the register also lists under another client."""
         if not units:
             return None
         unit_ids = [int(u['unit_id']) for u in units if u['unit_id'] is not None]
         mortgaged: set[int] = set()
+        owners: dict[int, int] = {}
         if unit_ids:
             inlist = ','.join(str(i) for i in unit_ids)
             mrows = self._t.execute(
                 f"SELECT DISTINCT unit_id FROM delta.gold_db.hfdi_mortgage_data WHERE unit_id IN ({inlist})")
             mortgaged = {int(r['unit_id']) for r in mrows if r['unit_id'] is not None}
+            # 385 of 9,774 units are listed under more than one client (2026-10-08),
+            # and the register cannot say which is current: none of those links is
+            # marked deleted, and the unit table's own holder never matches. So such a
+            # unit is shown, and said to be shared, rather than silently counted as
+            # wholly this customer's.
+            orows = self._t.execute(
+                "SELECT CAST(unit_id AS bigint) u, count(DISTINCT client_id) n "
+                f"FROM delta.gold_db.rpt_c360_customer_property WHERE unit_id IN ({inlist}) GROUP BY 1")
+            owners = {int(r['u']): int(r['n'] or 0) for r in orows if r.get('u') is not None}
         try:
             pay = self._property_payments(unit_ids)
         except Exception:
@@ -2708,7 +2741,9 @@ class TrinoWarehouse(WarehouseGateway):
         properties = []
         for u in units:
             uid = int(u['unit_id'])
-            value = round(float(u['value'] or 0))
+            # 22 units carry a value of 0 in the register: that is a value not stated,
+            # not a property worth nothing.
+            value = round(float(u['value'])) if u['value'] and float(u['value']) > 0 else None
             row = {
                 'unit_id': uid,
                 'unit': self._clean(u['unit']) or f'Unit {uid}',
@@ -2716,11 +2751,16 @@ class TrinoWarehouse(WarehouseGateway):
                 'value': value,
                 'mortgage': uid in mortgaged,
             }
+            if matched_by:
+                row['matched_by'] = matched_by
+            others = owners.get(uid, 1) - 1
+            if others > 0:
+                row['shared'] = f"{others} other client{'s' if others > 1 else ''}"
             got = (pay or {}).get('by_unit', {}).get(uid)
             if got and got['count']:
                 row['paid'] = got['paid']
-                row['outstanding'] = max(value - got['paid'], 0)
-                row['paid_pct'] = round(min(max(got['paid'] / value, 0.0), 1.0), 3) if value > 0 else None
+                row['outstanding'] = max(value - got['paid'], 0) if value else None
+                row['paid_pct'] = round(min(max(got['paid'] / value, 0.0), 1.0), 3) if value else None
                 row['last_payment'] = got['last']
                 row['payments'] = got['count']
             else:
@@ -2729,7 +2769,7 @@ class TrinoWarehouse(WarehouseGateway):
                 # the honest answer is "not known", not "0% paid".
                 row['paid_pct'] = None
             properties.append(row)
-        properties.sort(key=lambda p: p['value'], reverse=True)
+        properties.sort(key=lambda p: p['value'] or 0, reverse=True)
         return {'properties': properties,
                 'payments': (pay or {}).get('payments', []),
                 'payments_available': pay is not None,

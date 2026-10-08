@@ -64,7 +64,7 @@ def build_customer_overview(gateway: WarehouseGateway, cust_id: str, period: Res
         snapshots.append(_empty_snapshot('Whizz', 'whizz', 'No Whizz activity'))
 
     if props:
-        pv = sum(p['value'] for p in props['properties'])
+        pv = sum(p['value'] or 0 for p in props['properties'])
         pst = LIVE if data_mode() == 'live' else PREVIEW
         slices.append({'domain': 'Properties', 'value': pv, 'status': pst})
         snapshots.append({'domain': 'Properties', 'tab': 'properties', 'status': pst,
