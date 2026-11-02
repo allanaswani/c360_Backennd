@@ -175,10 +175,21 @@ def _revenue_metric(rev: dict | None) -> dict[str, Any]:
     if rev and rev.get('totals'):
         span = f"{_MONTHS[rev['first_month'] - 1]} to {_MONTHS[rev['last_month'] - 1]} {rev['year']}"
         t = rev['totals']
+        tr = rev.get('trend')
+        trend = ''
+        if tr:
+            q = (f"{_MONTHS[int(tr['recent_from'][5:7]) - 1]} to {_MONTHS[int(tr['recent_to'][5:7]) - 1]}")
+            p = (f"{_MONTHS[int(tr['prior_from'][5:7]) - 1]} to {_MONTHS[int(tr['prior_to'][5:7]) - 1]}")
+            if tr['direction'] == 'flat':
+                trend = (f' {q} earned KES {tr["recent"]:,}, steady against {p} '
+                         f'(KES {tr["prior"]:,}, {tr["change_pct"]:+}%).')
+            else:
+                trend = (f' {q} earned KES {tr["recent"]:,}, {tr["direction"]} '
+                         f'{abs(tr["change_pct"])}% on {p} (KES {tr["prior"]:,}).')
         return live(t['net'], unit='KES', note=(
             f'Net revenue, {span}: interest income KES {t["interest_income"]:,} plus fees and '
             f'commissions KES {t["nfi"]:,}, less interest paid to the customer KES '
-            f'{t["interest_expense"]:,}. Before operating costs.')).to_dict()
+            f'{t["interest_expense"]:,}. Before operating costs.{trend}')).to_dict()
     return to_source(unit='KES', note='No revenue on record for this customer this year.').to_dict()
 
 

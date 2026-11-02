@@ -305,6 +305,14 @@ class WarehouseGateway(abc.ABC):
         """How each loan was repaid over the window (c360/repayment.py)."""
         return None
 
+    def get_digital_loans(self, cust_id) -> dict[str, Any] | None:
+        """Every Whizz / digital loan, all programmes (c360/digital_loans.py)."""
+        return None
+
+    def get_alert_feed(self) -> dict[str, Any] | None:
+        """Book-wide rows for the RM alerts (c360/alerts.py); None when not wired."""
+        return None
+
     def get_timeline(self, cust_id) -> dict[str, Any] | None:
         """The relationship over time (c360/timeline.py)."""
         return None

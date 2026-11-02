@@ -39,3 +39,7 @@ lightgbm==4.7.0
 scikit-learn==1.9.0
 pandas==3.0.5
 numpy==2.5.1
+
+# Ask C360 (c360/assistant.py) - Anthropic's official SDK. Imported only when
+# C360_ASSISTANT_ENABLED is on; the rest of the app never touches it.
+anthropic==2.3.0

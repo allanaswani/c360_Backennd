@@ -23,10 +23,12 @@ from ..services.domains import DOMAIN_BUILDERS
 from ..services.hfcb import build_hfcb_domain
 from ..services.overview import build_customer_overview
 from ..services.portfolio import build_portfolio_overview
+from ..services import alerts as alerts_service
 from ..services import (portfolio_cache, tabcache, property_clients as pc_service,
                         insurance_clients as ic_service)
 from .. import property_register as prop_reg
 from .. import brand
+from .. import assistant
 from ..warehouse.factory import data_mode, get_gateway
 from ..warehouse.periods import PRESETS, resolve_period
 
@@ -404,6 +406,30 @@ class RecommendationsView(APIView):
             lambda: recommend_for_customer(gateway, cust_id, limit=limit, customer=raw).to_dict()))
 
 
+class CustomerAskView(APIView):
+    """Ask C360 (c360/assistant.py). GET says whether it is switched on; POST
+    {question} answers from this customer's record. Same scope check as the 360."""
+
+    def get(self, request: Request, cust_id: str):
+        return Response({'enabled': assistant.enabled()})
+
+    def post(self, request: Request, cust_id: str):
+        if not assistant.enabled():
+            return Response({'enabled': False, 'error': 'Ask C360 is not switched on for this bank yet.'})
+        gateway = get_gateway()
+        scope = resolve_scope(request)
+        raw, hidden = _resolve_or_hide(gateway, scope, cust_id)
+        if hidden:
+            return hidden
+        if not customer_visible(scope, raw):
+            return Response({'error': {'status': 403, 'detail': 'Outside your book.'}},
+                            status=status.HTTP_403_FORBIDDEN)
+        from ..services.insights import build_customer_insights
+        insights = build_customer_insights(gateway, cust_id, raw)
+        out = assistant.ask(raw, insights, str((request.data or {}).get('question') or ''))
+        return Response({'enabled': True, 'as_of': insights.get('as_of'), **out})
+
+
 class PortfolioOverviewView(APIView):
     """Level 1 — portfolio overview. Served through the precompute cache so the
     whole-book aggregation never runs live on every request (architecture §6)."""
@@ -498,6 +524,28 @@ class MaturitiesView(APIView):
             return Response({'results': [], 'unavailable': True,
                              'detail': 'The deposit book could not be read just now.'})
         return Response({**payload, 'cache': cache_meta})
+
+
+class AlertsView(APIView):
+    """New arrears, sharp deposit falls and maturities in the caller's own book, the
+    same lens as My book: the profile's sales code, or the whole book for management
+    without one. (A signed-in RM can open any 360, so the view scope is not the book.)
+    Read book-wide once an hour; see c360/alerts.py."""
+
+    def get(self, request: Request):
+        scope = resolve_scope(request)
+        sales_code = _acting_sales_code(request)
+        whole = scope.can_view_portfolio() and not sales_code
+        if not whole and not sales_code:
+            return Response({'available': False,
+                             'detail': 'No sales code on your profile yet. Ask an admin to set one so your alerts can load.'})
+        codes = None if whole else [c.strip() for c in sales_code.split(',') if c.strip()]
+        try:
+            payload, cache_meta = alerts_service.book_alerts(get_gateway())
+        except Exception:                                   # noqa: BLE001
+            return Response({'available': False,
+                             'detail': 'The loan and deposit books could not be read just now. Try again shortly.'})
+        return Response({**alerts_service.in_book(payload, codes), 'cache': cache_meta})
 
 
 def _acting_sales_code(request) -> str | None:

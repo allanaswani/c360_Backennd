@@ -84,6 +84,61 @@ _MOBILE_NOTE = ('Each mobile loan is approved separately, so these are the amoun
                 'Whizz system and is not in the warehouse.')
 
 
+def _digital_loans(gateway: WarehouseGateway, cust_id: str) -> dict | None:
+    """Every digital loan, all programmes (c360/digital_loans.py), or None. Preferred
+    over the agreement history, which misses the Mwanabiashara loans."""
+    try:
+        return gateway.get_digital_loans(cust_id)
+    except Exception:
+        return None
+
+
+_DIGITAL_NOTE = ('Every loan taken through Whizz, all programmes, from the loan register. The fee is '
+                 'the commission charged when the loan was paid out. Amounts are what was borrowed, '
+                 'not the limit: the Whizz eligibility limit is held in the Whizz system and is not '
+                 'in the warehouse.')
+
+
+def _digital_sections(dig: dict, st: str) -> tuple[list, list, list]:
+    yr = dig['last_12m']
+    latest, largest = dig['latest'], dig['largest']
+    metrics = [
+        _metric('Digital loans taken', dig['loans_taken'], 'count', status=st,
+                meta=f"Since {dig['first_opened'][:4]}, {yr['loans']} in the last 12 months"),
+        _metric('Latest loan', latest['amount'], 'KES', status=st,
+                meta=f"{latest['programme']}, {latest['opened']}"),
+        _metric('Largest loan', largest['amount'], 'KES', status=st,
+                meta=f"{largest['programme']}, {largest['opened']}"),
+        _metric('Fees charged, 12 months', yr['fees'], 'KES', status=st,
+                meta=f"KES {dig['fees_total']:,} since {dig['first_opened'][:4]}"),
+    ]
+    chrono = list(reversed(dig['loans']))
+    charts = []
+    if len(chrono) >= 2:
+        charts.append({'kind': 'lines', 'id': 'mobile_loans', 'title': 'Amount borrowed per digital loan',
+                       'question': 'Are they borrowing more, or less, each time?', 'status': st,
+                       'fmt': 'kes', 'note': _DIGITAL_NOTE,
+                       'series': [{'name': 'Borrowed', 'dataKey': 'amount', 'colorRole': 1}],
+                       'data': [{'period': x['opened'], 'amount': x['amount']} for x in chrono]})
+    rows = [{'date': x['opened'], 'product': x['programme'], 'account_no': x['account_no'],
+             'amount': x['amount'], 'fee': x['fee'], 'due': x['due']} for x in dig['loans']]
+    title = (f"Digital loans (latest {dig['listed']} of {dig['loans_taken']})"
+             if dig['listed'] < dig['loans_taken'] else 'Digital loans (latest first)')
+    tables = [{'id': 'mobile_loans', 'title': title, 'status': st, 'note': _DIGITAL_NOTE,
+               'columns': ['date', 'product', 'account_no', 'amount', 'fee', 'due'], 'rows': rows}]
+    return metrics, charts, tables
+
+
+def _loan_sections(gateway: WarehouseGateway, cust_id: str, st: str) -> tuple[list, list, list] | None:
+    """The Whizz tab's loan sections: the full digital-loan register when it answers,
+    else the agreement history, else None."""
+    dig = _digital_loans(gateway, cust_id)
+    if dig:
+        return _digital_sections(dig, st)
+    mob = _mobile_loans(gateway, cust_id)
+    return _mobile_sections(mob, st) if mob else None
+
+
 def _mobile_sections(mob: dict, st: str) -> tuple[list, list, list]:
     metrics = [
         _metric('Mobile loans taken', mob['loans_taken'], 'count', status=st,
@@ -137,19 +192,19 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
         return None
     live = data_mode() == 'live'
     st = LIVE if live else PREVIEW
-    mob = _mobile_loans(gateway, cust_id)
+    loans = _loan_sections(gateway, cust_id, st)
     try:
         data = gateway.get_whizz(cust_id, period)
     except Exception:
-        if mob:
-            m, c, t = _mobile_sections(mob, st)
+        if loans:
+            m, c, t = loans
             return {'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
                     'metrics': m, 'charts': c, 'tables': t,
                     'note': 'Whizz transactions could not be loaded right now; mobile loans are shown.'}
         return _unavailable(cust_id, 'Whizz')
     if data is None:
-        if mob:
-            m, c, t = _mobile_sections(mob, st)
+        if loans:
+            m, c, t = loans
             return {'cust_id': cust_id, 'domain': 'Whizz', 'preview': not live, 'period': period.to_dict(),
                     'metrics': m, 'charts': c, 'tables': t,
                     'note': 'No Whizz / M-Pesa transactions in the selected period.'}
@@ -222,8 +277,8 @@ def build_whizz(gateway: WarehouseGateway, cust_id: str, period: ResolvedPeriod)
              'flow': directional},
         ],
     }
-    if mob:
-        m, c, t = _mobile_sections(mob, st)
+    if loans:
+        m, c, t = loans
         payload['metrics'] += m
         payload['charts'] += c
         payload['tables'] += t

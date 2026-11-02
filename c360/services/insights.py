@@ -11,7 +11,8 @@ must never read as "has none". Every block therefore carries a status:
 Blocks: products (current / savings / fixed deposit … and loan types), cashflow
 (money in and out by month and source), loans (instalments, arrears, maturity and
 the standing order that pays each), repayments (how each loan was paid over twelve
-months, late instalments included), facilities
+months, late instalments included), digital loans (every Whizz loan, all
+programmes, with the fee charged), facilities
 (sanctioned limit vs outstanding, plus the mobile-loan history), activity (90 days of
 transactions by purpose and the opportunities they point to), profile (AML risk,
 income band, … and cards) and revenue (what the bank earned this year).
@@ -169,6 +170,7 @@ def build_customer_insights(gateway: WarehouseGateway, cust_id: str,
         'cashflow': gateway.get_cash_flow,
         'loans': gateway.get_loan_details,
         'repayments': gateway.get_repayment_history,
+        'digital_loans': gateway.get_digital_loans,
     }
     futures = {k: _POOL.submit(_block, fn, cust_id) for k, fn in reads.items()}
     card_future = _POOL.submit(_card, gateway, cust_id)
@@ -187,6 +189,7 @@ def build_customer_insights(gateway: WarehouseGateway, cust_id: str,
         'cashflow': got['cashflow'],
         'loans': got['loans'],
         'repayments': got['repayments'],
+        'digital_loans': got['digital_loans'],
     }
     # A product mix with nothing in it is "none", not an empty "live" block.
     if products['status'] == 'live' and not (products['data']['deposits'] or products['data']['loans']):
@@ -194,7 +197,7 @@ def build_customer_insights(gateway: WarehouseGateway, cust_id: str,
     # Only cache an answer that was actually read; a failed block should be retried.
     if all(out[b]['status'] != 'unavailable' for b in
            ('products', 'facilities', 'activity', 'profile', 'revenue', 'cashflow', 'loans',
-            'repayments')):
+            'repayments', 'digital_loans')):
         _store(key, out)
     return out
 

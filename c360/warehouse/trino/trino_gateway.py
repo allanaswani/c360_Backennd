@@ -44,6 +44,8 @@ from ... import crm as crm_shape
 from ... import property_register as prop_reg
 from ... import lending as lending_shape
 from ... import repayment as repayment_shape
+from ... import alerts as alerts_shape
+from ... import digital_loans as digital_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
 from .. import rm_balances as rm_bal
@@ -4287,7 +4289,69 @@ class TrinoWarehouse(WarehouseGateway):
         year = max(years) if years else self.as_of_date().year
         return profile_shape.revenue(
             [{'month': r.get('m'), 'category': r.get('c'), 'value': r.get('v')}
-             for r in rows if r.get('y') is None or int(r['y']) == year], year=year)
+             for r in rows if r.get('y') is None or int(r['y']) == year], year=year,
+            loaded_through=self._revenue_loaded_through())
+
+    # --- digital (Whizz) loans, every programme (c360/digital_loans.py) -------
+    _PROGRAMME_TTL_SECONDS = 24 * 3600
+
+    def _digital_programmes(self) -> dict[int, str]:
+        """Programme id -> product name, read from the loans on today's book (memoised
+        a day). 1:1 on 2026-11-02; a programme with no loan on the book is unnamed."""
+        now = time.monotonic()
+        hit = getattr(self, '_dig_progs', None)
+        if hit is not None and now - hit[0] < self._PROGRAMME_TTL_SECONDS:
+            return hit[1]
+        rows = self._t.execute(
+            f"SELECT CAST(i.loans_program_id AS integer) p, TRIM(e.product_desc) d, count(*) n "
+            f"FROM delta.gold_db.lns_instant_loans i JOIN delta.gold_db.eom_loans e "
+            f"ON split_part(TRIM(e.account_no), '-', 1) = TRIM(i.loan_account) "
+            f"WHERE e.eom_date = {self._loan_lit()} {self._loan_part('e.')} GROUP BY 1, 2")
+        best: dict[int, tuple[int, str]] = {}
+        for r in rows:
+            p, n = r.get('p'), int(r.get('n') or 0)
+            if p is not None and (int(p) not in best or n > best[int(p)][0]):
+                best[int(p)] = (n, r.get('d'))
+        names = {p: d for p, (_, d) in best.items()}
+        self._dig_progs = (now, names)
+        return names
+
+    def get_digital_loans(self, cust_id):
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        rows = self._t.execute(
+            "SELECT TRIM(loan_account) acc, CAST(acc_open_dt AS varchar) od, CAST(acc_exp_dt AS varchar) ed, "
+            "instant_loan_amount amt, loan_commission fee, CAST(loans_program_id AS integer) p "
+            "FROM delta.gold_db.lns_instant_loans WHERE cust_id = ?", (cid,))
+        if not rows:
+            return None
+        try:
+            names = self._digital_programmes()
+        except Exception:                                      # noqa: BLE001
+            names = {}                                         # loans still listed, by programme number
+        return digital_shape.build(
+            [{'account_no': r.get('acc'), 'opened': self._safe_date(r.get('od')), 'due': self._safe_date(r.get('ed')),
+              'amount': r.get('amt'), 'fee': r.get('fee'), 'programme': r.get('p')} for r in rows],
+            names, as_of=self.as_of_date().isoformat())
+
+    _REVENUE_TTL_SECONDS = 1800
+
+    def _revenue_loaded_through(self) -> str | None:
+        """Latest date in the revenue table (memoised), so the trend only compares
+        complete months. None when it cannot be read; the trend is then left out."""
+        now = time.monotonic()
+        hit = getattr(self, '_rev_through', None)
+        if hit is not None and now - hit[0] < self._REVENUE_TTL_SECONDS:
+            return hit[1]
+        try:
+            rows = self._t.execute(
+                "SELECT CAST(max(month_name) AS varchar) d FROM delta.gold_db.rpt_ceo_all_revenue_trend")
+            d = self._safe_date(rows[0].get('d')) if rows else None
+        except Exception:                                      # noqa: BLE001
+            return None
+        self._rev_through = (now, d)
+        return d
 
     # --- whole-book activity prospects (management worklist) ------------------
     def activity_prospects(self, limit_per_rule: int = 40) -> dict[str, Any]:
@@ -4791,6 +4855,76 @@ class TrinoWarehouse(WarehouseGateway):
             'past_due_count': past_n, 'past_due_value': round(past_v),
             'results': shown,
         }
+
+    # --- RM alerts: new arrears, sharp deposit falls, maturities (c360/alerts.py) ---
+    def get_alert_feed(self):
+        """Book-wide rows for the three alert events, staff and internal accounts
+        dropped, each customer stamped with their current RM. Three partition-pruned
+        scans, each under a second on 2026-11-02."""
+        L, A = self.loan_as_of(), self.as_of_date()
+        who = ("dc.full_name, dc.customer_segment, dc.account_branch_name, "
+               "dc.employer, dc.fk_bankemployeeid")
+        arrears = self._t.execute(f"""
+            SELECT CAST(e.cust_id AS BIGINT) cid, TRIM(e.account_no) acc, TRIM(e.product_desc) prod,
+                   e.overdue_days od, e.ov_balance * e.fixing_rate ov, e.book_balance * e.fixing_rate bal, {who}
+            FROM delta.gold_db.eom_loans e
+            JOIN delta.gold_db.dim_customer dc ON dc.customer_id = e.cust_id
+            WHERE e.eom_date = {self._date_lit(L)} {self._loan_part('e.')}
+              AND e.overdue_days BETWEEN 1 AND {alerts_shape.ARREARS_MAX_DAYS}
+              AND dc.customer_segment <> 'INTERNAL ACCOUNTS'""")
+        # The deposit snapshot nearest to 30 days back (a weekend has none).
+        prev = A - timedelta(days=alerts_shape.DROP_WINDOW_DAYS)
+        lo = prev - timedelta(days=7)
+        got = self._t.execute(
+            f"SELECT CAST(max(eom_date) AS varchar) d FROM delta.gold_db.eom_deposits "
+            f"WHERE eom_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(prev)} {self._range_part(lo, prev)}")
+        before_on = self._safe_date(got[0].get('d')) if got else None
+        drops = []
+        if before_on:
+            b = date.fromisoformat(before_on)
+            drops = self._t.execute(f"""
+                WITH a AS (SELECT cust_id, SUM(euro_book_bal) v FROM delta.gold_db.eom_deposits
+                           WHERE eom_date = {self._date_lit(b)} {self._range_part(b, b)} GROUP BY 1),
+                     n AS (SELECT cust_id, SUM(euro_book_bal) v FROM delta.gold_db.eom_deposits
+                           WHERE eom_date = {self._as_of_lit()} {self._asof_part()} GROUP BY 1)
+                SELECT CAST(a.cust_id AS BIGINT) cid, a.v before, COALESCE(n.v, 0) after, {who}
+                FROM a LEFT JOIN n ON n.cust_id = a.cust_id
+                JOIN delta.gold_db.dim_customer dc ON dc.customer_id = a.cust_id
+                WHERE a.v >= {alerts_shape.DROP_MIN_BEFORE}
+                  AND COALESCE(n.v, 0) <= a.v * {alerts_shape.DROP_MIN_SHARE}
+                  AND dc.customer_segment <> 'INTERNAL ACCOUNTS'""")
+
+        def keep(r):
+            return not is_staff_from_fields(employer=r.get('employer'), segment=r.get('customer_segment'),
+                                            bank_employee_id=r.get('fk_bankemployeeid'))
+
+        def ident(r):
+            return {'cust_id': str(r['cid']), 'name': self._clean(r.get('full_name')),
+                    'segment': self._seg_label(r.get('customer_segment')),
+                    'branch': self._clean(r.get('account_branch_name'))}
+
+        arrears = [{**ident(r), 'account_no': self._clean(r.get('acc')), 'product': self._clean(r.get('prod')),
+                    'od': int(r.get('od') or 0), 'overdue': float(r.get('ov') or 0),
+                    'balance': float(r.get('bal') or 0)} for r in arrears if keep(r)]
+        drops = [{**ident(r), 'before': float(r.get('before') or 0), 'after': float(r.get('after') or 0),
+                  'before_on': before_on} for r in drops if keep(r)]
+        mat = (self.td_maturities(alerts_shape.MATURITY_DAYS, limit=100_000) or {}).get('results') or []
+        ids = list(dict.fromkeys(r['cust_id'] for r in arrears + drops + mat))
+        # Same RM rule as every other screen (_aggregate_customers): the current
+        # allocation, else the account-opening officer, so an RM's alerts are exactly
+        # the customers C360 already shows as theirs.
+        rm = self._current_rm_chunked(ids)
+        missing = [i for i in ids if not (rm.get(i) or {}).get('code')]
+        for i in range(0, len(missing), 1000):
+            chunk = ','.join(str(int(c)) for c in missing[i:i + 1000])
+            for r in self._t.execute(
+                    f"SELECT CAST(customer_id AS BIGINT) id, created_emp_id, created_emp_name "
+                    f"FROM delta.gold_db.dim_customer WHERE customer_id IN ({chunk})"):
+                code = self._officer_id(r.get('created_emp_id'))
+                if code:
+                    rm[str(r['id'])] = {'code': code, 'name': self._officer_name(r.get('created_emp_name'))}
+        return {'loan_as_of': L.isoformat(), 'deposit_as_of': A.isoformat(),
+                'arrears': arrears, 'drops': drops, 'maturities': mat, 'rm': rm}
 
     def _current_rm_chunked(self, ids, size: int = 2000):
         out = {}

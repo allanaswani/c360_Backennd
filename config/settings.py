@@ -325,6 +325,15 @@ C360_ALERT_DATA_STALE_DAYS = int(os.environ.get('C360_ALERT_DATA_STALE_DAYS', '3
 C360_ALERT_RENOTIFY_MINUTES = int(os.environ.get('C360_ALERT_RENOTIFY_MINUTES', '360'))
 
 # ---------------------------------------------------------------------------
+# Ask C360 (c360/assistant.py) — plain-English answers about one customer, from that
+# customer's record only. OFF unless switched on: it sends the record to Anthropic's
+# API, so it waits for IT Risk sign-off. The SDK reads its key from ANTHROPIC_API_KEY
+# in the server env file; nothing here holds or logs it.
+# ---------------------------------------------------------------------------
+C360_ASSISTANT_ENABLED = _env_bool('C360_ASSISTANT_ENABLED', False)
+C360_ASSISTANT_MODEL = os.environ.get('C360_ASSISTANT_MODEL', 'claude-opus-5-5')
+
+# ---------------------------------------------------------------------------
 # CORS — the Next.js dev server talks to this API cross-origin.
 # ---------------------------------------------------------------------------
 CORS_ALLOWED_ORIGINS = [

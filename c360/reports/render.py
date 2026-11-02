@@ -32,7 +32,8 @@ def _e(value) -> str:
 
 
 def shell(title: str, preheader: str, blocks: Iterable[str], app_url: str,
-          footer_note: str = '') -> str:
+          footer_note: str = '', cta_path: str = '/admin/observability',
+          cta_label: str = 'Open the dashboard') -> str:
     """Wrap rendered blocks in the branded email frame."""
     body = '\n'.join(blocks)
     return f"""<!doctype html>
@@ -52,9 +53,9 @@ def shell(title: str, preheader: str, blocks: Iterable[str], app_url: str,
   </td></tr>
   <tr><td style="padding:20px 24px 8px;">{body}</td></tr>
   <tr><td style="padding:8px 24px 22px;">
-    <a href="{_e(app_url)}/admin/observability"
+    <a href="{_e(app_url)}{_e(cta_path)}"
        style="display:inline-block;background:{TEAL};color:#ffffff;text-decoration:none;
-              font-size:13px;font-weight:600;padding:10px 18px;border-radius:8px;">Open the dashboard</a>
+              font-size:13px;font-weight:600;padding:10px 18px;border-radius:8px;">{_e(cta_label)}</a>
   </td></tr>
   <tr><td style="border-top:1px solid {HAIRLINE};padding:14px 24px;background:{CANVAS};">
     <div style="font-size:11px;color:{MUTED};line-height:1.55;">

@@ -23,6 +23,7 @@ Pure - no SQL.
 """
 from __future__ import annotations
 
+from datetime import date, timedelta
 from typing import Any
 
 # Values that mean "not captured", never shown as a fact.
@@ -85,8 +86,44 @@ _REV_KEYS = {'Interest_Income': 'interest_income', 'NFI': 'nfi',
              'Interest_Expenses': 'interest_expense'}
 
 
-def revenue(rows: list[dict], *, year: int) -> dict[str, Any] | None:
-    """``rows``: {month (int), category, value}. None when there is nothing on record."""
+#: Recent quarter vs the one before: a move inside this band is "steady".
+TREND_FLAT_PCT = 5
+
+
+def revenue_trend(series: list[dict], *, year: int, loaded_through: str | None) -> dict[str, Any] | None:
+    """Net revenue over the last three complete months against the three before.
+
+    A month counts as complete once the revenue table is loaded past it (to its last
+    day, or into a later month), so a part-loaded month never reads as a fall. Missing
+    months inside the window count as zero: no revenue was booked. None when the year
+    does not yet hold six complete months, or the earlier quarter earned nothing."""
+    if not loaded_through:
+        return None
+    through = date.fromisoformat(loaded_through[:10])
+    if through.year > year:
+        last = 12
+    elif through.year < year:
+        return None
+    else:
+        month_end = (date(year, through.month % 12 + 1, 1) if through.month < 12 else date(year + 1, 1, 1)) - timedelta(days=1)
+        last = through.month if through >= month_end else through.month - 1
+    if last < 6:
+        return None
+    net = {int(p['period'][5:7]): p['net'] for p in series}
+    recent_m, prior_m = list(range(last - 2, last + 1)), list(range(last - 5, last - 2))
+    recent, prior = sum(net.get(m, 0) for m in recent_m), sum(net.get(m, 0) for m in prior_m)
+    if prior <= 0:
+        return None
+    pct = round((recent - prior) / prior * 100, 1)
+    return {'recent': recent, 'prior': prior, 'change_pct': pct,
+            'direction': 'flat' if abs(pct) < TREND_FLAT_PCT else ('up' if pct > 0 else 'down'),
+            'recent_from': f'{year}-{recent_m[0]:02d}-01', 'recent_to': f'{year}-{recent_m[-1]:02d}-01',
+            'prior_from': f'{year}-{prior_m[0]:02d}-01', 'prior_to': f'{year}-{prior_m[-1]:02d}-01'}
+
+
+def revenue(rows: list[dict], *, year: int, loaded_through: str | None = None) -> dict[str, Any] | None:
+    """``rows``: {month (int), category, value}. None when there is nothing on record.
+    ``loaded_through``: the revenue table's latest date, for the quarter-on-quarter trend."""
     months: dict[int, dict[str, float]] = {}
     for r in rows or []:
         key = _REV_KEYS.get(str(r.get('category') or '').strip())
@@ -107,4 +144,5 @@ def revenue(rows: list[dict], *, year: int) -> dict[str, Any] | None:
                        'net': round(s['interest_income'] + s['nfi'] - s['interest_expense'])})
     tot = {k: sum(p[k] for p in series) for k in ('interest_income', 'nfi', 'interest_expense', 'net')}
     return {'year': year, 'first_month': min(months), 'last_month': max(months),
-            'months': series, 'totals': tot}
+            'months': series, 'totals': tot,
+            'trend': revenue_trend(series, year=year, loaded_through=loaded_through)}
