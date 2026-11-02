@@ -301,6 +301,10 @@ class WarehouseGateway(abc.ABC):
         """Instalments, arrears, maturity and standing-order payment per live loan."""
         return None
 
+    def get_repayment_history(self, cust_id, months: int = 12) -> dict[str, Any] | None:
+        """How each loan was repaid over the window (c360/repayment.py)."""
+        return None
+
     def get_timeline(self, cust_id) -> dict[str, Any] | None:
         """The relationship over time (c360/timeline.py)."""
         return None

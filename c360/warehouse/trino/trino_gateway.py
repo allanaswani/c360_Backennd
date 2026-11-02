@@ -43,6 +43,7 @@ from ... import brand
 from ... import crm as crm_shape
 from ... import property_register as prop_reg
 from ... import lending as lending_shape
+from ... import repayment as repayment_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
 from .. import rm_balances as rm_bal
@@ -4545,6 +4546,40 @@ class TrinoWarehouse(WarehouseGateway):
                 'paid_by_standing_order': paid_by,
             })
         return {'loans': out, 'as_of': self.loan_as_of().isoformat()}
+
+    # --- repayment track record: every loan's daily book rows, 12 months ---------
+    def get_repayment_history(self, cust_id, months: int = 12):
+        """How each loan was paid over the last ``months``: payments, late instalments
+        and overlapping loans (c360/repayment.py). Closed loans included. None when the
+        customer had no loan on the book in the window."""
+        cid = self._cid(cust_id)
+        if cid is None:
+            return None
+        hi = self.loan_as_of()
+        lo = self._months_ago(months - 1)
+        # book_balance, not lc_gross_total: the latter dropped to 0 for one day on a live
+        # loan (8851, 14 Sep 2026) and came back, which read as a full repayment.
+        rows = self._t.execute(
+            f"SELECT CAST(e.acc_sn AS bigint) k, TRIM(e.account_no) acc, TRIM(e.product_desc) product, "
+            f"CAST(e.eom_date AS varchar) d, e.book_balance * e.fixing_rate bal, e.ov_balance * e.fixing_rate ov, "
+            f"e.overdue_days od, e.drawdown_fst_amn * e.fixing_rate amt "
+            f"FROM delta.gold_db.eom_loans e "
+            f"WHERE e.cust_id = ? {self._range_part(lo, hi)} "
+            f"AND e.eom_date BETWEEN {self._date_lit(lo)} AND {self._date_lit(hi)}", (cid,))
+        if not rows:
+            return None
+        reg = self._t.execute(
+            "SELECT CAST(acc_sn AS bigint) k, CAST(acc_open_dt AS varchar) opened, "
+            "CAST(acc_exp_dt AS varchar) matures, TRIM(account_type_account_status) status, "
+            "CAST(last_trx_date AS varchar) last_trx, TRIM(loan_product_name) product "
+            "FROM delta.gold_db.loan_account WHERE customer_id = ?", (cid,))
+        return repayment_shape.build(
+            [{'key': f"{r.get('k')}|{r.get('product')}", 'account_no': r.get('acc'), 'product': r.get('product'),
+              'd': r.get('d'), 'bal': r.get('bal'), 'ov': r.get('ov'), 'od': r.get('od'),
+              'amount': r.get('amt')} for r in rows],
+            # acc_sn is a serial per product, so the product name makes it unique.
+            {f"{r.get('k')}|{r.get('product')}": r for r in reg},
+            start=lo.isoformat(), end=hi.isoformat())
 
     # --- relationship timeline (full registers, closed accounts included) -------
     def get_timeline(self, cust_id):
