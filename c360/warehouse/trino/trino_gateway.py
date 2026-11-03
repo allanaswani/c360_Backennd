@@ -49,6 +49,7 @@ from ... import digital_loans as digital_shape
 from ... import retention as retention_derive
 from ... import relationships as rel_shape
 from .. import rm_balances as rm_bal
+from .. import book_rules
 from ... import insurance_register as ins_reg
 from ... import risk as risk_derive
 from ...rbac.staff import is_staff_from_fields
@@ -1338,6 +1339,30 @@ class TrinoWarehouse(WarehouseGateway):
         return f" AND {col} NOT IN ({','.join(str(i) for i in ids)}) "
 
     @staticmethod
+    def _dep_book_filter(alias: str = '') -> str:
+        """Deposit rows that count toward the book total (ETL: no DFS, no custodial)."""
+        prods = ','.join(str(x) for x in book_rules.DEP_EXCLUDED_PRODUCTS)
+        accs = ','.join(f"'{a}'" for a in book_rules.DEP_EXCLUDED_ACCOUNTS)
+        # COALESCE: a NULL product or account must stay in (NOT IN on NULL drops the row).
+        return (f" AND COALESCE(TRY_CAST({alias}id_product AS integer), -1) NOT IN ({prods}) "
+                f" AND COALESCE(TRIM({alias}account_no), '') NOT IN ({accs}) ")
+
+    @staticmethod
+    def _cash_margin_join(day: date, alias: str = 'e') -> str:
+        """LEFT JOIN adding the ETL's cash margins on ``day`` as ``cm.amt``."""
+        m = book_rules.cash_margins_on(day)
+        if not m:
+            return f"LEFT JOIN (SELECT CAST(NULL AS varchar) acc, 0e0 amt) cm ON FALSE"
+        rows = ','.join(f"('{a}', {v!r}e0)" for a, v in sorted(m.items()))
+        return f"LEFT JOIN (VALUES {rows}) AS cm(acc, amt) ON cm.acc = TRIM({alias}.account_no)"
+
+    @staticmethod
+    def _loan_book_filter(alias: str = '') -> str:
+        """Loan rows that count toward the book total (ETL: gross > 0, no auction shortfalls)."""
+        ids = ','.join(str(i) for i in book_rules.LOAN_EXCLUDED_CUSTOMERS)
+        return f" AND {alias}lc_gross_total > 0 AND {alias}cust_id NOT IN ({ids}) "
+
+    @staticmethod
     def _seg_label(raw: Any) -> str:
         """Display label for a segment; 'UNKNOWN'/blank → 'Unsegmented' (these are
         real customers with no segment assigned, not a distinct real segment)."""
@@ -2320,15 +2345,27 @@ class TrinoWarehouse(WarehouseGateway):
             return self._wb_asof
         d, p = self._as_of_lit(), self._asof_part()
 
-        excl = f" AND dc.customer_segment <> '{self._INTERNAL_SEGMENT}' "
+        # Book totals use the bank's own ETL definition (book_rules, copied from the
+        # daily balance queries): deposits exclude DFS products and custodial accounts
+        # and add the ETL's cash margins; loans count LC_GROSS_TOTAL > 0 and exclude
+        # auction-shortfall customers. Loans read their own snapshot date. LEFT JOIN so
+        # an account whose customer is missing from dim_customer still counts.
         dep_seg = self._t.execute(
-            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.euro_book_bal) v "
-            f"FROM delta.gold_db.eom_deposits e JOIN delta.gold_db.dim_customer dc "
-            f"ON dc.customer_id = e.cust_id WHERE e.eom_date={d} {p} {excl} GROUP BY dc.customer_segment", ())
+            f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, "
+            f"SUM(e.euro_book_bal + COALESCE(cm.amt, 0)) v "
+            f"FROM delta.gold_db.eom_deposits e "
+            f"LEFT JOIN delta.gold_db.dim_customer dc ON dc.customer_id = e.cust_id "
+            f"{self._cash_margin_join(self.as_of_date())} "
+            f"WHERE e.eom_date={d} {p.replace('partition_', 'e.partition_')} "
+            f"{self._not_internal_cid('e.cust_id')} {self._dep_book_filter('e.')} "
+            f"GROUP BY dc.customer_segment", ())
         loan_seg = self._t.execute(
             f"SELECT dc.customer_segment seg, COUNT(DISTINCT e.cust_id) n, SUM(e.lc_gross_total) v "
-            f"FROM delta.gold_db.eom_loans e JOIN delta.gold_db.dim_customer dc "
-            f"ON dc.customer_id = e.cust_id WHERE e.eom_date={d} {p} {excl} GROUP BY dc.customer_segment", ())
+            f"FROM delta.gold_db.eom_loans e "
+            f"LEFT JOIN delta.gold_db.dim_customer dc ON dc.customer_id = e.cust_id "
+            f"WHERE e.eom_date={self._loan_lit()} {self._loan_part('e.')} "
+            f"{self._not_internal_cid('e.cust_id')} {self._loan_book_filter('e.')} "
+            f"GROUP BY dc.customer_segment", ())
 
         seg: dict[str, dict] = {}
         for r in dep_seg:
