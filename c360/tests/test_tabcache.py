@@ -40,3 +40,28 @@ class TabCacheTests(SimpleTestCase):
             tabcache.get_or_build(k, mock.Mock(side_effect=RuntimeError('down')))
         self.assertIsNone(tabcache.get_or_build(k, lambda: None))
         self.assertEqual(tabcache.get_or_build(k, self.build), {'n': 1})
+
+
+class SingleBuildTests(SimpleTestCase):
+    def setUp(self):
+        tabcache.clear()
+
+    def test_concurrent_misses_build_once(self):
+        import threading
+        import time as _t
+        calls = []
+
+        def slow():
+            calls.append(1)
+            _t.sleep(0.2)
+            return {'n': len(calls)}
+        k = tabcache.key('recs', '1', '2026-11-03')
+        out = []
+        threads = [threading.Thread(target=lambda: out.append(tabcache.get_or_build(k, slow))) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out, [{'n': 1}] * 5)
+        self.assertEqual(tabcache._building, {})

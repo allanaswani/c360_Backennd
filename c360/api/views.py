@@ -441,9 +441,12 @@ class PortfolioOverviewView(APIView):
             return Response({'error': {'status': 403, 'detail': 'No book allocated to this user.'}},
                             status=status.HTTP_403_FORBIDDEN)
         period = _period_from_request(request, gateway)
-        key = f'overview:{portfolio_cache.scope_key(scope.sales_codes)}:{period.token}:{period.start}:{period.end}:{data_mode()}'
+        # Keyed by the warehouse date, so a new day's load is a new entry; within a day the
+        # figures only move with RM re-allocations, so half an hour is fresh enough.
+        key = (f'overview:{portfolio_cache.scope_key(scope.sales_codes)}:{period.token}:{period.start}:{period.end}:'
+               f'{data_mode()}:{gateway.as_of_date().isoformat()}')
         payload, cache_meta = portfolio_cache.get_or_build(
-            key, lambda: build_portfolio_overview(gateway, scope.sales_codes, period)
+            key, lambda: build_portfolio_overview(gateway, scope.sales_codes, period), ttl=1800
         )
         return Response({**payload, 'scope': {**payload['scope'], 'role': scope.role}, 'cache': cache_meta})
 
@@ -466,12 +469,14 @@ class WorklistView(APIView):
         max_customers = 60 if data_mode() == 'live' else None
         # Staff customers are superuser-only, so the cache key is per-lens (superuser vs
         # not) to avoid a superuser's staff-inclusive worklist being served to a manager.
-        key = f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}:{"s" if scope.is_superuser else "n"}'
+        key = (f'worklist:{portfolio_cache.scope_key(scope.sales_codes)}:{data_mode()}:{"s" if scope.is_superuser else "n"}:'
+               f'{gateway.as_of_date().isoformat()}')
         rows = portfolio_cache.get_or_build(
             key,
             lambda: worklist_across_customers(
                 gateway, sales_codes=scope.sales_codes, max_customers=max_customers,
                 include_staff=scope.is_superuser),
+            ttl=1800,
         )[0]
         return Response({'count': len(rows), 'results': rows})
 

@@ -278,10 +278,11 @@ class TrinoWarehouse(WarehouseGateway):
         2.37B-row fact tables. Returns None only when nothing at all is readable (so the
         caller keeps any previously cached date rather than snapping to today())."""
         rows = self._t.execute(
-            "SELECT prev_trx_date AS d FROM delta.gold_db.bank_parameters LIMIT 1")
-        biz = rows[0]['d'] if rows and rows[0].get('d') else None
-        if biz is None:
+            "SELECT prev_trx_date AS d, curr_trx_date AS c FROM delta.gold_db.bank_parameters LIMIT 1")
+        raw_biz = rows[0]['d'] if rows and rows[0].get('d') else None
+        if raw_biz is None:
             return None
+        biz = self._closed_business_date(raw_biz, rows[0].get('c'))
         lo = biz - timedelta(days=10)   # covers a long weekend / public-holiday gap
         months = ','.join(str(m) for m in self._months_between(lo, biz))
 
@@ -296,11 +297,42 @@ class TrinoWarehouse(WarehouseGateway):
         # Each table's own newest date, kept so a per-customer read can use the newest
         # data its table holds instead of waiting for the slower one (loans post a day
         # before deposits). The shared as-of below stays for whole-book figures.
-        self._source_dates = {'business': biz, 'deposits': dep, 'loans': loan}
+        # 'business' stays the table's own value so Data health still shows a stale copy.
+        self._source_dates = {'business': raw_biz, 'closed': biz, 'deposits': dep, 'loans': loan}
         if dep and loan:
             return min(dep, loan)          # newest date both tables share
         # One side unreadable in the window → use whichever we have, else the biz date.
         return dep or loan or biz
+
+    # Postings dated after the "current" business day that it takes to say that day has
+    # closed. A normal day posts hundreds of thousands; the first hour of a new day posts
+    # thousands. The floor keeps a stray forward-dated entry from moving the date.
+    _NEXT_DAY_MIN_POSTINGS = 1000
+
+    def _closed_business_date(self, prev: date, curr: date | None) -> date:
+        """The last business day core banking has closed.
+
+        The warehouse copy of bank_parameters can lag core banking by a day: on
+        2026-11-03 it still said prev 31 Oct / curr 2 Nov while core banking (production
+        and DR) said prev 2 Nov / curr 3 Nov, and the ledger already held 3 Nov postings.
+        Postings dated after ``curr`` exist only once core banking has moved past it, so
+        when the ledger holds them, ``curr`` is closed and is the cap instead of ``prev``.
+        Any doubt (no curr, a failed read, too few postings) keeps ``prev``."""
+        if not curr or curr <= prev or curr > date.today():
+            return prev
+        nxt, today = curr + timedelta(days=1), date.today()
+        if nxt > today:
+            return prev
+        try:
+            r = self._t.execute(
+                f"SELECT count(*) AS n FROM delta.gold_db.fact_dep_trx_recording "
+                f"WHERE 1=1 {self._range_part(nxt, today)} "
+                f"AND transaction_date BETWEEN {self._date_lit(nxt)} AND {self._date_lit(today)}")
+            n = int(r[0]['n']) if r and r[0].get('n') is not None else 0
+        except Exception:                                           # noqa: BLE001
+            logger.warning('closed-day ledger probe failed; using bank_parameters.prev_trx_date', exc_info=True)
+            return prev
+        return curr if n >= self._NEXT_DAY_MIN_POSTINGS else prev
 
     def _as_of_lit(self) -> str:
         # Our own validated date value → safe to inline (enables partition pruning).
@@ -358,7 +390,7 @@ class TrinoWarehouse(WarehouseGateway):
         sd = getattr(self, '_source_dates', None) or {}
         def iso(d):
             return d.isoformat() if d else None
-        return {'business_date': iso(sd.get('business')), 'deposits': iso(sd.get('deposits') or asof),
+        return {'business_date': iso(sd.get('closed') or sd.get('business')), 'deposits': iso(sd.get('deposits') or asof),
                 'loans': iso(self.loan_as_of()), 'transactions': iso(self.ledger_as_of())}
 
     _SRC_PROBE_TTL_SECONDS = 900  # 15 min
