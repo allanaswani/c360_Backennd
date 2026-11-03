@@ -4,8 +4,8 @@
     manage.py send_rm_alerts --code CM3010 --to me@hfgroup.co.ke   # one book, to a test inbox
     manage.py send_rm_alerts                           # the real send
 
-Recipients are the active C360 users whose profile sales code holds the book; a book
-with no such user, or no alerts, gets no email.
+Recipients are the RMs on c360/reports/rm_alert_recipients.csv plus the active C360 users
+whose profile sales code holds the book; a book with no recipient, or no alerts, gets no email.
 """
 from __future__ import annotations
 
@@ -59,4 +59,4 @@ class Command(BaseCommand):
         verb = 'would send' if options['dry_run'] else 'sent'
         self.stdout.write(self.style.SUCCESS(
             f'{verb} {ready if options["dry_run"] else sent} email(s); '
-            f'{skipped} book(s) with alerts have no C360 user with an email on that sales code.'))
+            f'{skipped} book(s) with alerts have no recipient on that sales code.'))

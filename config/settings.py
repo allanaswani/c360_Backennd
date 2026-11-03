@@ -313,6 +313,9 @@ C360_REPORT_RECIPIENTS = [
 ]
 # Public base URL used for "open the dashboard" links inside the emails.
 C360_APP_URL = os.environ.get('C360_APP_URL', 'http://localhost:3000').rstrip('/')
+# Who gets the morning RM alert email (sales_code,rm_name,email). Empty = the list bundled
+# at c360/reports/rm_alert_recipients.csv.
+C360_RM_ALERT_RECIPIENTS = os.environ.get('C360_RM_ALERT_RECIPIENTS', '')
 
 # Incident thresholds. An alert fires when a check crosses its threshold and STAYS
 # quiet until the condition clears and recurs (see c360.reports.alerts), so a

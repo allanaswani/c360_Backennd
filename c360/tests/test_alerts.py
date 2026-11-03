@@ -68,3 +68,42 @@ class AlertEmailTests(SimpleTestCase):
         self.assertIn('Plot Purchase: 2 days in arrears', msg['html'])
         self.assertIn('/book', msg['html'])
         self.assertIn('A CUSTOMER (1)', msg['text'])
+
+
+class RecipientListTests(SimpleTestCase):
+    def _write(self, text):
+        import tempfile
+        fh = tempfile.NamedTemporaryFile('w', suffix='.csv', delete=False, encoding='utf-8')
+        fh.write(text)
+        fh.close()
+        self.addCleanup(__import__('os').unlink, fh.name)
+        return fh.name
+
+    def test_reads_codes_and_skips_bad_rows(self):
+        path = self._write('sales_code,rm_name,email\nHM3729,A RM,a.rm@hfcb.co.ke\n,NO CODE,x@hfcb.co.ke\n'
+                           'BN3883,NO EMAIL,\n 4279 ,B RM, b.rm@hfcb.co.ke \n')
+        self.assertEqual(dict(rm_alerts.listed_recipients(path)),
+                         {'HM3729': ['a.rm@hfcb.co.ke'], '4279': ['b.rm@hfcb.co.ke']})
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(dict(rm_alerts.listed_recipients('no/such/file.csv')), {})
+
+    def test_bundled_list_loads(self):
+        listed = rm_alerts.listed_recipients()
+        self.assertGreaterEqual(len(listed), 100)
+        self.assertTrue(all('@' in e for es in listed.values() for e in es))
+
+
+class RecipientMergeTests(__import__('django.test', fromlist=['TestCase']).TestCase):
+    def test_list_and_users_merge_without_duplicates(self):
+        from django.contrib.auth.models import User
+        for name, email, code, active in [('rm.a', 'A.RM@hfcb.co.ke', 'HM3729', True),
+                                          ('rm.c', 'c.rm@hfcb.co.ke', 'CM3010', True),
+                                          ('rm.gone', 'gone@hfcb.co.ke', 'CM3010', False)]:
+            u = User.objects.create_user(username=name, email=email, is_active=active)
+            u.profile.sales_code = code
+            u.profile.save()
+        path = RecipientListTests._write(self, 'sales_code,rm_name,email\nHM3729,A RM,a.rm@hfcb.co.ke\n')
+        out = rm_alerts.recipients_by_code(path)
+        self.assertEqual(out['HM3729'], ['a.rm@hfcb.co.ke'])
+        self.assertEqual(out['CM3010'], ['c.rm@hfcb.co.ke'])
