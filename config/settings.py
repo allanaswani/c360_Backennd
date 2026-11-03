@@ -257,6 +257,12 @@ REST_FRAMEWORK['DEFAULT_THROTTLE_RATES'] = {
     'otp_request': os.environ.get('C360_OTP_REQUEST_RATE', '20/hour'),
     'otp_verify': os.environ.get('C360_OTP_VERIFY_RATE', '10/hour'),
     'login': os.environ.get('C360_LOGIN_RATE', '30/hour'),
+    # Per-IP ceilings. Every user arrives through the same proxy, so these are
+    # sized for the whole bank signing in at once, not for one person; the tight
+    # limits above are per ACCOUNT (c360/api/throttles.py).
+    'otp_request_ip': os.environ.get('C360_OTP_REQUEST_IP_RATE', '600/hour'),
+    'otp_verify_ip': os.environ.get('C360_OTP_VERIFY_IP_RATE', '600/hour'),
+    'login_ip': os.environ.get('C360_LOGIN_IP_RATE', '1200/hour'),
 }
 
 # ---------------------------------------------------------------------------

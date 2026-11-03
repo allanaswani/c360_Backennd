@@ -25,7 +25,6 @@ from rest_framework.generics import ListCreateAPIView, RetrieveUpdateDestroyAPIV
 from rest_framework.permissions import AllowAny, BasePermission, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
-from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
 from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -34,6 +33,7 @@ from ..auth.claims import apply_claims
 from ..models import BRANCH_CHOICES, OTP, SEGMENT_CHOICES
 from ..otp import dev_code, issue_otp, verify_otp
 from ..rbac.scoping import resolve_scope
+from .throttles import SIGN_IN_THROTTLES
 from ..roles import ROLE_ADMIN, tier_for_groups
 from .auth_serializers import (
     AdminUserSerializer,
@@ -109,7 +109,7 @@ class LoginStartView(APIView):
     When 2FA is disabled (``C360_LOGIN_MFA=false``) this issues tokens directly."""
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = SIGN_IN_THROTTLES
     throttle_scope = 'login'
 
     def post(self, request: Request):
@@ -136,7 +136,7 @@ class LoginVerifyView(APIView):
     """Step 2 of sign-in: exchange the ticket + emailed code for a JWT pair."""
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = SIGN_IN_THROTTLES
     throttle_scope = 'otp_verify'
 
     def post(self, request: Request):
@@ -163,7 +163,7 @@ class PasswordResetRequestView(APIView):
     endpoint never reveals which usernames/emails exist."""
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = SIGN_IN_THROTTLES
     throttle_scope = 'otp_request'
 
     def post(self, request: Request):
@@ -182,7 +182,7 @@ class PasswordResetConfirmView(APIView):
     """Forgot password (step 2): verify the code and set a new password."""
 
     permission_classes = [AllowAny]
-    throttle_classes = [ScopedRateThrottle]
+    throttle_classes = SIGN_IN_THROTTLES
     throttle_scope = 'otp_verify'
 
     def post(self, request: Request):

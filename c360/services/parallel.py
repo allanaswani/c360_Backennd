@@ -12,12 +12,21 @@ after another; on a slow day that was long enough for the page to time out
 from __future__ import annotations
 
 import logging
+import os
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix='c360-read')
+# Shared by every request thread in the worker (gunicorn runs 6). One customer open
+# submits ~25 reads across its header, Overview and HFCB tabs, so with 8 threads a
+# second user on the same worker queued behind the first: with several testers at
+# once (2026-11-03) customers took far longer than their slowest read. 16 doubles
+# that. Not higher by default: each pool thread keeps its own reporting-Postgres
+# connection open (warehouse/connector.py), and 3 workers x 2 servers share that
+# database's connection limit. C360_READ_POOL overrides.
+POOL = ThreadPoolExecutor(max_workers=int(os.environ.get('C360_READ_POOL', '16') or '16'),
+                          thread_name_prefix='c360-read')
 
 
 def quiet(fn, *args):
