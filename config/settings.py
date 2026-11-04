@@ -299,6 +299,9 @@ APP_BRAND_NAME = 'HFCB Customer 360'
 # Login 2FA: when on, sign-in is a two-step flow (password → emailed OTP). On by
 # default; set C360_LOGIN_MFA=false to allow single-step login (e.g. for smoke tests).
 C360_LOGIN_MFA = _env_bool('C360_LOGIN_MFA', True)
+# Refuse a portfolio token that has not passed that system's code. Turn on together
+# with the portfolio's LOGIN_MFA_ENFORCED, once its new frontend is live.
+C360_REQUIRE_PORTFOLIO_MFA = _env_bool('C360_REQUIRE_PORTFOLIO_MFA', False)
 
 # ---------------------------------------------------------------------------
 # Operational reporting — the digests and incident alerts that leave the app by

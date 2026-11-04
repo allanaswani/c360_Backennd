@@ -209,3 +209,27 @@ class AdminUserApiTests(TestCase):
         meta = self.c.get('/api/auth/user-meta/')
         self.assertEqual(meta.status_code, 200)
         self.assertIn('THIKA BRANCH', meta.json()['branches'])
+
+
+class PortfolioSecondFactorTests(TestCase):
+    """A portfolio token from the password alone must not step round the second factor."""
+
+    def _status(self, **claims):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        token = AccessToken()
+        token['username'] = 'anne.m'
+        token['groups'] = []
+        for key, value in claims.items():
+            token[key] = value
+        return self.client.get('/api/auth/me/', HTTP_AUTHORIZATION=f'Bearer {token}').status_code
+
+    def test_refused_when_required(self):
+        with self.settings(C360_REQUIRE_PORTFOLIO_MFA=True):
+            self.assertEqual(self._status(mfa=False), 401)
+            self.assertEqual(self._status(mfa=True), 200)
+            self.assertEqual(self._status(), 200)
+
+    def test_allowed_until_it_is_turned_on(self):
+        with self.settings(C360_REQUIRE_PORTFOLIO_MFA=False):
+            self.assertEqual(self._status(mfa=False), 200)

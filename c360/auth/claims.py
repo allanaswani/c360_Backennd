@@ -20,7 +20,9 @@ through one authentication path.
 """
 from __future__ import annotations
 
+from django.conf import settings
 from rest_framework_simplejwt.authentication import JWTAuthentication
+from rest_framework_simplejwt.exceptions import AuthenticationFailed
 from rest_framework_simplejwt.settings import api_settings
 
 
@@ -128,6 +130,13 @@ class ClaimsJWTAuthentication(JWTAuthentication):
     """
 
     def get_user(self, validated_token):
+        # A portfolio token from the password alone says so with ``mfa: false``. It
+        # must not step round the second factor this system asks for at its own
+        # login. Tokens without the claim are this system's own, or older ones.
+        if (getattr(settings, 'C360_REQUIRE_PORTFOLIO_MFA', False)
+                and validated_token.get('mfa') is False):
+            raise AuthenticationFailed('Enter the code sent to your e-mail first.',
+                                       code='mfa_required')
         if validated_token.get('username') is not None:
             return ClaimsUser(validated_token)
         return super().get_user(validated_token)
