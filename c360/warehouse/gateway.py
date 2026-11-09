@@ -330,7 +330,7 @@ class WarehouseGateway(abc.ABC):
         return None
 
     # --- data-health report (admin panel; live gateways override) -------------
-    def health_report(self) -> dict[str, Any]:
+    def health_report(self, deadline_s: float | None = None) -> dict[str, Any]:
         return {'data_mode': 'mock', 'freshness': None, 'checks': [],
                 'note': 'Preview (mock) data — connect the live warehouse '
                         '(C360_DATA_MODE=live) to see source health.'}

@@ -667,7 +667,15 @@ class DataHealthView(APIView):
         if not scope.is_admin:
             return Response({'error': {'status': 403, 'detail': 'Data health is admin-only.'}},
                             status=status.HTTP_403_FORBIDDEN)
-        report = get_gateway().health_report()
+        # ~35 warehouse reads. On a congested day (2026-11-09) they took 83-189s and
+        # the page died at the 120s request limit. So: a time budget well inside that
+        # limit (a check still running shows as slow), and the result kept 5 minutes,
+        # refreshed in the background, so most opens are instant. A copy is used
+        # because the steps below edit the report.
+        import copy
+        cached, _ = portfolio_cache.get_or_build(
+            f'health:{data_mode()}', lambda: get_gateway().health_report(deadline_s=75), ttl=300)
+        report = copy.deepcopy(cached)
         # Deployment checks need no warehouse, so they report even in an outage.
         from .. import deployment
         report['checks'] = deployment.checks() + list(report.get('checks') or [])

@@ -603,7 +603,23 @@ class TrinoWarehouse(WarehouseGateway):
         return {'key': key, 'label': label, 'group': group, 'table': table.split('.')[-1],
                 'status': 'unknown', 'value': None, 'detail': 'not checked — warehouse connection is down'}
 
-    def _check_source_dates(self, limit: int) -> list[dict]:
+    _SLOW = object()      # a read that did not answer within the report's time budget
+
+    @classmethod
+    def _within(cls, fut, end: float | None):
+        """``fut``'s result, or _SLOW if it is not done by ``end`` (monotonic)."""
+        from concurrent.futures import TimeoutError as _Timeout
+        try:
+            return fut.result(timeout=None if end is None else max(0.0, end - time.monotonic()))
+        except _Timeout:
+            return cls._SLOW
+        except Exception:                                           # noqa: BLE001
+            return None             # the read failed: callers report "could not read"
+
+    def _check_source_dates(self, limit: int, end: float | None = None,
+                            futs: dict | None = None, start_only: bool = False):
+        """(``start_only``: submit the reads and return their futures, so the caller
+        can start them alongside its own and collect the rows later.)"""
         """The date each source is current to - one row per feed, so a feed that
         stops loading is named rather than hidden behind one as-of date. The ledger
         loads ahead of the balance snapshots (2026-10-01: transactions to 1 Oct,
@@ -612,6 +628,9 @@ class TrinoWarehouse(WarehouseGateway):
 
         def row(key, label, table, when, stale_after):
             base = {'key': key, 'label': label, 'group': 'Freshness', 'table': table}
+            if when is self._SLOW:
+                return {**base, 'status': 'unknown', 'value': None, 'as_of': None, 'age_days': None,
+                        'detail': 'no answer in time - the warehouse is slow; refresh shortly'}
             if when is None:
                 return {**base, 'status': 'unknown', 'value': None, 'as_of': None, 'age_days': None,
                         'detail': 'could not read the latest date'}
@@ -657,23 +676,45 @@ class TrinoWarehouse(WarehouseGateway):
             d = self._safe_date(r[0].get('d')) if r else None
             return date.fromisoformat(d) if d else None
 
+        # The dates are read side by side (see health_report), each within the budget.
+        # as_of_date() also fills in loan_as_of and the business date, so those two
+        # are read only once it has answered.
+        from ...services.parallel import POOL
+        futs = dict(futs or {})
+        if 'deposits' not in futs:
+            futs['deposits'] = POOL.submit(safe, self.as_of_date)
+        for k, fn in (('ledger', self.ledger_as_of), ('payments', payments_latest),
+                      ('ins_r', lambda: insurance_loaded('hfbi_receipt_data')),
+                      ('ins_p', lambda: insurance_loaded('hfbi_policy_data')),
+                      ('revenue', revenue_latest)):
+            if k not in futs:
+                futs[k] = POOL.submit(safe, fn)
+        if start_only:
+            return futs
+        got ={k: self._within(f, end) for k, f in futs.items()}
+        asof_slow = got['deposits'] is self._SLOW
         sd = getattr(self, '_source_dates', None) or {}
         return [
-            row('fresh_business', 'Business date', 'bank_parameters', sd.get('business'), limit),
-            row('fresh_deposits', 'Deposit balances', 'eom_deposits', safe(self.as_of_date), limit),
-            row('fresh_loans', 'Loan balances', 'eom_loans', safe(self.loan_as_of), limit),
-            row('fresh_ledger', 'Transactions', 'fact_dep_trx_recording', safe(self.ledger_as_of), limit),
+            row('fresh_business', 'Business date', 'bank_parameters',
+                self._SLOW if asof_slow else sd.get('business'), limit),
+            row('fresh_deposits', 'Deposit balances', 'eom_deposits', got['deposits'], limit),
+            row('fresh_loans', 'Loan balances', 'eom_loans',
+                self._SLOW if asof_slow else safe(self.loan_as_of), limit),
+            row('fresh_ledger', 'Transactions', 'fact_dep_trx_recording', got['ledger'], limit),
             row('fresh_payments', 'Property payments (latest)', 'hfdi_payment_data',
-                safe(payments_latest), self._PAYMENTS_STALE_DAYS),
+                got['payments'], self._PAYMENTS_STALE_DAYS),
             row('fresh_ins_receipts', 'Insurance receipts (last load)', 'hfbi_receipt_data',
-                safe(lambda: insurance_loaded('hfbi_receipt_data')), self._INSURANCE_STALE_DAYS),
+                got['ins_r'], self._INSURANCE_STALE_DAYS),
             row('fresh_ins_policies', 'Insurance policies (last load)', 'hfbi_policy_data',
-                safe(lambda: insurance_loaded('hfbi_policy_data')), self._INSURANCE_STALE_DAYS),
+                got['ins_p'], self._INSURANCE_STALE_DAYS),
             row('fresh_revenue', 'Revenue per customer (latest day)', 'rpt_ceo_all_revenue_trend',
-                safe(revenue_latest), limit),
+                got['revenue'], limit),
         ]
 
-    def health_report(self):
+    def health_report(self, deadline_s: float | None = None):
+        """``deadline_s`` bounds the wait (the admin page passes one, so it answers
+        inside the request limit); a check still running then is reported as slow."""
+        end = None if deadline_s is None else time.monotonic() + deadline_s
         # System group first: connection/auth, model, RM-allocation source. The model
         # check needs no warehouse, so it reports even during an outage.
         conn = self._check_connection()
@@ -690,10 +731,33 @@ class TrinoWarehouse(WarehouseGateway):
                          'detail': 'warehouse unreachable — see System · Warehouse connection'}
             return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
 
-        checks = (system + [self._run_health_check(*spec) for spec in self._HEALTH_CHECKS]
-                  + [self._run_pg_health_check(*spec) for spec in self._PG_HEALTH_CHECKS])
+        # Side by side, not one after another: ~35 reads in series took 159-368s on a
+        # slow warehouse day (2026-11-09), past the 120s request limit, and the page
+        # showed "Internal Server Error". In parallel it takes as long as the slowest.
+        from ...services.parallel import POOL
+        # The as-of date first: it is the slowest read (~30-40s uncached) and both the
+        # freshness banner and the Freshness rows wait on it.
+        asof_fut = POOL.submit(self.as_of_date)
+        from django.conf import settings as _settings
+        stale_limit = int(getattr(_settings, 'C360_ALERT_DATA_STALE_DAYS', 3))
+        src_futs = self._check_source_dates(stale_limit, futs={'deposits': asof_fut}, start_only=True)
+        t_futs =[POOL.submit(self._run_health_check, *spec) for spec in self._HEALTH_CHECKS]
+        p_futs = [POOL.submit(self._run_pg_health_check, *spec) for spec in self._PG_HEALTH_CHECKS]
+        def done(fut, spec):
+            r = self._within(fut, end)
+            if r is self._SLOW:
+                return {'key': spec[0], 'label': spec[1], 'group': spec[2],
+                        'table': spec[3].split('.')[-1], 'status': 'unknown', 'value': None,
+                        'detail': 'no answer in time - the warehouse is slow; refresh shortly'}
+            return r
+        checks = (system + [done(f, s) for f, s in zip(t_futs, self._HEALTH_CHECKS)]
+                  + [done(f, s) for f, s in zip(p_futs, self._PG_HEALTH_CHECKS)])
         try:
-            asof = self.as_of_date()
+            asof = self._within(asof_fut, end)
+            if asof is self._SLOW:
+                raise TimeoutError('no answer in time - the warehouse is slow; refresh shortly')
+            if asof is None:
+                asof = self.as_of_date()        # re-raise the real error for the detail
             days = (date.today() - asof).days
             # ONE threshold, shared with the alert emails (c360.reports.alerts).
             # These were separately hard-coded and disagreed: the page called four
@@ -707,8 +771,7 @@ class TrinoWarehouse(WarehouseGateway):
         except Exception as e:
             freshness = {'as_of': None, 'days_behind': None, 'status': 'error',
                          'detail': f'{type(e).__name__}: {str(e)[:140]}'}
-        from django.conf import settings as _settings
-        checks += self._check_source_dates(int(getattr(_settings, 'C360_ALERT_DATA_STALE_DAYS', 3)))
+        checks += self._check_source_dates(stale_limit, end, src_futs)
         return {'data_mode': 'live', 'freshness': freshness, 'checks': checks}
 
     @staticmethod
