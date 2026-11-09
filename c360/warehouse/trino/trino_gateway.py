@@ -458,6 +458,10 @@ class TrinoWarehouse(WarehouseGateway):
     # load every business day; the shared limit (C360_ALERT_DATA_STALE_DAYS) applies.
     # Property payments arrive with sales, not on a schedule, so they get a week.
     _PAYMENTS_STALE_DAYS = 7
+    # Insurance receipts and policies had no date check: on 2026-11-09 receipts had
+    # last loaded on 1 Sep 2026 and nothing said so. Like payments, they arrive with
+    # business, so a week.
+    _INSURANCE_STALE_DAYS = 7
 
     # The curated reporting Postgres, checked separately because a failure there is a
     # different outage from a warehouse failure: the book page loses its allocation
@@ -643,6 +647,25 @@ class TrinoWarehouse(WarehouseGateway):
             d = self._safe_date(r[0].get('d')) if r else None
             return date.fromisoformat(d) if d else None
 
+        def receipts_latest():
+            # receipt_date is NULL on every row; receipt_created_at is the load time,
+            # as text 'M/D/YYYY H:MM' (so a plain max() sorts '9/...' last). Parsed.
+            r = self._t.execute(
+                "SELECT CAST(CAST(max(TRY(date_parse(TRIM(receipt_created_at), '%c/%e/%Y %k:%i'))) "
+                "AS date) AS varchar) d FROM delta.gold_db.hfbi_receipt_data")
+            d = self._safe_date(r[0].get('d')) if r else None
+            return date.fromisoformat(d) if d else None
+
+        def policies_latest():
+            # Latest policy start up to today. Start dates run to 2035 (data entry),
+            # and a few rows were loaded with columns shifted, so only ISO dates count.
+            r = self._t.execute(
+                "SELECT max(TRIM(policy_start_date)) d FROM delta.gold_db.hfbi_policy_data "
+                "WHERE regexp_like(TRIM(policy_start_date), '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') "
+                "AND TRIM(policy_start_date) <= CAST(current_date AS varchar)")
+            d = self._safe_date(r[0].get('d')) if r else None
+            return date.fromisoformat(d) if d else None
+
         sd = getattr(self, '_source_dates', None) or {}
         return [
             row('fresh_business', 'Business date', 'bank_parameters', sd.get('business'), limit),
@@ -651,6 +674,10 @@ class TrinoWarehouse(WarehouseGateway):
             row('fresh_ledger', 'Transactions', 'fact_dep_trx_recording', safe(self.ledger_as_of), limit),
             row('fresh_payments', 'Property payments (latest)', 'hfdi_payment_data',
                 safe(payments_latest), self._PAYMENTS_STALE_DAYS),
+            row('fresh_ins_receipts', 'Insurance receipts (last load)', 'hfbi_receipt_data',
+                safe(receipts_latest), self._INSURANCE_STALE_DAYS),
+            row('fresh_ins_policies', 'Insurance policies (latest start)', 'hfbi_policy_data',
+                safe(policies_latest), self._INSURANCE_STALE_DAYS),
             row('fresh_revenue', 'Revenue per customer (latest day)', 'rpt_ceo_all_revenue_trend',
                 safe(revenue_latest), limit),
         ]
