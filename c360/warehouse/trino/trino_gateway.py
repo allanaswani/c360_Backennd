@@ -458,9 +458,9 @@ class TrinoWarehouse(WarehouseGateway):
     # load every business day; the shared limit (C360_ALERT_DATA_STALE_DAYS) applies.
     # Property payments arrive with sales, not on a schedule, so they get a week.
     _PAYMENTS_STALE_DAYS = 7
-    # Insurance receipts and policies had no date check: on 2026-11-09 receipts had
-    # last loaded on 1 Sep 2026 and nothing said so. Like payments, they arrive with
-    # business, so a week.
+    # Insurance receipts and policies had no date check. On 2026-11-09 the bulk load
+    # ended 1 Sep 2026 (receipts) / 25 Aug (policies) and the live feed began 6 Nov,
+    # so two months are missing and nothing said so. Like payments, a week.
     _INSURANCE_STALE_DAYS = 7
 
     # The curated reporting Postgres, checked separately because a failure there is a
@@ -633,7 +633,7 @@ class TrinoWarehouse(WarehouseGateway):
         def payments_latest():
             r = self._t.execute(
                 "SELECT max(CAST(timestamp AS bigint)) ts FROM delta.gold_db.hfdi_payment_data "
-                "WHERE event_type = 'CREATE' AND pay_state = 'COMPLETED'")
+                "WHERE event_type IN ('CREATE', 'UPDATE') AND pay_state = 'COMPLETED'")
             ts = r[0].get('ts') if r else None
             if ts is None:
                 return None
@@ -647,22 +647,13 @@ class TrinoWarehouse(WarehouseGateway):
             d = self._safe_date(r[0].get('d')) if r else None
             return date.fromisoformat(d) if d else None
 
-        def receipts_latest():
-            # receipt_date is NULL on every row; receipt_created_at is the load time,
-            # as text 'M/D/YYYY H:MM' (so a plain max() sorts '9/...' last). Parsed.
+        def insurance_loaded(table):
+            # The bulk migration (event_type NULL, to 1 Sep 2026 for receipts) has no
+            # load time; the live feed (event_type INSERT, from 6 Nov 2026) stamps
+            # processed_at. The feed's last load is what says whether it is running.
             r = self._t.execute(
-                "SELECT CAST(CAST(max(TRY(date_parse(TRIM(receipt_created_at), '%c/%e/%Y %k:%i'))) "
-                "AS date) AS varchar) d FROM delta.gold_db.hfbi_receipt_data")
-            d = self._safe_date(r[0].get('d')) if r else None
-            return date.fromisoformat(d) if d else None
-
-        def policies_latest():
-            # Latest policy start up to today. Start dates run to 2035 (data entry),
-            # and a few rows were loaded with columns shifted, so only ISO dates count.
-            r = self._t.execute(
-                "SELECT max(TRIM(policy_start_date)) d FROM delta.gold_db.hfbi_policy_data "
-                "WHERE regexp_like(TRIM(policy_start_date), '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') "
-                "AND TRIM(policy_start_date) <= CAST(current_date AS varchar)")
+                f"SELECT CAST(CAST(max(processed_at) AS date) AS varchar) d "
+                f"FROM delta.gold_db.{table}")
             d = self._safe_date(r[0].get('d')) if r else None
             return date.fromisoformat(d) if d else None
 
@@ -675,9 +666,9 @@ class TrinoWarehouse(WarehouseGateway):
             row('fresh_payments', 'Property payments (latest)', 'hfdi_payment_data',
                 safe(payments_latest), self._PAYMENTS_STALE_DAYS),
             row('fresh_ins_receipts', 'Insurance receipts (last load)', 'hfbi_receipt_data',
-                safe(receipts_latest), self._INSURANCE_STALE_DAYS),
-            row('fresh_ins_policies', 'Insurance policies (latest start)', 'hfbi_policy_data',
-                safe(policies_latest), self._INSURANCE_STALE_DAYS),
+                safe(lambda: insurance_loaded('hfbi_receipt_data')), self._INSURANCE_STALE_DAYS),
+            row('fresh_ins_policies', 'Insurance policies (last load)', 'hfbi_policy_data',
+                safe(lambda: insurance_loaded('hfbi_policy_data')), self._INSURANCE_STALE_DAYS),
             row('fresh_revenue', 'Revenue per customer (latest day)', 'rpt_ceo_all_revenue_trend',
                 safe(revenue_latest), limit),
         ]
@@ -2886,7 +2877,10 @@ class TrinoWarehouse(WarehouseGateway):
           credits alone, 353 did.
         * the new system (event_type 'CREATE', pay_state 'COMPLETED', from 7 Sep 2026):
           no payment_date, so the date is the epoch `timestamp`. No receipt overlaps the
-          old register; reversed and archived rows are excluded.
+          old register; reversed and archived rows are excluded. A payment completed
+          after it was created arrives only as an UPDATE row (checked 2026-11-09: 36
+          receipts, KES 3.97M, 14 Oct - 5 Nov, none with a CREATE row), so UPDATE rows
+          in COMPLETED count too - once per receipt and unit, never twice.
         """
         from zoneinfo import ZoneInfo
         from datetime import datetime as _dt
@@ -2904,7 +2898,8 @@ class TrinoWarehouse(WarehouseGateway):
             "SELECT DISTINCT receipt_no, CAST(unit_id AS bigint) u, credited_amount c, "
             "TRIM(timestamp) ts, TRIM(payment_mode) m "
             "FROM delta.gold_db.hfdi_payment_data "
-            f"WHERE event_type = 'CREATE' AND pay_state = 'COMPLETED' AND unit_id IN ({inlist})")
+            f"WHERE event_type IN ('CREATE', 'UPDATE') AND pay_state = 'COMPLETED' "
+            f"AND unit_id IN ({inlist})")
 
         def old_date(s: Any) -> str | None:
             for fmt in ('%d-%m-%Y', '%d/%m/%y'):
@@ -2926,6 +2921,8 @@ class TrinoWarehouse(WarehouseGateway):
             ln['mode'] = ln['mode'] or self._clean(r['m'])
         for r in new:
             key = ('new:' + str(r['receipt_no']), int(r['u']))
+            if key in lines:        # CREATE and UPDATE rows of one completed payment
+                continue
             try:
                 when = _dt.fromtimestamp(int(str(r['ts'])), tz=nairobi).date().isoformat()
             except (TypeError, ValueError, OverflowError, OSError):
