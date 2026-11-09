@@ -273,6 +273,11 @@ docker exec c360-backend python manage.py send_ops_report --period daily --to yo
 # yesterday and today; the portfolio replaces a day it already has, so this is safe
 # to repeat. Needs C360_PORTFOLIO_INGEST_URL / _TOKEN (see .env.example).
 20 * * * *   docker exec c360-backend python manage.py push_usage >/dev/null 2>&1
+
+# RM book alerts (new arrears, deposit falls, maturities), weekdays 07:30.
+# ON ONE HOST ONLY (node1). C360 runs on two servers; a line on both sends
+# every RM two copies. Output is kept in a log so a missed morning can be traced.
+30 7 * * 1-5 docker exec c360-backend python manage.py send_rm_alerts >> /var/log/c360_rm_alerts.log 2>&1
 ```
 
 Cron runs in UTC unless the host says otherwise — check with `timedatectl`, and
