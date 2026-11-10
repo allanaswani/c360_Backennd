@@ -679,7 +679,7 @@ class TrinoWarehouse(WarehouseGateway):
         # The dates are read side by side (see health_report), each within the budget.
         # as_of_date() also fills in loan_as_of and the business date, so those two
         # are read only once it has answered.
-        from ...services.parallel import POOL
+        from ...services.parallel import HEALTH_POOL as POOL
         futs = dict(futs or {})
         if 'deposits' not in futs:
             futs['deposits'] = POOL.submit(safe, self.as_of_date)
@@ -734,7 +734,7 @@ class TrinoWarehouse(WarehouseGateway):
         # Side by side, not one after another: ~35 reads in series took 159-368s on a
         # slow warehouse day (2026-11-09), past the 120s request limit, and the page
         # showed "Internal Server Error". In parallel it takes as long as the slowest.
-        from ...services.parallel import POOL
+        from ...services.parallel import HEALTH_POOL as POOL
         # The as-of date first: it is the slowest read (~30-40s uncached) and both the
         # freshness banner and the Freshness rows wait on it.
         asof_fut = POOL.submit(self.as_of_date)

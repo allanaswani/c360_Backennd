@@ -33,16 +33,36 @@ def _tone_latency(p95: int) -> str:
     return 'warn' if p95 >= threshold / 2 else 'good'
 
 
-def _health_report() -> dict:
+def _health_report(max_age_minutes: int | None = None) -> dict:
     """The current warehouse health report, or a marker that it couldn't be read.
 
     A digest must never claim the warehouse is healthy because the check itself
     fell over, so a failure here is reported as a failure.
+
+    ``max_age_minutes``: reuse the newest stored snapshot if it is that recent. The
+    five-minute alert job rebuilt the whole report (~43 warehouse queries) every run,
+    on both a quiet and a congested day; once per window is enough to see a source
+    that stopped loading. Each fresh build is stored for the next run to reuse.
     """
+    from datetime import timedelta
+    from ..models import HealthSnapshot
     from ..warehouse.factory import data_mode, get_gateway
+    if max_age_minutes:
+        try:
+            last = HealthSnapshot.objects.first()
+            if last and timezone.now() - last.captured_at < timedelta(minutes=max_age_minutes):
+                return dict(last.payload)
+        except Exception:                                    # noqa: BLE001
+            pass
     try:
         report = get_gateway().health_report()
         report['data_mode'] = data_mode()
+        if max_age_minutes and report.get('data_mode') == 'live':
+            try:
+                HealthSnapshot.objects.create(
+                    days_behind=(report.get('freshness') or {}).get('days_behind'), payload=report)
+            except Exception:                                # noqa: BLE001
+                pass
         return report
     except Exception as exc:                                 # noqa: BLE001
         return {'data_mode': 'unknown', 'freshness': None, 'checks': [],

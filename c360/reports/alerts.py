@@ -137,7 +137,8 @@ def evaluate() -> list[dict]:
 
     findings: list[dict] = []
     try:
-        health = _health_report()
+        # A report up to 30 minutes old: the warehouse checks need not run every 5.
+        health = _health_report(max_age_minutes=int(getattr(settings, 'C360_ALERT_HEALTH_MAX_AGE_MIN', 30)))
     except Exception as exc:                                 # noqa: BLE001
         health = {'unavailable': f'{type(exc).__name__}: {str(exc)[:200]}', 'checks': []}
     try:

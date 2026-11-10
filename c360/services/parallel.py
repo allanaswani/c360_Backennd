@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 POOL = ThreadPoolExecutor(max_workers=int(os.environ.get('C360_READ_POOL', '16') or '16'),
                           thread_name_prefix='c360-read')
 
+# The data-health report's ~43 checks. Its own small pool, so a health check never
+# queues a user's customer page behind it, and so it never fires more than four
+# queries at once at a warehouse that is already congested (2026-11-10: SELECT 1
+# took over 60s).
+HEALTH_POOL = ThreadPoolExecutor(max_workers=int(os.environ.get('C360_HEALTH_POOL', '4') or '4'),
+                                 thread_name_prefix='c360-health')
+
 
 def quiet(fn, *args):
     """Call ``fn``; None on any failure. For reads the page can do without."""
