@@ -27,9 +27,38 @@ class Command(BaseCommand):
         parser.add_argument('--to', action='append', metavar='ADDR',
                             help='Send to these addresses instead of the RMs (repeatable).')
         parser.add_argument('--write-html', metavar='PATH', help='Write the first email body to this file.')
+        parser.add_argument('--query-limit', type=int, default=600, metavar='SECONDS',
+                            help='Trino time limit per query for this run (default 600).')
+        parser.add_argument('--attempts', type=int, default=4,
+                            help='Tries at building the alerts before giving up (default 4).')
+        parser.add_argument('--retry-wait', type=int, default=300, metavar='SECONDS',
+                            help='Wait between tries (default 300).')
 
     def handle(self, *args, **options):
-        payload, _ = alerts_service.book_alerts(get_gateway())
+        # The whole-book alert feed runs past the web app's 60s Trino cap on a busy
+        # morning; the 10:15 runs of 9 and 10 Nov 2026 died on it and no RM got mail.
+        # This is its own process with no user waiting, so it gets its own limit
+        # (no cron flag to forget). The web app's cap is untouched.
+        from django.conf import settings
+        cfg = settings.C360['trino_config']
+        limit = max(int(cfg.get('query_max_run_time_s') or 60), options['query_limit'])
+        cfg['query_max_run_time_s'] = limit
+        cfg['request_timeout_s'] = max(int(cfg.get('request_timeout_s') or 60), limit)
+        # A congested cluster also fails queries outright ("too many errors talking to
+        # a worker node ... transient", 10 Nov 2026). Retried, a few minutes apart,
+        # before the morning is given up.
+        import time
+        attempts = max(1, options['attempts'])
+        for n in range(1, attempts + 1):
+            try:
+                payload, _ = alerts_service.book_alerts(get_gateway())
+                break
+            except Exception as exc:                                  # noqa: BLE001
+                if n == attempts:
+                    raise
+                self.stderr.write(f'attempt {n} failed ({type(exc).__name__}: {str(exc)[:160]}); '
+                                  f'retrying in {options["retry_wait"]}s')
+                time.sleep(options['retry_wait'])
         if not payload.get('available'):
             raise CommandError(payload.get('detail') or 'alerts are not available')
         by_code = defaultdict(list)

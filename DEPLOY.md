@@ -278,7 +278,7 @@ docker exec c360-backend python manage.py send_ops_report --period daily --to yo
 # node1's clock is +0545, so 07:30 EAT is 10:15 there; change this if its zone changes.
 # ON ONE HOST ONLY (node1). C360 runs on two servers; a line on both sends
 # every RM two copies. Output is kept in a log so a missed morning can be traced.
-15 10 * * 1-5 docker exec -e TRINO_QUERY_MAX_RUN_TIME_S=600 -e TRINO_REQUEST_TIMEOUT_S=600 c360-backend python manage.py send_rm_alerts >> /var/log/c360_rm_alerts.log 2>&1
+15 10 * * 1-5 docker exec c360-backend python manage.py send_rm_alerts >> /var/log/c360_rm_alerts.log 2>&1
 ```
 
 Cron runs in UTC unless the host says otherwise — check with `timedatectl`, and
