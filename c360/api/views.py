@@ -5,6 +5,7 @@ through the gateway. No business logic here; views orchestrate and serialise.
 """
 from __future__ import annotations
 
+import logging
 from datetime import timedelta
 
 from django.utils import timezone
@@ -32,6 +33,7 @@ from .. import assistant
 from ..warehouse.factory import data_mode, get_gateway
 from ..warehouse.periods import PRESETS, resolve_period
 
+logger = logging.getLogger(__name__)
 
 def _period_from_request(request: Request, gateway):
     return resolve_period(
@@ -163,6 +165,14 @@ class PropertyClientListView(APIView):
         ))
 
 
+class _PartialDetail(Exception):
+    """Carries a customer payload that is missing a part, past the tab cache."""
+
+    def __init__(self, payload: dict):
+        super().__init__('partial customer detail')
+        self.payload = payload
+
+
 class CustomerDetailView(APIView):
     """Level 2 landing payload — header + cross-domain value summary."""
 
@@ -189,13 +199,26 @@ class CustomerDetailView(APIView):
             header = build_customer_header(gateway, cust_id, raw)
             if header is None:
                 return None
-            value_summary = build_value_summary(gateway, cust_id)
+            try:
+                value_summary = build_value_summary(gateway, cust_id)
+            except Exception as exc:                                  # noqa: BLE001
+                # A congested warehouse times this read out (EXCEEDED_TIME_LIMIT,
+                # 10-12 Nov 2026) and the whole page used to fail with a 500. The
+                # header already answered, so show it and mark the value missing.
+                # Not cached: the next open tries again.
+                logger.warning('value summary for %s failed: %s', cust_id, exc)
+                header['summary'] = None
+                raise _PartialDetail({'header': header, 'value_summary': None,
+                                      'unavailable': ['value_summary']})
             # One plain-language line for the top of the page — composed from the facts
             # already assembled above, so it's testable and never invents a figure.
             header['summary'] = relationship_summary(header, value_summary)
             return {'header': header, 'value_summary': value_summary}
 
-        payload = tabcache.get_or_build(tabcache.key('detail', cust_id, gateway.as_of_date()), build)
+        try:
+            payload = tabcache.get_or_build(tabcache.key('detail', cust_id, gateway.as_of_date()), build)
+        except _PartialDetail as partial:
+            return Response(partial.payload)
         if payload is None:
             return _not_found()
         return Response(payload)
