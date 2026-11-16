@@ -54,7 +54,15 @@ def _resolve_or_hide(gateway, scope, cust_id):
     record, or a 404 Response when the customer is unknown OR is an HF-staff account the
     caller may not see. Staff records return 404 (not 403) so their existence is never
     confirmed to a non-admin snooping by id."""
-    raw = gateway.get_customer(cust_id)
+    # One customer open calls five endpoints at once and each resolved the customer
+    # again: five identical customer-master reads, 7-13 s each on a busy warehouse
+    # (2026-11-16). Kept with the tab payloads (same day, same 30 minutes); the
+    # access checks below still run on every request. A copy, so no caller edits
+    # the shared record.
+    import copy
+    raw = tabcache.get_or_build(tabcache.key('raw', cust_id, gateway.as_of_date()),
+                                lambda: gateway.get_customer(cust_id))
+    raw = copy.deepcopy(raw)
     if raw is None or staff_hidden(scope, raw):
         return None, _not_found()
     return raw, None
