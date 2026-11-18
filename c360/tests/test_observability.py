@@ -98,7 +98,9 @@ class ObservabilityApiTests(TestCase):
         self.assertTrue(AuditEvent.objects.exists())
 
     def test_metrics_endpoint(self):
-        r = self.c.get('/metrics')
+        # Admin only (finding S-15): open to anyone before.
+        self.assertEqual(self.c.get('/metrics').status_code, 403)
+        r = self.c.get('/metrics', HTTP_X_C360_ADMIN='1')
         self.assertEqual(r.status_code, 200)
         self.assertIn('c360_up', r.content.decode())
         self.assertIn('text/plain', r['Content-Type'])

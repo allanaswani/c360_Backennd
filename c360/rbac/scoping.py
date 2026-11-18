@@ -64,6 +64,10 @@ def resolve_scope(request) -> Scope:
         # Level 1 portfolio analytics.
         if user.is_superuser or tier in (ROLE_ADMIN, ROLE_MANAGER):
             return Scope('management', None, is_admin=is_admin, is_superuser=is_super)
+        if tier is None:
+            # No Customer 360 role: no customers. The API refuses these callers
+            # outright (HasC360Role); this is the same answer if one slips past.
+            return Scope('none', [], is_admin=False, is_superuser=False)
         # RMs (officer tier): this is Customer 360 — an RM must be able to look up ANY
         # customer's 360, not only their own book. So they get whole-book *view*
         # access (sales_codes=None → no per-customer filter). The 'rm' role still gates

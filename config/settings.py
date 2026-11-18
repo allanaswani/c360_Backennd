@@ -223,6 +223,8 @@ REST_FRAMEWORK = {
     # permission class so it cannot be bypassed from the UI. See c360/rbac/scoping.py.
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.AllowAny',
+        # A signed-in caller with no Customer 360 role is refused (Nov 2026).
+        'c360.rbac.permissions.HasC360Role',
     ],
     'EXCEPTION_HANDLER': 'c360.api.errors.exception_handler',
 }
@@ -396,6 +398,7 @@ SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 if _env_bool('C360_REQUIRE_AUTH', False):
     REST_FRAMEWORK['DEFAULT_PERMISSION_CLASSES'] = [
         'rest_framework.permissions.IsAuthenticated',
+        'c360.rbac.permissions.HasC360Role',
     ]
 
 # ---------------------------------------------------------------------------

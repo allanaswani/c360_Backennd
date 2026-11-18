@@ -144,6 +144,54 @@ class ScopeTests(TestCase):
         self.assertEqual(self.c.get('/api/portfolio/overview/?period=30D').status_code, 200)
 
 
+class NoRoleTests(TestCase):
+    """A login with no Customer 360 role gets nothing (Nov 2026). It used to be
+    an officer by default, so telesales or mortgages staff could open any
+    customer."""
+
+    def setUp(self):
+        _pin_mock()
+        self.c = APIClient()
+
+    def test_no_role_is_refused_on_data(self):
+        user = _make_user('tele.agent', group='telesales_agent')
+        self.c.force_authenticate(user=user)
+        r = self.c.get('/api/customers/HF-100571/')
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('Customer 360 role', r.content.decode())
+        self.assertEqual(self.c.get('/api/portfolio/overview/?period=30D').status_code, 403)
+
+    def test_no_role_still_sees_who_they_are(self):
+        user = _make_user('tele.agent', group='telesales_agent')
+        self.c.force_authenticate(user=user)
+        me = self.c.get('/api/auth/me/')
+        self.assertEqual(me.status_code, 200)
+        self.assertIsNone(me.json()['role_tier'])
+        self.assertEqual(me.json()['scope']['role'], 'none')
+
+    def test_portfolio_sso_token_without_a_role_is_refused(self):
+        from rest_framework_simplejwt.tokens import AccessToken
+
+        token = AccessToken()
+        token['username'] = 'mortgage.officer'
+        token['groups'] = ['mortgages_officer']
+        r = self.client.get('/api/customers/HF-100571/', HTTP_AUTHORIZATION=f'Bearer {token}')
+        self.assertEqual(r.status_code, 403)
+        token['groups'] = ['c360_rm']
+        r = self.client.get('/api/customers/HF-100571/', HTTP_AUTHORIZATION=f'Bearer {token}')
+        self.assertEqual(r.status_code, 200)
+
+    def test_a_mapped_portfolio_role_keeps_access(self):
+        user = _make_user('branch.rm', group='branch_portfolio')
+        self.c.force_authenticate(user=user)
+        self.assertEqual(self.c.get('/api/customers/HF-100571/').status_code, 200)
+
+    def test_superuser_with_no_group_keeps_access(self):
+        user = _make_user('root', is_superuser=True, is_staff=True)
+        self.c.force_authenticate(user=user)
+        self.assertEqual(self.c.get('/api/customers/HF-100571/').status_code, 200)
+
+
 class AdminUserApiTests(TestCase):
     def setUp(self):
         _pin_mock()

@@ -108,11 +108,13 @@ class PortfolioSsoTests(TestCase):
         self.c.credentials(HTTP_AUTHORIZATION=f'Bearer {forged}')
         self.assertEqual(self.c.get('/api/auth/me/').status_code, 401)
 
-    def test_unrecognised_group_falls_back_to_least_privilege(self):
-        # A group C360 doesn't know about must not accidentally grant management.
+    def test_unrecognised_group_gets_no_access(self):
+        # A group C360 doesn't know about grants nothing - not management, and
+        # (since Nov 2026) not the officer tier it used to fall back to either.
         token = _portfolio_token(user_id=99005, username='temp', groups=['some_new_role'])
         self.c.credentials(HTTP_AUTHORIZATION=f'Bearer {token}')
         me = self.c.get('/api/auth/me/')
         self.assertEqual(me.status_code, 200, me.content)
-        self.assertEqual(me.json()['role_tier'], 'officer')
+        self.assertIsNone(me.json()['role_tier'])
         self.assertEqual(self.c.get('/api/portfolio/overview/?period=30D').status_code, 403)
+        self.assertEqual(self.c.get('/api/customers/HF-100571/').status_code, 403)

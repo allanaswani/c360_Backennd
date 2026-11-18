@@ -12,6 +12,8 @@ from __future__ import annotations
 from django.db.models import Avg, Count, Q
 from rest_framework import serializers, status
 from rest_framework.permissions import IsAuthenticated
+
+from ..rbac.permissions import HasC360Role
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -44,7 +46,7 @@ class FeedbackView(APIView):
     """GET ?cust_id=… → outcomes already recorded for that customer (panel state).
     POST → record/update an outcome (one per customer+product+RM, upserted)."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasC360Role]
 
     def get(self, request: Request):
         qs = RecommendationFeedback.objects.all()
@@ -102,7 +104,7 @@ class FeedbackStatsView(APIView):
     good, acceptance rises with the band. That's the honest, outcome-based check that
     replaces a fabricated accuracy number."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, HasC360Role]
 
     def get(self, request: Request):
         qs = RecommendationFeedback.objects.all()

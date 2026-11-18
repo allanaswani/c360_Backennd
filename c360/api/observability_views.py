@@ -11,7 +11,6 @@ from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
-from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -32,11 +31,16 @@ def _admin_or_403(request):
 
 class MetricsExporterView(APIView):
     """GET /metrics — Prometheus text exposition for THIS worker's live window, so a real
-    Prometheus can scrape it whenever you stand one up (each worker is its own target)."""
-    permission_classes = [AllowAny]
-    authentication_classes: list = []
+    Prometheus can scrape it whenever you stand one up (each worker is its own target).
+
+    Admin only (finding S-15): it was open to anyone who could reach the server,
+    with no login. A Prometheus scraper, when one exists, signs in like any
+    other caller."""
 
     def get(self, request: Request):
+        denied = _admin_or_403(request)
+        if denied:
+            return denied
         return HttpResponse(obs.prometheus_text(), content_type='text/plain; version=0.0.4; charset=utf-8')
 
 

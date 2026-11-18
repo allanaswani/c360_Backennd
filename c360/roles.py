@@ -74,9 +74,15 @@ ROLE_TO_TIER = {
 }
 
 
-def tier_for_groups(group_names) -> str:
-    """Strongest tier implied by a set of group names; defaults to ``officer``
-    (the old default for every authenticated RM) when none are recognised."""
+def tier_for_groups(group_names) -> str | None:
+    """Strongest tier implied by a set of group names, or ``None`` when none of
+    them is a Customer 360 role.
+
+    It used to default to ``officer``, so every portfolio login - telesales,
+    mortgages, staff management - could open any customer here. Access is now
+    given the way every other module's is: a role group (``c360_rm``,
+    ``c360_management`` or one of the mapped portfolio roles). Nov 2026.
+    """
     best, best_rank = None, -1
     for name in group_names:
         tier = ROLE_TO_TIER.get(name)
@@ -85,4 +91,13 @@ def tier_for_groups(group_names) -> str:
         rank = _TIER_RANK[tier]
         if rank > best_rank:
             best, best_rank = tier, rank
-    return best or ROLE_OFFICER
+    return best
+
+
+def has_c360_access(user) -> bool:
+    """A superuser, or a member of at least one Customer 360 role group."""
+    if user is None or not getattr(user, 'is_authenticated', False):
+        return False
+    if getattr(user, 'is_superuser', False):
+        return True
+    return tier_for_groups(user.groups.values_list('name', flat=True)) is not None

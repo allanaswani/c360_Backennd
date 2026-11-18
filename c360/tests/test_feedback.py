@@ -1,6 +1,6 @@
 """Recommendation outcome-logging loop — record, upsert, list, stats, and the
 label extraction that feeds retraining."""
-from django.contrib.auth.models import User
+from django.contrib.auth.models import Group, User
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -11,6 +11,8 @@ class FeedbackApiTests(TestCase):
     def setUp(self):
         self.c = APIClient()
         self.rm = User.objects.create_user('rm.brian', password='x')
+        # An RM: a login with no Customer 360 role is refused (Nov 2026).
+        self.rm.groups.add(Group.objects.get_or_create(name='c360_rm')[0])
         self.c.force_authenticate(user=self.rm)
 
     def _record(self, **over):
