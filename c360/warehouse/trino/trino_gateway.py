@@ -4430,11 +4430,44 @@ class TrinoWarehouse(WarehouseGateway):
             "WHERE fk_customercust_id = ? AND TRIM(entry_status_description) = 'Active'", (cid,))
         return bool(rows and int(rows[0].get('n') or 0) > 0)
 
-    # --- revenue earned from the customer (rpt_ceo_all_revenue_trend) ---------
+    # --- revenue earned from the customer ------------------------------------
+    # Read from the reporting Postgres ``revenue`` table, the figures Finance reconciles.
+    # Gold rpt_ceo_all_revenue_trend disagreed with it on 2026-11-20: Sep/Oct 2026
+    # interest income, NFI and Oct interest expense were 11.6M-33.8M higher in gold, and
+    # gold carries no negative NFI entries. Only Sep interest expense matched (sign
+    # flipped). Gold is kept as the fallback for when Postgres is absent or down.
+    _PG_REV_CATEGORIES = {'interest_income': 'Interest_Income', 'nfi': 'NFI',
+                          'interest_expenses': 'Interest_Expenses'}
+
+    def _revenue_from_pg(self, cid: int):
+        year = self.as_of_date().year
+        rows = self._pg.execute(
+            "SELECT EXTRACT(MONTH FROM trx_date)::int AS m, LOWER(TRIM(income_category)) AS c, "
+            "SUM(sum_dc) AS v FROM revenue WHERE cust_id = %s AND trx_date >= %s AND trx_date < %s "
+            "GROUP BY 1, 2", (str(cid), date(year, 1, 1), date(year + 1, 1, 1)))
+        out = []
+        for r in rows:
+            cat = self._PG_REV_CATEGORIES.get(str(r.get('c') or ''))
+            if cat is None:
+                continue
+            v = float(r.get('v') or 0)
+            # Postgres books interest expense as a negative; the profile shape takes it
+            # as a positive amount the bank paid and subtracts it.
+            out.append({'month': r.get('m'), 'category': cat,
+                        'value': -v if cat == 'Interest_Expenses' else v})
+        if not out:
+            return None
+        return profile_shape.revenue(out, year=year, loaded_through=self._revenue_loaded_through())
+
     def get_revenue(self, cust_id):
         cid = self._cid(cust_id)
         if cid is None:
             return None
+        if self._pg is not None:
+            try:
+                return self._revenue_from_pg(cid)
+            except Exception:                                  # noqa: BLE001
+                logger.warning('revenue: reporting Postgres read failed, using gold', exc_info=True)
         rows = self._t.execute(
             "SELECT month_no m, YEAR(MAX(month_name)) y, TRIM(income_category) c, SUM(revenue) v "
             "FROM delta.gold_db.rpt_ceo_all_revenue_trend WHERE cust_cif = ? "
@@ -4501,8 +4534,11 @@ class TrinoWarehouse(WarehouseGateway):
         if hit is not None and now - hit[0] < self._REVENUE_TTL_SECONDS:
             return hit[1]
         try:
-            rows = self._t.execute(
-                "SELECT CAST(max(month_name) AS varchar) d FROM delta.gold_db.rpt_ceo_all_revenue_trend")
+            if self._pg is not None:
+                rows = self._pg.execute("SELECT CAST(max(trx_date) AS varchar) AS d FROM revenue")
+            else:
+                rows = self._t.execute(
+                    "SELECT CAST(max(month_name) AS varchar) d FROM delta.gold_db.rpt_ceo_all_revenue_trend")
             d = self._safe_date(rows[0].get('d')) if rows else None
         except Exception:                                      # noqa: BLE001
             return None
